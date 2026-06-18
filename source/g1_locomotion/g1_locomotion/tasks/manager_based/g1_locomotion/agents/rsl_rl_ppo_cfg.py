@@ -1,38 +1,64 @@
-# Copyright (c) 2022-2025, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
+# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
 # All rights reserved.
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
 from isaaclab.utils import configclass
 
-from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticCfg, RslRlPpoAlgorithmCfg
+from isaaclab_tasks.manager_based.locomotion.velocity.config.g1.agents.rsl_rl_ppo_cfg import (
+    G1FlatPPORunnerCfg,
+    G1RoughPPORunnerCfg,
+)
 
 
 @configclass
-class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
-    num_steps_per_env = 16
-    max_iterations = 150
-    save_interval = 50
-    experiment_name = "cartpole_direct"
-    policy = RslRlPpoActorCriticCfg(
-        init_noise_std=1.0,
-        actor_obs_normalization=False,
-        critic_obs_normalization=False,
-        actor_hidden_dims=[32, 32],
-        critic_hidden_dims=[32, 32],
-        activation="elu",
-    )
-    algorithm = RslRlPpoAlgorithmCfg(
-        value_loss_coef=1.0,
-        use_clipped_value_loss=True,
-        clip_param=0.2,
-        entropy_coef=0.005,
-        num_learning_epochs=5,
-        num_mini_batches=4,
-        learning_rate=1.0e-3,
-        schedule="adaptive",
-        gamma=0.99,
-        lam=0.95,
-        desired_kl=0.01,
-        max_grad_norm=1.0,
-    )
+class G1LocomotionFlatPPORunnerCfg(G1FlatPPORunnerCfg):
+    """RSL-RL PPO config for G1 flat-terrain locomotion.
+
+    Inherits network sizes [256, 128, 128], 1500 iterations, adaptive LR from Isaac Lab.
+    Override fields here to tune, e.g.:
+        self.max_iterations = 2000
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.experiment_name = "legs/g1_locomotion_flat"
+
+
+@configclass
+class G1LocomotionRoughPPORunnerCfg(G1RoughPPORunnerCfg):
+    """RSL-RL PPO config for G1 rough-terrain locomotion.
+
+    Inherits network sizes [512, 256, 128], 3000 iterations, adaptive LR from Isaac Lab.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.experiment_name = "legs/g1_locomotion_rough"
+
+
+@configclass
+class G1LocomotionStandingFlatPPORunnerCfg(G1FlatPPORunnerCfg):
+    """RSL-RL PPO config for the standing-only flat terrain task."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.experiment_name = "standing/g1_locomotion_flat"
+
+
+@configclass
+class G1LocomotionFlatTransitionPPORunnerCfg(G1FlatPPORunnerCfg):
+    """RSL-RL PPO config for transition-heavy walking policy."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.experiment_name = "legs/g1_locomotion_flat_transition"
+
+
+@configclass
+class G1LocomotionStandingTransitionFlatPPORunnerCfg(G1FlatPPORunnerCfg):
+    """RSL-RL PPO config for transition-aware standing policy."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.experiment_name = "standing/g1_locomotion_flat_transition"

@@ -3,25 +3,14 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-from __future__ import annotations
+"""Custom reward functions for the G1 locomotion task.
 
-from typing import TYPE_CHECKING
+Add project-specific reward terms here. All standard Isaac Lab locomotion rewards
+are already available via ``isaaclab_tasks.manager_based.locomotion.velocity.mdp``
+(imported in the parent env cfg through ``mdp/__init__.py``).
 
-import torch
+Example:
+    def my_custom_reward(env: ManagerBasedRLEnv, ...) -> torch.Tensor:
+        ...
+"""
 
-from isaaclab.assets import Articulation
-from isaaclab.managers import SceneEntityCfg
-from isaaclab.utils.math import wrap_to_pi
-
-if TYPE_CHECKING:
-    from isaaclab.envs import ManagerBasedRLEnv
-
-
-def joint_pos_target_l2(env: ManagerBasedRLEnv, target: float, asset_cfg: SceneEntityCfg) -> torch.Tensor:
-    """Penalize joint position deviation from a target value."""
-    # extract the used quantities (to enable type-hinting)
-    asset: Articulation = env.scene[asset_cfg.name]
-    # wrap the joint positions to (-pi, pi)
-    joint_pos = wrap_to_pi(asset.data.joint_pos[:, asset_cfg.joint_ids])
-    # compute the reward
-    return torch.sum(torch.square(joint_pos - target), dim=1)

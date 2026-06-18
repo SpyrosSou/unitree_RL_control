@@ -1,16 +1,105 @@
-# Template for Isaac Lab Projects
+# Unitree RL Control
 
-## Overview
+Reinforcement-learning-based locomotion and arm control for the Unitree G1 using
+Isaac Sim, Isaac Lab, and RSL-RL.
 
-This project/repository serves as a template for building projects or extensions based on Isaac Lab.
-It allows you to develop in an isolated environment, outside of the core Isaac Lab repository.
+This repository contains:
 
-**Key Features:**
+- locomotion tasks for walking and standing,
+- arm reaching tasks for left, right, or both arms,
+- integration demos combining standing, walking, and arm control,
+- curated deployable checkpoints under `chosen_checkpoints/`.
 
-- `Isolation` Work outside the core Isaac Lab repository, ensuring that your development efforts remain self-contained.
-- `Flexibility` This template is set up to allow your code to be run as an extension in Omniverse.
+## What Is In This Repo
 
-**Keywords:** extension, template, isaaclab
+Main task families:
+
+- Walking: `G1-Locomotion-Flat-v0`
+- Standing: `G1-Locomotion-Standing-Flat-v0`
+- Arm IK: `G1-Arm-IK-Left-v0`, `G1-Arm-IK-Right-v0`, `G1-Arm-IK-Both-v0`
+
+Recent customizations include:
+
+- single walking policy with stronger transition exposure,
+- standing policy with arm-disturbance curriculum,
+- early visible standing disturbances in play mode,
+- arm action filtering and per-step delta limiting for smoother arm motion.
+
+## Environment
+
+Expected local workflow:
+
+```bash
+conda activate isaac_g1_control
+cd ~/Elm/Code/g1_locomotion
+```
+
+Isaac Lab is expected to be installed separately and available in the active
+Python environment.
+
+## Curated Checkpoints
+
+This repo ignores large training logs and intermediate checkpoints, but keeps a
+small curated set of deployable models in:
+
+- `chosen_checkpoints/walking_latest.pt`
+- `chosen_checkpoints/standing_latest.pt`
+- `chosen_checkpoints/arm_left_latest.pt`
+
+These are the default checkpoints referenced by the YAML config files for demos
+and tests.
+
+## Quick Start
+
+### Train
+
+```bash
+python scripts/rsl_rl/train.py --task G1-Locomotion-Flat-v0 --num_envs 4096 --headless --max_iterations 2500
+python scripts/rsl_rl/train.py --task G1-Locomotion-Standing-Flat-v0 --num_envs 4096 --headless --max_iterations 1500
+python scripts/rsl_rl/train.py --task G1-Arm-IK-Left-v0 --num_envs 4096 --headless --max_iterations 5000
+```
+
+### Generic Play
+
+```bash
+python scripts/rsl_rl/play.py --task G1-Locomotion-Flat-Play-v0 --checkpoint chosen_checkpoints/walking_latest.pt
+python scripts/rsl_rl/play.py --task G1-Locomotion-Standing-Flat-Play-v0 --checkpoint chosen_checkpoints/standing_latest.pt
+python scripts/rsl_rl/play.py --task G1-Arm-IK-Left-Play-v0 --checkpoint chosen_checkpoints/arm_left_latest.pt
+```
+
+### Full Integrated Demo
+
+```bash
+python general_testing/g1_full_demo.py
+```
+
+The integrated demo reads default checkpoint paths from:
+
+- `walking_testing/checkpoints.yaml`
+- `arm_testing/checkpoints.yaml`
+- `general_testing/checkpoints.yaml`
+
+## Repo Layout
+
+- `source/g1_locomotion/` — task registration and environment/task code
+- `scripts/` — train/play entry points
+- `walking_testing/` — locomotion demos and switch demos
+- `arm_testing/` — arm evaluation and mirror tests
+- `general_testing/` — combined demos
+- `chosen_checkpoints/` — curated deployable checkpoints
+- `quickrun.md` — command reference
+- `training_regimes.md` — training setup summary
+
+## Notes On Ignored Files
+
+Ignored by default:
+
+- training logs under `logs/`
+- generated outputs under `outputs/`
+- local learning notes under `personal_development/`
+- intermediate `.pt` checkpoints outside `chosen_checkpoints/`
+
+This keeps the repo small while still shipping usable models.
 
 ## Installation
 
@@ -61,7 +150,7 @@ It allows you to develop in an isolated environment, outside of the core Isaac L
             python scripts/random_agent.py --task=<TASK_NAME>
             ```
 
-### Set up IDE (Optional)
+### Set Up IDE (Optional)
 
 To setup the IDE, please follow these instructions:
 
@@ -72,7 +161,7 @@ If everything executes correctly, it should create a file .python.env in the `.v
 The file contains the python paths to all the extensions provided by Isaac Sim and Omniverse.
 This helps in indexing all the python modules for intelligent suggestions while writing code.
 
-### Setup as Omniverse Extension (Optional)
+### Setup As Omniverse Extension (Optional)
 
 We provide an example UI extension that will load upon enabling your extension defined in `source/g1_locomotion/g1_locomotion/ui_extension_example.py`.
 

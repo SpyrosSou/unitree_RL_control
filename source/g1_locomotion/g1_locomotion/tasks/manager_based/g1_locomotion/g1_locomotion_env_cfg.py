@@ -1,180 +1,316 @@
-# Copyright (c) 2022-2025, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
+# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
 # All rights reserved.
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-import math
+"""G1 locomotion environment configurations.
 
-import isaaclab.sim as sim_utils
-from isaaclab.assets import ArticulationCfg, AssetBaseCfg
-from isaaclab.envs import ManagerBasedRLEnvCfg
+These classes inherit from Isaac Lab's pre-built G1 velocity-tracking environments.
+Override any field here to tune or extend the base configs.
+"""
+
 from isaaclab.managers import EventTermCfg as EventTerm
-from isaaclab.managers import ObservationGroupCfg as ObsGroup
-from isaaclab.managers import ObservationTermCfg as ObsTerm
-from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
-from isaaclab.managers import TerminationTermCfg as DoneTerm
-from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.utils import configclass
 
 from . import mdp
 
-##
-# Pre-defined configs
-##
-
-from isaaclab_assets.robots.cartpole import CARTPOLE_CFG  # isort:skip
-
-
-##
-# Scene definition
-##
+from isaaclab_tasks.manager_based.locomotion.velocity.config.g1.flat_env_cfg import (
+    G1FlatEnvCfg,
+    G1FlatEnvCfg_PLAY,
+)
+from isaaclab_tasks.manager_based.locomotion.velocity.config.g1.rough_env_cfg import (
+    G1RoughEnvCfg,
+    G1RoughEnvCfg_PLAY,
+)
 
 
 @configclass
-class G1LocomotionSceneCfg(InteractiveSceneCfg):
-    """Configuration for a cart-pole scene."""
+class G1LocomotionFlatEnvCfg(G1FlatEnvCfg):
+    """G1 flat-terrain locomotion (customisable).
 
-    # ground plane
-    ground = AssetBaseCfg(
-        prim_path="/World/ground",
-        spawn=sim_utils.GroundPlaneCfg(size=(100.0, 100.0)),
-    )
+    Inherits the full flat-ground G1 setup from Isaac Lab.
+    Add per-project overrides below, e.g.:
+        self.rewards.track_lin_vel_xy_exp.weight = 2.0
+    """
 
-    # robot
-    robot: ArticulationCfg = CARTPOLE_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
+    def __post_init__(self):
+        super().__post_init__()
 
-    # lights
-    dome_light = AssetBaseCfg(
-        prim_path="/World/DomeLight",
-        spawn=sim_utils.DomeLightCfg(color=(0.9, 0.9, 0.9), intensity=500.0),
-    )
-
-
-##
-# MDP settings
-##
-
-
-@configclass
-class ActionsCfg:
-    """Action specifications for the MDP."""
-
-    joint_effort = mdp.JointEffortActionCfg(asset_name="robot", joint_names=["slider_to_cart"], scale=100.0)
+        base_velocity = getattr(self.commands, "base_velocity", None)
+        if base_velocity is not None:
+            # Add frequent command changes and a small near-zero/zero slice.
+            if hasattr(base_velocity, "resampling_time_range"):
+                base_velocity.resampling_time_range = (0.9, 2.6)
+            if hasattr(base_velocity, "rel_standing_envs"):
+                base_velocity.rel_standing_envs = 0.10
+            if hasattr(base_velocity, "ranges"):
+                ranges = base_velocity.ranges
+                if hasattr(ranges, "lin_vel_x"):
+                    ranges.lin_vel_x = (-0.5, 1.0)
+                if hasattr(ranges, "lin_vel_y"):
+                    ranges.lin_vel_y = (-0.6, 0.6)
+                if hasattr(ranges, "ang_vel_z"):
+                    ranges.ang_vel_z = (-1.2, 1.2)
 
 
 @configclass
-class ObservationsCfg:
-    """Observation specifications for the MDP."""
+class G1LocomotionFlatTransitionEnvCfg(G1FlatEnvCfg):
+    """Flat locomotion config with transition-heavy command sampling.
 
-    @configclass
-    class PolicyCfg(ObsGroup):
-        """Observations for policy group."""
+    Designed to expose frequent stop/start, direction reversal, and short pulses.
+    """
 
-        # observation terms (order preserved)
-        joint_pos_rel = ObsTerm(func=mdp.joint_pos_rel)
-        joint_vel_rel = ObsTerm(func=mdp.joint_vel_rel)
+    def __post_init__(self):
+        super().__post_init__()
 
-        def __post_init__(self) -> None:
-            self.enable_corruption = False
-            self.concatenate_terms = True
-
-    # observation groups
-    policy: PolicyCfg = PolicyCfg()
-
-
-@configclass
-class EventCfg:
-    """Configuration for events."""
-
-    # reset
-    reset_cart_position = EventTerm(
-        func=mdp.reset_joints_by_offset,
-        mode="reset",
-        params={
-            "asset_cfg": SceneEntityCfg("robot", joint_names=["slider_to_cart"]),
-            "position_range": (-1.0, 1.0),
-            "velocity_range": (-0.5, 0.5),
-        },
-    )
-
-    reset_pole_position = EventTerm(
-        func=mdp.reset_joints_by_offset,
-        mode="reset",
-        params={
-            "asset_cfg": SceneEntityCfg("robot", joint_names=["cart_to_pole"]),
-            "position_range": (-0.25 * math.pi, 0.25 * math.pi),
-            "velocity_range": (-0.25 * math.pi, 0.25 * math.pi),
-        },
-    )
+        base_velocity = getattr(self.commands, "base_velocity", None)
+        if base_velocity is not None:
+            if hasattr(base_velocity, "rel_standing_envs"):
+                base_velocity.rel_standing_envs = 0.30
+            if hasattr(base_velocity, "resampling_time_range"):
+                base_velocity.resampling_time_range = (0.5, 1.6)
+            if hasattr(base_velocity, "ranges"):
+                ranges = base_velocity.ranges
+                if hasattr(ranges, "lin_vel_x"):
+                    ranges.lin_vel_x = (-1.0, 1.0)
+                if hasattr(ranges, "lin_vel_y"):
+                    ranges.lin_vel_y = (-0.9, 0.9)
+                if hasattr(ranges, "ang_vel_z"):
+                    ranges.ang_vel_z = (-1.2, 1.2)
 
 
 @configclass
-class RewardsCfg:
-    """Reward terms for the MDP."""
+class G1LocomotionFlatEnvCfg_PLAY(G1FlatEnvCfg_PLAY):
+    """Play / evaluation variant of the flat env (fewer envs, no randomisation)."""
 
-    # (1) Constant running reward
-    alive = RewTerm(func=mdp.is_alive, weight=1.0)
-    # (2) Failure penalty
-    terminating = RewTerm(func=mdp.is_terminated, weight=-2.0)
-    # (3) Primary task: keep pole upright
-    pole_pos = RewTerm(
-        func=mdp.joint_pos_target_l2,
-        weight=-1.0,
-        params={"asset_cfg": SceneEntityCfg("robot", joint_names=["cart_to_pole"]), "target": 0.0},
-    )
-    # (4) Shaping tasks: lower cart velocity
-    cart_vel = RewTerm(
-        func=mdp.joint_vel_l1,
-        weight=-0.01,
-        params={"asset_cfg": SceneEntityCfg("robot", joint_names=["slider_to_cart"])},
-    )
-    # (5) Shaping tasks: lower pole angular velocity
-    pole_vel = RewTerm(
-        func=mdp.joint_vel_l1,
-        weight=-0.005,
-        params={"asset_cfg": SceneEntityCfg("robot", joint_names=["cart_to_pole"])},
-    )
+    pass
 
 
 @configclass
-class TerminationsCfg:
-    """Termination terms for the MDP."""
+class G1LocomotionFlatTransitionEnvCfg_PLAY(G1LocomotionFlatTransitionEnvCfg):
+    """Play variant for transition-heavy walking policy."""
 
-    # (1) Time out
-    time_out = DoneTerm(func=mdp.time_out, time_out=True)
-    # (2) Cart out of bounds
-    cart_out_of_bounds = DoneTerm(
-        func=mdp.joint_pos_out_of_manual_limit,
-        params={"asset_cfg": SceneEntityCfg("robot", joint_names=["slider_to_cart"]), "bounds": (-3.0, 3.0)},
-    )
+    def __post_init__(self):
+        super().__post_init__()
 
-
-##
-# Environment configuration
-##
+        self.scene.num_envs = 50
+        self.scene.env_spacing = 2.5
+        self.observations.policy.enable_corruption = False
+        self.events.base_external_force_torque = None
+        self.events.push_robot = None
 
 
 @configclass
-class G1LocomotionEnvCfg(ManagerBasedRLEnvCfg):
-    # Scene settings
-    scene: G1LocomotionSceneCfg = G1LocomotionSceneCfg(num_envs=4096, env_spacing=4.0)
-    # Basic settings
-    observations: ObservationsCfg = ObservationsCfg()
-    actions: ActionsCfg = ActionsCfg()
-    events: EventCfg = EventCfg()
-    # MDP settings
-    rewards: RewardsCfg = RewardsCfg()
-    terminations: TerminationsCfg = TerminationsCfg()
+class G1LocomotionRoughEnvCfg(G1RoughEnvCfg):
+    """G1 rough-terrain locomotion (customisable).
 
-    # Post initialization
-    def __post_init__(self) -> None:
-        """Post initialization."""
-        # general settings
-        self.decimation = 2
-        self.episode_length_s = 5
-        # viewer settings
-        self.viewer.eye = (8.0, 0.0, 5.0)
-        # simulation settings
-        self.sim.dt = 1 / 120
-        self.sim.render_interval = self.decimation
+    Inherits the full rough-terrain G1 setup from Isaac Lab.
+    """
+
+    pass
+
+
+@configclass
+class G1LocomotionRoughEnvCfg_PLAY(G1RoughEnvCfg_PLAY):
+    """Play / evaluation variant of the rough env (fewer envs, no randomisation)."""
+
+    pass
+
+
+@configclass
+class G1LocomotionStandingFlatEnvCfg(G1FlatEnvCfg):
+    """Flat terrain standing-only policy configuration.
+
+    Commands are fixed to zero so the policy specializes in balance and posture.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        # Arm actuator gains are reduced for smoother, physically plausible trajectory tracking.
+        if "arms" in self.scene.robot.actuators:
+            self.scene.robot.actuators["arms"].stiffness = 25.0
+            self.scene.robot.actuators["arms"].damping = 8.0
+
+        # Keep action dimension unchanged, but override arm-joint targets from disturbance curriculum.
+        if hasattr(self.actions, "joint_pos"):
+            self.actions.joint_pos.class_type = mdp.StandingArmBlendJointPositionAction
+
+        # Arm-motion curriculum event: starts with no motion, then small/slow, then larger/faster,
+        # and finally asymmetric motions with occasional sudden reversals.
+        self.events.standing_arm_motion_disturbance = EventTerm(
+            func=mdp.StandingArmTrajectoryDisturbance,
+            mode="interval",
+            interval_range_s=(self.sim.dt * self.decimation, self.sim.dt * self.decimation),
+            params={"asset_cfg": SceneEntityCfg("robot")},
+            is_global_time=False,
+        )
+
+        # Ensure reset keeps the arm-disturbance trajectory anchored to default posture.
+        self.events.standing_arm_motion_reset = EventTerm(
+            func=mdp.reset_arm_targets_to_default,
+            mode="reset",
+            params={
+                "asset_cfg": SceneEntityCfg(
+                    "robot",
+                    joint_names=[
+                        "left_shoulder_pitch_joint",
+                        "left_shoulder_roll_joint",
+                        "left_shoulder_yaw_joint",
+                        "left_elbow_pitch_joint",
+                        "left_elbow_roll_joint",
+                        "right_shoulder_pitch_joint",
+                        "right_shoulder_roll_joint",
+                        "right_shoulder_yaw_joint",
+                        "right_elbow_pitch_joint",
+                        "right_elbow_roll_joint",
+                    ],
+                )
+            },
+        )
+
+        base_velocity = getattr(self.commands, "base_velocity", None)
+        if base_velocity is not None:
+            if hasattr(base_velocity, "heading_command"):
+                base_velocity.heading_command = False
+            if hasattr(base_velocity, "rel_standing_envs"):
+                base_velocity.rel_standing_envs = 1.0
+            if hasattr(base_velocity, "ranges"):
+                ranges = base_velocity.ranges
+                if hasattr(ranges, "lin_vel_x"):
+                    ranges.lin_vel_x = (0.0, 0.0)
+                if hasattr(ranges, "lin_vel_y"):
+                    ranges.lin_vel_y = (0.0, 0.0)
+                if hasattr(ranges, "ang_vel_z"):
+                    ranges.ang_vel_z = (0.0, 0.0)
+
+        rewards = getattr(self, "rewards", None)
+        if rewards is not None:
+            if hasattr(rewards, "lin_vel_z_l2"):
+                rewards.lin_vel_z_l2.weight = -3.0
+            if hasattr(rewards, "ang_vel_xy_l2"):
+                rewards.ang_vel_xy_l2.weight = -0.2
+            if hasattr(rewards, "action_rate_l2"):
+                rewards.action_rate_l2.weight = -0.02
+            if hasattr(rewards, "dof_acc_l2"):
+                rewards.dof_acc_l2.weight = -2.5e-7
+            if hasattr(rewards, "feet_air_time"):
+                rewards.feet_air_time.weight = 0.0
+
+
+@configclass
+class G1LocomotionStandingTransitionFlatEnvCfg(G1FlatEnvCfg):
+    """Standing-focused config with tiny command pulses for transition robustness.
+
+    Most samples remain near-standstill, but occasional micro-commands train
+    recovery from brief command transients around zero.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        if "arms" in self.scene.robot.actuators:
+            self.scene.robot.actuators["arms"].stiffness = 25.0
+            self.scene.robot.actuators["arms"].damping = 8.0
+
+        if hasattr(self.actions, "joint_pos"):
+            self.actions.joint_pos.class_type = mdp.StandingArmBlendJointPositionAction
+
+        self.events.standing_arm_motion_disturbance = EventTerm(
+            func=mdp.StandingArmTrajectoryDisturbance,
+            mode="interval",
+            interval_range_s=(self.sim.dt * self.decimation, self.sim.dt * self.decimation),
+            params={"asset_cfg": SceneEntityCfg("robot")},
+            is_global_time=False,
+        )
+
+        self.events.standing_arm_motion_reset = EventTerm(
+            func=mdp.reset_arm_targets_to_default,
+            mode="reset",
+            params={
+                "asset_cfg": SceneEntityCfg(
+                    "robot",
+                    joint_names=[
+                        "left_shoulder_pitch_joint",
+                        "left_shoulder_roll_joint",
+                        "left_shoulder_yaw_joint",
+                        "left_elbow_pitch_joint",
+                        "left_elbow_roll_joint",
+                        "right_shoulder_pitch_joint",
+                        "right_shoulder_roll_joint",
+                        "right_shoulder_yaw_joint",
+                        "right_elbow_pitch_joint",
+                        "right_elbow_roll_joint",
+                    ],
+                )
+            },
+        )
+
+        base_velocity = getattr(self.commands, "base_velocity", None)
+        if base_velocity is not None:
+            if hasattr(base_velocity, "heading_command"):
+                base_velocity.heading_command = False
+            if hasattr(base_velocity, "rel_standing_envs"):
+                base_velocity.rel_standing_envs = 0.85
+            if hasattr(base_velocity, "resampling_time_range"):
+                base_velocity.resampling_time_range = (0.7, 1.8)
+            if hasattr(base_velocity, "ranges"):
+                ranges = base_velocity.ranges
+                if hasattr(ranges, "lin_vel_x"):
+                    ranges.lin_vel_x = (-0.2, 0.2)
+                if hasattr(ranges, "lin_vel_y"):
+                    ranges.lin_vel_y = (-0.15, 0.15)
+                if hasattr(ranges, "ang_vel_z"):
+                    ranges.ang_vel_z = (-0.25, 0.25)
+
+        rewards = getattr(self, "rewards", None)
+        if rewards is not None:
+            if hasattr(rewards, "lin_vel_z_l2"):
+                rewards.lin_vel_z_l2.weight = -3.0
+            if hasattr(rewards, "ang_vel_xy_l2"):
+                rewards.ang_vel_xy_l2.weight = -0.2
+            if hasattr(rewards, "action_rate_l2"):
+                rewards.action_rate_l2.weight = -0.02
+            if hasattr(rewards, "dof_acc_l2"):
+                rewards.dof_acc_l2.weight = -2.5e-7
+            if hasattr(rewards, "feet_air_time"):
+                rewards.feet_air_time.weight = 0.0
+
+
+@configclass
+class G1LocomotionStandingFlatEnvCfg_PLAY(G1LocomotionStandingFlatEnvCfg):
+    """Play variant for the standing flat terrain policy."""
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.scene.num_envs = 50
+        self.scene.env_spacing = 2.5
+        self.observations.policy.enable_corruption = False
+        self.events.base_external_force_torque = None
+        self.events.push_robot = None
+
+        # In play mode, begin arm-motion disturbances quickly for visualization.
+        if hasattr(self.events, "standing_arm_motion_disturbance"):
+            self.events.standing_arm_motion_disturbance.params["phase_step_boundaries"] = (20, 80, 180)
+            # Start play close to phase-2 so large motions appear almost immediately.
+            self.events.standing_arm_motion_disturbance.params["phase_step_offset"] = 80
+
+
+@configclass
+class G1LocomotionStandingTransitionFlatEnvCfg_PLAY(G1LocomotionStandingTransitionFlatEnvCfg):
+    """Play variant for transition-aware standing policy."""
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.scene.num_envs = 50
+        self.scene.env_spacing = 2.5
+        self.observations.policy.enable_corruption = False
+        self.events.base_external_force_torque = None
+        self.events.push_robot = None
+
+        if hasattr(self.events, "standing_arm_motion_disturbance"):
+            self.events.standing_arm_motion_disturbance.params["phase_step_boundaries"] = (20, 80, 180)
+            self.events.standing_arm_motion_disturbance.params["phase_step_offset"] = 80

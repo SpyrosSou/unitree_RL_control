@@ -33,6 +33,9 @@ docker/.container.cfg
 # Don't ignore the top-level .vscode directory as it is
 # used to configure VS Code settings
 !.vscode
+.vscode/browse.vc.db
+.vscode/browse.vc.db-shm
+.vscode/browse.vc.db-wal
 
 # Outputs
 **/output/*
@@ -57,12 +60,21 @@ _build
 **/runs/*
 **/logs/*
 **/recordings/*
+**/*.pt
+
+# Curated deployable checkpoints kept in-repo
+!chosen_checkpoints/
+!chosen_checkpoints/*.pt
+!chosen_checkpoints/*.md
 
 # Pre-Trained Checkpoints
 /.pretrained_checkpoints/
 
 # Teleop Recorded Dataset
 /datasets/
+
+# Personal notes / learning material
+/personal_development/
 
 # Tests
 tests/
