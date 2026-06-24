@@ -21,9 +21,35 @@ Main task families:
 Recent customizations include:
 
 - single walking policy with stronger transition exposure,
-- standing policy with arm-disturbance curriculum,
-- early visible standing disturbances in play mode,
+- standing policy with phased arm-disturbance curriculum and random push disturbances,
+- early visible standing disturbances in play mode, including mild random pushes,
 - arm action filtering and per-step delta limiting for smoother arm motion.
+
+Standing-policy details (current):
+
+- Standing commands are mostly near-zero, with a small corrective-velocity slice.
+- Reward shaping is tuned for balance recovery rather than gait generation:
+    - `lin_vel_z_l2 = -2.2`
+    - `ang_vel_xy_l2 = -0.12`
+    - `action_rate_l2 = -0.008`
+    - `dof_acc_l2 = -1.5e-7`
+    - `feet_air_time = 0.0`
+- Arm disturbance curriculum phases use per-step arm target deltas:
+    - Phase 0: `0.00 rad/step`
+    - Phase 1: `0.03 rad/step`
+    - Phase 2: `0.05 rad/step`
+    - Phase 3: `0.10 rad/step`
+    - Phase 4: `0.25 rad/step`
+- Push disturbance is decoupled from arm phase and sampled as a mixed random distribution,
+    so policy training sees easy/hard combinations instead of only correlated easy/easy
+    and hard/hard cases.
+
+Standing logging details:
+
+- Standing training writes `standing_metrics.csv` in each standing run directory.
+- CSV now includes push-disturbance episode summaries:
+    - `max_push_lin_speed_m_s`
+    - `max_push_yaw_speed_rad_s`
 
 ## Environment
 

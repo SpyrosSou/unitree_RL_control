@@ -55,10 +55,3 @@ class G1LocomotionFlatTransitionPPORunnerCfg(G1FlatPPORunnerCfg):
         self.experiment_name = "legs/g1_locomotion_flat_transition"
 
 
-@configclass
-class G1LocomotionStandingTransitionFlatPPORunnerCfg(G1FlatPPORunnerCfg):
-    """RSL-RL PPO config for transition-aware standing policy."""
-
-    def __post_init__(self):
-        super().__post_init__()
-        self.experiment_name = "standing/g1_locomotion_flat_transition"

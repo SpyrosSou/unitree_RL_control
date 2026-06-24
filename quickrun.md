@@ -186,18 +186,15 @@ python walking_testing/g1_stand_walk_switch_demo.py
 
 # Transition-focused retraining (better stop/start and reversals)
 python scripts/rsl_rl/train.py --task G1-Locomotion-Flat-Transition-v0 --headless
-python scripts/rsl_rl/train.py --task G1-Locomotion-Standing-Transition-Flat-v0 --headless
 
 # Play with transition-trained checkpoints
 python scripts/rsl_rl/play.py --task G1-Locomotion-Flat-Transition-Play-v0 \
     --checkpoint logs/rsl_rl/legs/g1_locomotion_flat_transition/<run>/model_1500.pt
-python scripts/rsl_rl/play.py --task G1-Locomotion-Standing-Transition-Flat-Play-v0 \
-    --checkpoint logs/rsl_rl/standing/g1_locomotion_flat_transition/<run>/model_1500.pt
 
-# Use transition-trained checkpoints in switch demo
+# Use transition-trained walking checkpoint in switch demo
 python walking_testing/g1_stand_walk_switch_demo.py \
     --walking_checkpoint logs/rsl_rl/legs/g1_locomotion_flat_transition/<run>/model_1500.pt \
-    --standing_checkpoint logs/rsl_rl/standing/g1_locomotion_flat_transition/<run>/model_1500.pt
+    --standing_checkpoint logs/rsl_rl/standing/g1_locomotion_flat/<run>/model_1500.pt
 ```
 
 ---

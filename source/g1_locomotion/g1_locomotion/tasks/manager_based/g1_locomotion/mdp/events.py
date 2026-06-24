@@ -54,17 +54,21 @@ class StandingArmTrajectoryDisturbance(ManagerTermBase):
 
     The curriculum is phased by global env step count:
     - Phase 0: no arm motion (standing baseline warm-up)
-    - Phase 1: moderate motions
-    - Phase 2: large motions
-    - Phase 3: large + faster + asymmetric + occasional reversals
+    - Phase 1: mild motions (0.03 rad/step ≈ 1.5 rad/s @ 50 Hz)
+    - Phase 2: moderate motions (0.05 rad/step ≈ 2.5 rad/s @ 50 Hz)
+    - Phase 3: stronger motions (0.10 rad/step ≈ 5.0 rad/s @ 50 Hz)
+    - Phase 4: stress-test bursts (0.25 rad/step ≈ 12.5 rad/s @ 50 Hz)
     """
 
-    _PHASE_STEP_BOUNDARIES = (6000, 15000, 27000)
-    _NO_MOTION_PROB = (1.00, 0.00, 0.00, 0.00)
-    _MAX_DELTA_RAD = (0.00, 0.030, 0.070, 0.100)
-    _MAX_AMPLITUDE_RAD = (0.00, 0.28, 0.60, 0.90)
-    _ASYMMETRY_PROB = (0.00, 0.10, 0.35, 0.85)
-    _REVERSAL_PROB = (0.00, 0.00, 0.05, 0.20)
+    # 4 boundaries -> 5 phases (0-4).
+    # Spend longer at lower speeds where the real platform normally operates,
+    # then introduce progressively harder disturbances.
+    _PHASE_STEP_BOUNDARIES = (12000, 30000, 50000, 80000)
+    _NO_MOTION_PROB    = (1.00, 0.00, 0.00, 0.00, 0.00)
+    _MAX_DELTA_RAD     = (0.00, 0.030, 0.050, 0.100, 0.250)
+    _MAX_AMPLITUDE_RAD = (0.00, 0.24,  0.45,  0.70,  0.90)
+    _ASYMMETRY_PROB    = (0.00, 0.08,  0.20,  0.45,  0.75)
+    _REVERSAL_PROB     = (0.00, 0.00,  0.02,  0.06,  0.15)
 
     def __init__(self, cfg: EventTermCfg, env: ManagerBasedEnv):
         super().__init__(cfg, env)
@@ -137,20 +141,17 @@ class StandingArmTrajectoryDisturbance(ManagerTermBase):
         self._env._standing_arm_motion_targets = self._targets
 
     def _phase_index(self, common_step_counter: int) -> int:
-        if common_step_counter < self._phase_step_boundaries[0]:
-            return 0
-        if common_step_counter < self._phase_step_boundaries[1]:
-            return 1
-        if common_step_counter < self._phase_step_boundaries[2]:
-            return 2
-        return 3
+        for i, boundary in enumerate(self._phase_step_boundaries):
+            if common_step_counter < boundary:
+                return i
+        return len(self._phase_step_boundaries)
 
     def __call__(
         self,
         env: ManagerBasedEnv,
         env_ids: torch.Tensor,
         asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-        phase_step_boundaries: tuple[int, int, int] | None = None,
+        phase_step_boundaries: tuple[int, ...] | None = None,
         phase_step_offset: int = 0,
     ) -> None:
         del asset_cfg
@@ -204,3 +205,102 @@ class StandingArmTrajectoryDisturbance(ManagerTermBase):
 
         self._targets[env_ids] = updated
         self._env._standing_arm_motion_targets = self._targets
+
+
+class StandingRandomPushDisturbance(ManagerTermBase):
+    """Apply random mixed-intensity pushes during standing-policy training.
+
+    Push intensity is intentionally decoupled from arm-motion phase so the policy
+    sees all combinations: easy/hard arm swings with easy/hard pushes.
+    """
+
+    def __call__(
+        self,
+        env: ManagerBasedEnv,
+        env_ids: torch.Tensor,
+        asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+        warmup_steps: int = 12000,
+        push_probability: float = 0.60,
+        hard_push_probability: float = 0.20,
+        easy_lin_speed_range: tuple[float, float] = (0.06, 0.20),
+        hard_lin_speed_range: tuple[float, float] = (0.20, 0.45),
+        yaw_vel_range_easy: tuple[float, float] = (-0.20, 0.20),
+        yaw_vel_range_hard: tuple[float, float] = (-0.55, 0.55),
+    ) -> None:
+        # Expose the push applied at this event tick for logging/diagnostics.
+        if not hasattr(env, "_standing_push_vx"):
+            env._standing_push_vx = torch.zeros(env.num_envs, dtype=torch.float32, device=self.device)
+            env._standing_push_vy = torch.zeros(env.num_envs, dtype=torch.float32, device=self.device)
+            env._standing_push_lin_speed = torch.zeros(env.num_envs, dtype=torch.float32, device=self.device)
+            env._standing_push_yaw_speed = torch.zeros(env.num_envs, dtype=torch.float32, device=self.device)
+            env._standing_push_applied = torch.zeros(env.num_envs, dtype=torch.bool, device=self.device)
+
+        env._standing_push_vx.zero_()
+        env._standing_push_vy.zero_()
+        env._standing_push_lin_speed.zero_()
+        env._standing_push_yaw_speed.zero_()
+        env._standing_push_applied.zero_()
+
+        # Warm-up in pure standing before introducing pushes.
+        if int(env.common_step_counter) < int(warmup_steps):
+            return
+
+        asset: Articulation = env.scene[asset_cfg.name]
+
+        if env_ids is None:
+            env_ids = torch.arange(env.num_envs, device=asset.device)
+        elif isinstance(env_ids, slice):
+            env_ids = torch.arange(env.num_envs, device=asset.device)
+
+        if len(env_ids) == 0:
+            return
+
+        # Randomly choose which environments receive a push at this event tick.
+        push_mask = torch.rand(len(env_ids), device=asset.device) < float(push_probability)
+        if not torch.any(push_mask):
+            return
+        push_env_ids = env_ids[push_mask]
+        n_push = len(push_env_ids)
+
+        # Mixture model: most pushes are easy/moderate, some are hard outliers.
+        hard_mask = torch.rand(n_push, device=asset.device) < float(hard_push_probability)
+
+        easy_mag = (
+            torch.rand(n_push, device=asset.device)
+            * float(easy_lin_speed_range[1] - easy_lin_speed_range[0])
+            + float(easy_lin_speed_range[0])
+        )
+        hard_mag = (
+            torch.rand(n_push, device=asset.device)
+            * float(hard_lin_speed_range[1] - hard_lin_speed_range[0])
+            + float(hard_lin_speed_range[0])
+        )
+        lin_mag = torch.where(hard_mask, hard_mag, easy_mag)
+
+        heading = (2.0 * torch.pi) * torch.rand(n_push, device=asset.device)
+        push_vx = lin_mag * torch.cos(heading)
+        push_vy = lin_mag * torch.sin(heading)
+
+        easy_yaw = (
+            torch.rand(n_push, device=asset.device)
+            * float(yaw_vel_range_easy[1] - yaw_vel_range_easy[0])
+            + float(yaw_vel_range_easy[0])
+        )
+        hard_yaw = (
+            torch.rand(n_push, device=asset.device)
+            * float(yaw_vel_range_hard[1] - yaw_vel_range_hard[0])
+            + float(yaw_vel_range_hard[0])
+        )
+        push_yaw = torch.where(hard_mask, hard_yaw, easy_yaw)
+
+        env._standing_push_vx[push_env_ids] = push_vx.float()
+        env._standing_push_vy[push_env_ids] = push_vy.float()
+        env._standing_push_lin_speed[push_env_ids] = lin_mag.float()
+        env._standing_push_yaw_speed[push_env_ids] = push_yaw.abs().float()
+        env._standing_push_applied[push_env_ids] = True
+
+        vel_w = asset.data.root_vel_w[push_env_ids].clone()
+        vel_w[:, 0] += push_vx
+        vel_w[:, 1] += push_vy
+        vel_w[:, 5] += push_yaw
+        asset.write_root_velocity_to_sim(vel_w, env_ids=push_env_ids)

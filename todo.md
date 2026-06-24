@@ -8,10 +8,12 @@
 
 ---
 
-## 1) Standing Policy (with arm disturbances) — `G1-Locomotion-Standing-Flat-v0`
+## 1) Standing Policy (with arm disturbances + minimal corrective stepping) — `G1-Locomotion-Standing-Flat-v0`
 
 This task now includes arm-motion disturbances by default during training.
-You do not need extra flags to enable it.
+It also includes a small near-zero command slice so the policy can learn
+tiny corrective steps instead of only in-place balancing.
+You do not need extra flags to enable this.
 
 ### Train (new run)
 
@@ -20,7 +22,7 @@ python scripts/rsl_rl/train.py \
   --task G1-Locomotion-Standing-Flat-v0 \
   --num_envs 4096 \
   --headless \
-  --max_iterations 1500
+  --max_iterations 2500
 ```
 
 ### Resume
@@ -34,7 +36,7 @@ python scripts/rsl_rl/train.py \
   --headless \
   --resume \
   --load_run <YYYY-MM-DD_HH-MM-SS> \
-  --max_iterations 1500
+  --max_iterations 2500
 ```
 
 Option B (resume from an explicit checkpoint path):
@@ -46,7 +48,7 @@ python scripts/rsl_rl/train.py \
   --headless \
   --resume \
   --checkpoint logs/rsl_rl/standing/g1_locomotion_flat/<run>/model_<k>.pt \
-  --max_iterations 1500
+  --max_iterations 2500
 ```
 
 ### Play / visualize output
@@ -55,12 +57,15 @@ python scripts/rsl_rl/train.py \
 python scripts/rsl_rl/play.py \
   --task G1-Locomotion-Standing-Flat-Play-v0 \
   --num_envs 4 \
-  --checkpoint logs/rsl_rl/standing/g1_locomotion_flat/<run>/model_1500.pt
+  --checkpoint logs/rsl_rl/standing/g1_locomotion_flat/<run>/model_2500.pt
 ```
 
 Notes:
 
-- Standing play now introduces arm disturbances early for visualization.
+- Standing play introduces arm disturbances early for visualization.
+- For this updated regime, validate at checkpoints around `model_1200`, `model_1800`, and `model_2500`.
+- Keep the run that has the lowest fall rate during high-intensity arm phases.
+- Each standing training run now writes `standing_metrics.csv` alongside the checkpoints.
 - Logs/checkpoints: `logs/rsl_rl/standing/g1_locomotion_flat/<run>/...`
 
 ---

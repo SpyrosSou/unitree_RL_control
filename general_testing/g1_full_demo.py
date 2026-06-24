@@ -145,6 +145,9 @@ TRANSITION_STEPS_TO_STAND   = 22
 
 # Arm action scale (must match what the arm policy was trained with)
 ARM_ACTION_SCALE = 0.5
+# Cap arm target changes to realistic joint speed for sim integration.
+# 2.5 rad/s at 50 Hz policy rate => 0.05 rad per policy step.
+ARM_MAX_JOINT_DELTA_PER_STEP = 0.05
 
 # Goal-sphere colours
 _RED_SPHERE_CFG = VisualizationMarkersCfg(
@@ -248,9 +251,12 @@ class G1FullDemo:
 
         # ------ identify arm joint indices in the locomotion action vector ------
         # The locomotion env uses joint_names=[".*"] — all joints appear in the action.
-        # We need the indices so we can override just the arm columns.
+        # We keep separate index sets for:
+        #   - the arm(s) controlled by the IK policy
+        #   - all arm joints, which must be held neutral while standing without a target
         self.arm_joint_ids_in_action, self.arm_joint_names_ordered = \
-            self._find_arm_action_indices()
+            self._find_arm_action_indices(include_all_arms=False)
+        self.all_arm_joint_ids_in_action, _ = self._find_arm_action_indices(include_all_arms=True)
 
         # ------ load locomotion policies ------
         self.standing_policy = self._load_loco_policy(agent_cfg, self.standing_ckpt)
@@ -315,18 +321,20 @@ class G1FullDemo:
 
     # ------------------------------------------------------------------ utils
 
-    def _find_arm_action_indices(self) -> tuple[torch.Tensor, list[str]]:
+    def _find_arm_action_indices(self, include_all_arms: bool = False) -> tuple[torch.Tensor, list[str]]:
         """Return (action_vector_indices, joint_names) for the arm joints.
 
         The locomotion action manager sorts joints by the order returned by
         robot.find_joints([".*"]).  We query each arm joint name and record
         its position in that ordering.
         """
-        if self.arm_mode in ("left", "both"):
+        if include_all_arms:
+            arm_names = list(_LEFT_ARM_JOINTS) + list(_RIGHT_ARM_JOINTS)
+        elif self.arm_mode in ("left", "both"):
             arm_names = list(_LEFT_ARM_JOINTS)
         else:
             arm_names = list(_RIGHT_ARM_JOINTS)
-        if self.arm_mode == "both":
+        if self.arm_mode == "both" and not include_all_arms:
             arm_names += list(_RIGHT_ARM_JOINTS)
 
         # Get ALL joints in the same order the action manager uses
@@ -463,7 +471,10 @@ class G1FullDemo:
         # Compute new arm joint targets from current position + delta
         current = self.robot.data.joint_pos[0, self.arm_joint_ids_robot]  # (n_arm_joints,)
         limits  = self.robot.data.soft_joint_pos_limits[0, self.arm_joint_ids_robot]  # (n, 2)
-        new_targets = (current + arm_delta.squeeze(0) * ARM_ACTION_SCALE).clamp(
+        delta = (arm_delta.squeeze(0) * ARM_ACTION_SCALE).clamp(
+            -ARM_MAX_JOINT_DELTA_PER_STEP, ARM_MAX_JOINT_DELTA_PER_STEP
+        )
+        new_targets = (current + delta).clamp(
             limits[:, 0], limits[:, 1]
         )
 
@@ -476,6 +487,12 @@ class G1FullDemo:
         modified = loco_action.clone()
         modified[0, self.arm_joint_ids_in_action] = action_delta
 
+        return modified
+
+    def _hold_arms_at_default(self, loco_action: torch.Tensor) -> torch.Tensor:
+        """Zero the arm slice so the locomotion action holds the default arm posture."""
+        modified = loco_action.clone()
+        modified[0, self.all_arm_joint_ids_in_action] = 0.0
         return modified
 
     def _has_active_arm_target(self) -> bool:
@@ -589,6 +606,8 @@ class G1FullDemo:
         )
         if arm_active:
             loco_action = self._arm_action_override(loco_action)
+        elif self.mode == "standing" or (self._in_transition and self._transition_to == "standing"):
+            loco_action = self._hold_arms_at_default(loco_action)
 
         return loco_action
 

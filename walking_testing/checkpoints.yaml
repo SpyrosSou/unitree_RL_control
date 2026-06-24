@@ -5,9 +5,8 @@
 #
 # Algorithm is inferred from the path: "logs/rsl_rl/..." → rsl_rl
 #
-# After retraining transition-focused policies, uncomment and fill in
-# walking_transition / standing_transition entries and switch the active
-# checkpoints in the switch demo if you want to use those instead.
+# After retraining the walking transition policy, uncomment and fill in
+# walking_transition if you want to use it instead of the base walking checkpoint.
 
 walking:
   # Flat-terrain walking.  Trained 3149 iterations with G1-Locomotion-Flat-v0.
@@ -23,7 +22,3 @@ standing:
 #   # Faster command resampling (0.8-2.0 s), exposure to stop/start/reversal
 #   checkpoint: logs/rsl_rl/legs/g1_locomotion_flat_transition/<YYYY-MM-DD_HH-MM-SS>/model_1500.pt
 
-# standing_transition:
-#   # Task: G1-Locomotion-Standing-Transition-Flat-v0
-#   # 85% standing envs + 15% micro-command envs
-#   checkpoint: logs/rsl_rl/standing/g1_locomotion_flat_transition/<YYYY-MM-DD_HH-MM-SS>/model_1500.pt

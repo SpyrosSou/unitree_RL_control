@@ -1,7 +1,7 @@
 # Training Regimes
 
 Current training-process snapshot for the three active policy families in this repo.
-Date: 18 June 2026.
+Date: 24 June 2026.
 
 ## Common Training Setup (All Policies)
 
@@ -60,26 +60,41 @@ Primary role:
 
 Main standing training regime (`G1-Locomotion-Standing-Flat-v0`):
 
-- Training command distribution is centered on zero velocity.
+- Training command distribution is mostly zero velocity, with a small near-zero pulse slice.
+- This teaches minimal corrective stepping under disturbance while preserving standing behavior.
 - Designed to suppress bounce, sway, and jitter rather than produce gait.
 - Reward shaping is intentionally different from walking: stronger penalties on vertical body velocity, roll/pitch body rates, and abrupt action changes.
-- Feet-air-time gait reward is removed for standing behavior.
+- Current standing reward weights:
+  - `lin_vel_z_l2 = -2.2`
+  - `ang_vel_xy_l2 = -0.12`
+  - `action_rate_l2 = -0.008`
+  - `dof_acc_l2 = -1.5e-7`
+  - `feet_air_time = 0.0`
 
 Standing with arm-motion disturbance (same task name: `G1-Locomotion-Standing-Flat-v0`):
 
 - The standing policy now trains with random arm trajectories to expose center-of-gravity shifts.
 - Arm targets are generated as smooth bounded trajectories, not instantaneous jumps.
 - Arm gains are reduced during standing training (`stiffness=25`, `damping=8`) so disturbances evolve over realistic durations.
-- Curriculum phases are applied by global step count:
-  - Phase 0: no arm motion (baseline standing behavior)
-  - Phase 1: moderate motions
-  - Phase 2: large motions
-  - Phase 3: large + faster (still bounded) + asymmetric + occasional reversals
+- Curriculum phases are applied by global step count with longer low-speed exposure:
+  - Phase 0: no arm motion (`0.00 rad/step`)
+  - Phase 1: mild motions (`0.03 rad/step`)
+  - Phase 2: moderate motions (`0.05 rad/step`)
+  - Phase 3: stronger motions (`0.10 rad/step`)
+  - Phase 4: stress-test bursts (`0.25 rad/step`)
 - Shoulder joints receive larger excursion envelopes than elbow joints so arm raises become more realistic without making elbow behavior too extreme.
+
+Standing with random push disturbance (same task name: `G1-Locomotion-Standing-Flat-v0`):
+
+- Training now includes interval push disturbances implemented as random root-velocity perturbations.
+- Push intensity is intentionally decoupled from arm phase.
+- Each push interval samples a mixed distribution (mostly easy/moderate, some hard outliers), so policy training includes all arm/push combinations.
+- Push direction is a random planar vector (not fixed perpendicular), with optional yaw perturbation.
+- A warm-up period is kept before pushes activate.
 
 Suggested workflow now:
 
-- Train standing for `1000` iterations headless first.
+- Train standing for `2000-2500` iterations headless first.
 - Then inspect behavior with `play.py` and standing-specific demos.
 
 Suggested walking workflow now:
@@ -87,16 +102,10 @@ Suggested walking workflow now:
 - Train walking after standing converges so checkpoint updates are staggered.
 - Recommended first run is the transition-focused walking task, because it is strongest for switch robustness.
 
-Transition-aware standing refinement (`G1-Locomotion-Standing-Transition-Flat-v0`):
-
-- Mostly zero-command environments plus a small fraction of micro-command environments.
-- Current setup is approximately `85%` zero-command and `15%` micro-command exposure.
-- Improves robustness when decelerating from walking into a full stop.
-
 Output/checkpoints:
 
 - Base standing logs: `logs/rsl_rl/standing/g1_locomotion_flat/<run>/...`
-- Transition standing logs: `logs/rsl_rl/standing/g1_locomotion_flat_transition/<run>/...`
+- Each standing run also writes `standing_metrics.csv` in the run folder with per-episode rows for fall / timeout, max tilt, minimum height, reward return, action extremes, and push disturbance metrics (`max_push_lin_speed_m_s`, `max_push_yaw_speed_rad_s`).
 
 ## 3. Left Arm Control Policy Regime
 

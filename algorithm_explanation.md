@@ -84,30 +84,34 @@ Walking training uses the full body and all joints. The policy learns to convert
 velocity command into a gait while keeping the torso stable. For the standard
 walking policy, the command distribution is mostly about forward motion, turning,
 and lateral correction.
-
-The transition-focused walking variant is trained with more stop-go behavior,
-shorter command resampling windows, and more exposure to reversals. That makes it
+The standing policy is trained to hold the robot upright under zero or near-zero
+commands, with a small micro-command slice so the policy can learn minimal
+corrective stepping instead of only static balance.
 better at starting, stopping, and switching direction instead of only cruising at
 steady speed.
 
 ### Standing training
 
-Standing training is a separate policy because the objective is different. The
-standing policy sees zero-command or near-zero-command situations and learns to
-stay quiet, upright, and low jitter. Compared with walking, it is penalized much
-more strongly for bounce and sway, and it does not need to learn a gait at all.
+| `lin_vel_z_l2` weight | **−2.2** | Strongly penalise vertical bounce |
+| `ang_vel_xy_l2` weight | **−0.12** | Penalise roll/pitch wobble without forbidding recovery |
+| `action_rate_l2` weight | **−0.008** | Smooth actions for quiet standing |
+| `dof_acc_l2` weight | **−1.5×10⁻⁷** | Smoother joint acceleration |
 
 The transition-focused standing variant adds a small amount of micro-command
 exposure so it can absorb the residual motion that appears when the robot decelerates
 from walking into a stop.
-
-### Why split the tasks this way?
-
-If a single policy is trained for everything at once, the reward landscape becomes
-harder to interpret and the behavior often becomes compromised. Splitting the tasks
+A walking policy trained with `rel_standing_envs = 0` (no zero-command envs)
+has little incentive to remain perfectly still — it optimises for forward motion.
+When you release the joystick, the walking policy continues to drift, sway, or
+oscillate. A dedicated standing policy, by contrast, is trained to suppress
+those motions while still allowing small corrective steps when arm disturbance
+is high.
 lets each policy specialize:
 - arm policy: reach targets cleanly
 - walking policy: move and balance
+- `max_iterations = 2500` in the current repo snapshot
+- Validate intermediate checkpoints around `model_1200`, `model_1800`, and `model_2500`
+- Standing runs now write `standing_metrics.csv` in the log folder
 - standing policy: hold still and stabilize
 
 The integrated demo can then combine those specialized policies at runtime.
@@ -116,9 +120,9 @@ The integrated demo can then combine those specialized policies at runtime.
 
 ## 4. Proximal Policy Optimization (PPO)
 
-PPO is an on-policy actor-critic algorithm that collects experience in parallel
-across many environments, then updates a shared neural network to:
-- Maximize expected cumulative reward (actor / policy head)
+- `resampling_time_range = (0.8, 2.0)` s  — commands change more frequently, forcing the policy to handle stop/start/reversal
+- `rel_standing_envs = 0.25` — teaches the walking policy to brake cleanly rather than stumbling
+- Wider command ranges: `lin_vel_x = (−1, 1)`, `lin_vel_y = (−0.8, 0.8)`, `ang_vel_z = (−1, 1)` — includes backward walking and tight reversals
 - Accurately predict value (critic / value head)
 
 ### The PPO update step
@@ -292,18 +296,18 @@ During training the command $[v_x, v_y, \omega_z]$ is resampled every
 **Runner cfg:** `G1LocomotionStandingFlatPPORunnerCfg`  
 **Log namespace:** `standing/g1_locomotion_flat`
 
-The standing policy is trained with **zero velocity commands** in every environment
-(`rel_standing_envs = 1.0`) so the policy never sees a locomotion command and
-specialises entirely in balance.
+The standing policy is trained to hold the robot upright under zero or near-zero
+commands, with a small micro-command slice so the policy can learn minimal
+corrective stepping instead of only static balance.
 
 ### Key reward shaping changes vs. walking
 
 | Term | Value | Reason |
 |---|---|---|
-| `lin_vel_z_l2` weight | **−3.0** (vs −0.2) | Strongly penalise vertical bounce |
-| `ang_vel_xy_l2` weight | **−0.2** (vs −0.05) | Strongly penalise roll/pitch wobble |
-| `action_rate_l2` weight | **−0.02** (vs −0.005) | Smooth actions for quiet standing |
-| `dof_acc_l2` weight | **−2.5×10⁻⁷** (vs −1×10⁻⁷) | Smoother joint acceleration |
+| `lin_vel_z_l2` weight | **−2.2** | Strongly penalise vertical bounce |
+| `ang_vel_xy_l2` weight | **−0.12** | Penalise roll/pitch wobble without forbidding recovery |
+| `action_rate_l2` weight | **−0.008** | Smooth actions for quiet standing |
+| `dof_acc_l2` weight | **−1.5×10⁻⁷** | Smoother joint acceleration |
 | `feet_air_time` weight | **0.0** | No gait cycle needed — feet stay on ground |
 
 ### Why train a separate standing policy?
@@ -311,15 +315,17 @@ specialises entirely in balance.
 A walking policy trained with `rel_standing_envs = 0` (no zero-command envs)
 has little incentive to remain perfectly still — it optimises for forward motion.
 When you release the joystick, the walking policy continues to drift, sway, or
-oscillate. A dedicated standing policy, by contrast, is trained exclusively to
-minimise all body motion and maintains a rigid, upright posture.
+oscillate. A dedicated standing policy, by contrast, is trained to suppress
+those motions while still allowing small corrective steps when arm disturbance
+is high.
 
 ### Training schedule
 
-- `max_iterations = 1500` (standing converges faster — simpler objective)
-- All other hyperparameters identical to walking
+- `max_iterations = 2500` in the current repo snapshot
+- Validate intermediate checkpoints around `model_1200`, `model_1800`, and `model_2500`
+- Standing runs now write `standing_metrics.csv` in the log folder
 
----
+
 
 ## 9. Transition-Focused Variants
 
@@ -328,20 +334,9 @@ These tasks improve the quality of mode switches in the stand/walk switch demo.
 ### Walking transition (`G1-Locomotion-Flat-Transition-v0`)
 
 Changes vs. standard walking:
-- `resampling_time_range = (0.8, 2.0)` s  (vs Isaac Lab default ~5 s)
-  — commands change more frequently, forcing the policy to handle stop/start/reversal
-- `rel_standing_envs = 0.25` — 25% of environments hold zero command
-  — teaches the walking policy to brake cleanly rather than stumbling
-- Wider command ranges: `lin_vel_x = (−1, 1)`, `lin_vel_y = (−0.8, 0.8)`,
-  `ang_vel_z = (−1, 1)` — includes backward walking and tight reversals
-
-### Standing transition (`G1-Locomotion-Standing-Transition-Flat-v0`)
-
-Changes vs. standard standing:
-- `rel_standing_envs = 0.85` — 85% zero-command, 15% micro-command
-- Micro-command range: `lin_vel_x = (−0.2, 0.2)`, `lin_vel_y = (−0.15, 0.15)`,
-  `ang_vel_z = (−0.25, 0.25)` — exposes standing policy to tiny residual velocities
-  that appear when the robot decelerates from a walk
+- `resampling_time_range = (0.8, 2.0)` s — commands change more frequently, forcing the policy to handle stop/start/reversal
+- `rel_standing_envs = 0.25` — teaches the walking policy to brake cleanly rather than stumbling
+- Wider command ranges: `lin_vel_x = (−1, 1)`, `lin_vel_y = (−0.8, 0.8)`, `ang_vel_z = (−1, 1)` — includes backward walking and tight reversals
 
 ---
 

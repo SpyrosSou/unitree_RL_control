@@ -1,6 +1,6 @@
 # Testing Reference
 
-How to run the interactive test scripts in `walking_testing/` and `arm_testing/`.
+How to run the interactive test scripts in `walking_testing/`, `arm_testing/`, and `general_testing/`.
 
 All commands run from `~/Elm/Code/g1_locomotion` with `conda activate isaac_g1_control`.
 
@@ -20,7 +20,7 @@ logs/rsl_rl/
     g1_locomotion_flat/ 2026-06-03_10-20-23/  model_150.pt … model_3149.pt
     g1_locomotion_rough/ ...
     standing/
-        g1_locomotion_flat/ 2026-06-16_10-00-00/ model_0.pt ... model_1500.pt
+        g1_locomotion_flat/ 2026-06-16_10-00-00/ model_0.pt ... model_2500.pt
 ```
 
 Pick the latest `model_N.pt` in the run you want (higher N = more training):
@@ -98,6 +98,9 @@ Or specify one explicitly:
 python walking_testing/g1_standing_demo.py \
     --checkpoint logs/rsl_rl/standing/g1_locomotion_flat/<run>/model_1500.pt
 ```
+
+Standing training runs also write `standing_metrics.csv` in the same run folder so you can inspect
+fall rate, peak tilt, minimum base height, and similar episode-level metrics after training.
 
 ---
 
@@ -245,6 +248,140 @@ python arm_testing/g1_arm_reach_test.py \
 | z | height above ground | 0.9 – 1.2 m |
 
 > Targets outside the trained range will still be attempted but expect degraded accuracy.
+
+---
+
+## general_testing/g1_full_demo.py
+
+Integrated demo that combines:
+
+- standing policy for balance at zero velocity
+- walking policy for keyboard-commanded locomotion
+- arm IK policy that activates only when an arm target is set
+
+The demo starts in standing mode. When you command walking, locomotion takes over the whole body.
+When you stop and the robot settles, the standing policy resumes and the arm policy can continue
+tracking the active target.
+
+### Checkpoint resolution order
+
+Each checkpoint path is chosen in this order:
+
+1. explicit CLI override
+2. `general_testing/checkpoints.yaml`
+3. hardcoded fallback inside the script
+
+Arm mode is chosen in this order:
+
+1. `--arm`
+2. `arm_mode` in `general_testing/checkpoints.yaml`
+3. default `left`
+
+### Script-specific arguments
+
+| Argument | Required | Default | Description |
+| --- | --- | --- | --- |
+| `--standing_checkpoint` | no | from YAML or fallback | Standing policy checkpoint |
+| `--walking_checkpoint` | no | from YAML or fallback | Walking policy checkpoint |
+| `--arm_checkpoint` | no | from YAML or fallback | Arm IK checkpoint matching the active arm mode |
+| `--arm` | no | `left` if not set in YAML | Active arm mode: `left`, `right`, or `both` |
+| `--target X Y Z` | no | no initial target | Initial robot-local arm target |
+
+### Common inherited launch arguments
+
+The script also accepts standard RSL-RL / Isaac Lab launcher flags. The ones most likely to be
+useful at the terminal are:
+
+| Argument | Description |
+| --- | --- |
+| `--headless` | Run without opening the simulator window |
+| `--device DEVICE` | Choose device, e.g. `cpu`, `cuda`, `cuda:0` |
+| `--enable_cameras` | Enable camera sensors and related extensions |
+| `--livestream {0,1,2}` | Force livestream mode |
+| `--verbose` | More simulation log output |
+| `--info` | Info-level simulation log output |
+
+It also exposes generic RSL-RL flags such as `--experiment_name`, `--run_name`, `--resume`,
+`--load_run`, `--checkpoint`, `--logger`, and `--log_project_name`, although those are usually
+not important for normal demo usage.
+
+### Run with defaults from YAML
+
+```bash
+python general_testing/g1_full_demo.py
+```
+
+With the current `general_testing/checkpoints.yaml`, this means:
+
+- walking checkpoint from `chosen_checkpoints/walking_latest.pt`
+- standing checkpoint from `chosen_checkpoints/standing_latest.pt`
+- arm mode from `arm_mode: left`
+- arm checkpoint from `chosen_checkpoints/arm_left_latest.pt`
+
+### Override checkpoints explicitly
+
+```bash
+python general_testing/g1_full_demo.py \
+    --standing_checkpoint logs/rsl_rl/standing/g1_locomotion_flat/<run>/model_1500.pt \
+    --walking_checkpoint logs/rsl_rl/legs/g1_locomotion_flat/<run>/model_3149.pt \
+    --arm_checkpoint logs/rsl_rl/arms/g1_arm_ik_left/<run>/model_4200.pt \
+    --arm left
+```
+
+### Start with an initial arm target
+
+```bash
+python general_testing/g1_full_demo.py \
+    --arm left \
+    --target 0.3 0.2 1.0
+```
+
+### Both-arm mode
+
+```bash
+python general_testing/g1_full_demo.py \
+    --arm both \
+    --arm_checkpoint logs/rsl_rl/arms/g1_arm_ik_both/<run>/model_1000.pt \
+    --target 0.3 0.2 1.0
+```
+
+In `--arm both` mode, the initial target is interpreted as the left-arm target and mirrored to the
+right arm by negating `y`. So `0.3 0.2 1.0` becomes:
+
+- left target: `(0.3, 0.2, 1.0)`
+- right target: `(0.3, -0.2, 1.0)`
+
+### Keyboard / prompt controls
+
+| Key | Action |
+| --- | --- |
+| `W` | Walk forward |
+| `A` | Turn left |
+| `D` | Turn right |
+| `Q` | Strafe left |
+| `E` | Strafe right |
+| `S` | Stop walking |
+| `T` | Open a terminal prompt for a new arm target |
+| `L` | Select left arm as the active prompt target in `--arm both` mode |
+| `R` | Select right arm as the active prompt target in `--arm both` mode |
+| `C` | Toggle camera mode |
+
+Pressing `T` blocks the simulation briefly and opens a console prompt for a new target in robot-local
+coordinates.
+
+### Target coordinate reference
+
+| Axis | Direction | Typical trained range |
+| --- | --- | --- |
+| x | forward from robot base | 0.1 - 0.5 m |
+| y | left positive, right negative | 0.05 - 0.45 m on left, -0.05 - -0.45 m on right |
+| z | height above ground | 0.9 - 1.2 m |
+
+### Useful help command
+
+```bash
+python general_testing/g1_full_demo.py --help
+```
 
 ---
 
