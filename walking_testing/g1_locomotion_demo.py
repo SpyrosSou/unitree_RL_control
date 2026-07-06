@@ -45,7 +45,6 @@ _spec.loader.exec_module(cli_args)
 
 from isaaclab.app import AppLauncher
 
-import os
 import yaml
 
 _YAML_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkpoints.yaml")
@@ -81,8 +80,6 @@ simulation_app = app_launcher.app
 import torch
 from rsl_rl.runners import OnPolicyRunner
 
-import carb
-import omni
 from omni.kit.viewport.utility import get_viewport_from_window_name
 from omni.kit.viewport.utility.camera_state import ViewportCameraState
 from pxr import Gf, Sdf

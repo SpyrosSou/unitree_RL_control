@@ -319,9 +319,6 @@ def main():
             action = demo.select_action(obs)
             obs, _, _, _ = demo.env.step(action)
 
-            # Keep command channels aligned for the next policy step.
-            obs[:, 9:12] = demo.cmd_filtered.unsqueeze(0)
-
             if step % 60 == 0:
                 print(
                     f"[SwitchDemo] mode={demo.mode:8s} "

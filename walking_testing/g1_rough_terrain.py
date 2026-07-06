@@ -4,9 +4,10 @@ G1 rough-terrain locomotion demo with keyboard control.
 Uses the pre-trained RSL-RL checkpoint for Isaac-Velocity-Rough-G1-v0.
 The checkpoint is downloaded automatically from NVIDIA Nucleus on first run.
 
-Usage (run from IsaacLab root):
-    cd ~/Elm/Code/IsaacLab
-    ./isaaclab.sh -p /home/spyros/Elm/Code/g1_locomotion/scripts/g1_rough_terrain.py
+Usage:
+    conda activate isaac_g1_control
+    cd ~/Elm/Code/g1_locomotion
+    python walking_testing/g1_rough_terrain.py
 
 Controls:
     W  -- walk forward
@@ -24,7 +25,7 @@ import importlib.util as _ilu
 import os
 
 # Load IsaacLab rsl_rl CLI helpers by file path to avoid collision with
-# ROS 2s "scripts" Python package that lives on the same sys.path.
+# ROS 2's "scripts" Python package that lives on the same sys.path.
 ISAACLAB_PATH = os.path.expanduser("~/Elm/Code/IsaacLab")
 _spec = _ilu.spec_from_file_location(
     "cli_args",
@@ -49,8 +50,6 @@ simulation_app = app_launcher.app
 import torch
 from rsl_rl.runners import OnPolicyRunner
 
-import carb
-import omni
 from omni.kit.viewport.utility import get_viewport_from_window_name
 from omni.kit.viewport.utility.camera_state import ViewportCameraState
 from pxr import Gf, Sdf

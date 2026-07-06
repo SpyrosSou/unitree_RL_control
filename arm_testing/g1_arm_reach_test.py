@@ -39,7 +39,6 @@ Target coordinate reference (robot-local frame, base at origin):
 # Isaac Sim must be launched before all other imports
 # ---------------------------------------------------------------------------
 import argparse
-import sys
 
 from isaaclab.app import AppLauncher
 
@@ -183,7 +182,7 @@ def main():
     print(f"[ArmTest] Checkpoint: {checkpoint_path}")
     print(f"[ArmTest] Targets   : {[t.tolist() for t in targets_local]}")
     print(f"[ArmTest] Hold steps: {hold_steps}")
-    print(f"[ArmTest] When a target is reached/timed out, you will be prompted to type the next one.\n")
+    print("[ArmTest] When a target is reached/timed out, you will be prompted to type the next one.\n")
 
     # ------------------------------------------------------------------
     # Build environment  (1 env, no episode randomisation)
@@ -266,7 +265,7 @@ def main():
             dists.append((inner_env.goal_positions[0, i, :] - ee).norm().item())
 
         label = ["left", "right"] if arm == "both" else [arm]
-        status = "  ".join(f"{l}: {d * 100:.1f} cm" for l, d in zip(label, dists))
+        status = "  ".join(f"{name}: {d * 100:.1f} cm" for name, d in zip(label, dists))
         print(f"\r  step {step_count:5d}  |  {status}   ", end="", flush=True)
 
         reached = all(d < inner_env.cfg.goal_threshold for d in dists)

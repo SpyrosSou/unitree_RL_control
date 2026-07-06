@@ -45,7 +45,6 @@ or press Enter alone to cycle through the initial --targets list.
 # Isaac Sim must be launched before all other imports
 # ---------------------------------------------------------------------------
 import argparse
-import sys
 
 from isaaclab.app import AppLauncher
 
@@ -248,7 +247,7 @@ def main():
     print(f"[MirrorTest] Checkpoint  : {checkpoint_path}")
     print(f"[MirrorTest] Targets     : {[t.tolist() for t in targets_local]}")
     print(f"[MirrorTest] Hold steps  : {hold_steps}")
-    print(f"[MirrorTest] Type 'x y z' + Enter at each prompt to set a new target.\n")
+    print("[MirrorTest] Type 'x y z' + Enter at each prompt to set a new target.\n")
 
     # ------------------------------------------------------------------
     # Build environment for the ACTIVE arm (1 env)

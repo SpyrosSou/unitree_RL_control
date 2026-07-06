@@ -37,9 +37,7 @@ def reset_arm_targets_to_default(
 
     asset: Articulation = env.scene[asset_cfg.name]
 
-    if env_ids is None:
-        env_ids = torch.arange(env.num_envs, device=asset.device)
-    elif isinstance(env_ids, slice):
+    if env_ids is None or isinstance(env_ids, slice):
         env_ids = torch.arange(env.num_envs, device=asset.device)
 
     joint_ids, _ = asset.find_joints(_ARM_JOINT_NAMES)
@@ -120,9 +118,7 @@ class StandingArmTrajectoryDisturbance(ManagerTermBase):
         for name in self._arm_joint_names:
             if "shoulder_pitch" in name:
                 scale.append(1.00)
-            elif "shoulder_roll" in name:
-                scale.append(0.95)
-            elif "shoulder_yaw" in name:
+            elif "shoulder_roll" in name or "shoulder_yaw" in name:
                 scale.append(0.95)
             elif "elbow_pitch" in name:
                 scale.append(0.75)
@@ -133,9 +129,7 @@ class StandingArmTrajectoryDisturbance(ManagerTermBase):
         self._joint_motion_scale = torch.tensor(scale, dtype=torch.float32, device=self.device).view(1, -1)
 
     def reset(self, env_ids: torch.Tensor | None = None) -> None:
-        if env_ids is None:
-            env_ids = torch.arange(self.num_envs, device=self.device)
-        elif isinstance(env_ids, slice):
+        if env_ids is None or isinstance(env_ids, slice):
             env_ids = torch.arange(self.num_envs, device=self.device)
         self._targets[env_ids] = self._default[env_ids]
         self._env._standing_arm_motion_targets = self._targets
@@ -163,9 +157,7 @@ class StandingArmTrajectoryDisturbance(ManagerTermBase):
 
         self._phase_step_offset = int(phase_step_offset)
 
-        if env_ids is None:
-            env_ids = torch.arange(self.num_envs, device=self.device)
-        elif isinstance(env_ids, slice):
+        if env_ids is None or isinstance(env_ids, slice):
             env_ids = torch.arange(self.num_envs, device=self.device)
 
         if len(env_ids) == 0:
@@ -190,9 +182,8 @@ class StandingArmTrajectoryDisturbance(ManagerTermBase):
                 delta = torch.where(reversal_mask, -2.0 * delta, delta)
 
             if self._pair_left is not None:
-                symmetric_mask = (torch.rand((len(env_ids), 1), device=self.device) > self._ASYMMETRY_PROB[phase]).expand(
-                    -1, len(self._pair_left)
-                )
+                symmetric_roll = torch.rand((len(env_ids), 1), device=self.device) > self._ASYMMETRY_PROB[phase]
+                symmetric_mask = symmetric_roll.expand(-1, len(self._pair_left))
                 mirrored_right = delta[:, self._pair_left] * self._pair_sign
                 delta[:, self._pair_right] = torch.where(symmetric_mask, mirrored_right, delta[:, self._pair_right])
 
@@ -247,9 +238,7 @@ class StandingRandomPushDisturbance(ManagerTermBase):
 
         asset: Articulation = env.scene[asset_cfg.name]
 
-        if env_ids is None:
-            env_ids = torch.arange(env.num_envs, device=asset.device)
-        elif isinstance(env_ids, slice):
+        if env_ids is None or isinstance(env_ids, slice):
             env_ids = torch.arange(env.num_envs, device=asset.device)
 
         if len(env_ids) == 0:

@@ -44,8 +44,6 @@ class StandingArmBlendJointPositionAction(JointPositionAction):
             action_joint_ids = self._joint_ids
             if isinstance(action_joint_ids, slice):
                 action_joint_ids = torch.arange(self._asset.num_joints, device=self.device)
-            elif isinstance(action_joint_ids, list):
-                action_joint_ids = torch.tensor(action_joint_ids, dtype=torch.long, device=self.device)
             else:
                 action_joint_ids = torch.tensor(action_joint_ids, dtype=torch.long, device=self.device)
 

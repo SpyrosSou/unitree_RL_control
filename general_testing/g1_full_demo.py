@@ -348,7 +348,10 @@ class G1FullDemo:
                 action_indices.append(name_to_action_idx[jname])
                 ordered_names.append(jname)
             else:
-                print(f"[FullDemo] WARNING: arm joint '{jname}' not found in action space — arm override will be partial.")
+                print(
+                    f"[FullDemo] WARNING: arm joint '{jname}' not found in action space — "
+                    "arm override will be partial."
+                )
 
         return (
             torch.tensor(action_indices, dtype=torch.long, device=self.device),
@@ -779,7 +782,6 @@ def main():
             action = demo.select_action(obs)
             obs, _, dones, _ = demo.env.step(action)
             demo._handle_env_resets(dones)
-            obs[:, 9:12] = demo.cmd_filtered.unsqueeze(0)
 
         if step % 60 == 0:
             # Distance to arm target(s) for display
