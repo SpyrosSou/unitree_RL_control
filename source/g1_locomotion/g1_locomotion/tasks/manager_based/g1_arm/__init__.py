@@ -33,6 +33,50 @@ gym.register(
 )
 
 # ---------------------------------------------------------------------------
+# Left arm — overnight sweep experiments (2026-07-07), see known_issues.md.
+# Each isolates exactly one change vs. G1-Arm-IK-Left-v0's baseline.
+# ---------------------------------------------------------------------------
+gym.register(
+    id="G1-Arm-IK-Left-RewardShape-v0",
+    entry_point="g1_locomotion.tasks.manager_based.g1_arm.g1_arm_env:G1ArmIKEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.g1_arm_env:G1ArmIKLeftRewardShapeEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1ArmIKLeftRewardShapePPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="G1-Arm-IK-Left-GoalCurriculum-v0",
+    entry_point="g1_locomotion.tasks.manager_based.g1_arm.g1_arm_env:G1ArmIKEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.g1_arm_env:G1ArmIKLeftGoalCurriculumEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1ArmIKLeftGoalCurriculumPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="G1-Arm-IK-Left-WideNet-v0",
+    entry_point="g1_locomotion.tasks.manager_based.g1_arm.g1_arm_env:G1ArmIKEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.g1_arm_env:G1ArmIKLeftEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1ArmIKLeftWideNetPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="G1-Arm-IK-Left-Entropy-v0",
+    entry_point="g1_locomotion.tasks.manager_based.g1_arm.g1_arm_env:G1ArmIKEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.g1_arm_env:G1ArmIKLeftEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1ArmIKLeftEntropyPPORunnerCfg",
+    },
+)
+
+# ---------------------------------------------------------------------------
 # Right arm  (train + play)
 # ---------------------------------------------------------------------------
 gym.register(

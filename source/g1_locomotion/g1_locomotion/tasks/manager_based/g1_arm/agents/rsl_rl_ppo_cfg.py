@@ -2,7 +2,24 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 from isaaclab.utils import configclass
-from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticCfg, RslRlPpoAlgorithmCfg
+
+from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticCfg, RslRlPpoAlgorithmCfg, RslRlSymmetryCfg
+
+from ..mdp.symmetry import compute_symmetric_arm_states
+
+
+def _arm_symmetry_cfg() -> RslRlSymmetryCfg:
+    """Fresh RslRlSymmetryCfg per runner cfg instance (not a shared module-level object).
+
+    See ``mdp/symmetry.py`` for why this replaces the assumption
+    ``testing/arm_testing/g1_arm_mirror_test.py``'s runtime mirror relies on with a trained-for
+    property instead (Phase 2, finding #7 in the roadmap plan).
+    """
+    return RslRlSymmetryCfg(
+        use_data_augmentation=True,
+        use_mirror_loss=False,
+        data_augmentation_func=compute_symmetric_arm_states,
+    )
 
 
 @configclass
@@ -11,6 +28,9 @@ class G1ArmIKPPORunnerCfg(RslRlOnPolicyRunnerCfg):
 
     A single runner config is shared for left/right arm; only ``experiment_name``
     differs in the two public subclasses below.
+
+    Trains with left-right symmetry data augmentation (see ``mdp/symmetry.py``) so the
+    left/right mirror deployment path is a trained-for property, not an assumption.
     """
 
     num_steps_per_env = 24
@@ -32,6 +52,13 @@ class G1ArmIKPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         value_loss_coef=1.0,
         use_clipped_value_loss=True,
         clip_param=0.2,
+        # Tried 0.005 (2026-07-07, alongside the reward-shaping change reverted in
+        # g1_arm_env.py — see known_issues.md) to keep exploration alive longer against
+        # an apparent early plateau. That retrain regressed badly (success rate declined
+        # over the run instead of improving), and since both changes were bundled into
+        # the same retrain there's no way to tell whether entropy or the reward term was
+        # responsible. Reverted to 0.0 (the confirmed-good baseline) — if revisited,
+        # change this alone, not together with other reward/hyperparameter changes.
         entropy_coef=0.0,
         num_learning_epochs=5,
         num_mini_batches=4,
@@ -43,12 +70,79 @@ class G1ArmIKPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         max_grad_norm=1.0,
     )
 
+    def __post_init__(self):
+        super().__post_init__()
+        self.algorithm.symmetry_cfg = _arm_symmetry_cfg()
+
 
 @configclass
 class G1ArmIKLeftPPORunnerCfg(G1ArmIKPPORunnerCfg):
     def __post_init__(self):
         super().__post_init__()
         self.experiment_name = "arms/g1_arm_ik_left"
+
+
+# ---------------------------------------------------------------------------
+# Overnight sweep (2026-07-07): 3 isolated arm-policy experiments vs. the baseline
+# above, each changing exactly one thing. Distinct experiment_name per variant so
+# each lands in its own logs/rsl_rl/arms/<name>/ subfolder — identifiable by path
+# alone, not by timestamp. See known_issues.md for the plateau this targets and
+# g1_arm_env.py for the matching env cfg variant (where one exists).
+# ---------------------------------------------------------------------------
+
+
+@configclass
+class G1ArmIKLeftRewardShapePPORunnerCfg(G1ArmIKPPORunnerCfg):
+    """Experiment 1/4: exponential proximity bonus (env cfg change only, see g1_arm_env.py).
+
+    entropy_coef and network size stay at baseline — only pair with
+    G1ArmIKLeftRewardShapeEnvCfg.
+    """
+    def __post_init__(self):
+        super().__post_init__()
+        self.experiment_name = "arms/g1_arm_ik_left_reward_shape"
+
+
+@configclass
+class G1ArmIKLeftGoalCurriculumPPORunnerCfg(G1ArmIKPPORunnerCfg):
+    """Experiment 2/4: goal-difficulty curriculum (env cfg change only, see g1_arm_env.py).
+
+    entropy_coef and network size stay at baseline — only pair with
+    G1ArmIKLeftGoalCurriculumEnvCfg.
+    """
+    def __post_init__(self):
+        super().__post_init__()
+        self.experiment_name = "arms/g1_arm_ik_left_goal_curriculum"
+
+
+@configclass
+class G1ArmIKLeftWideNetPPORunnerCfg(G1ArmIKPPORunnerCfg):
+    """Experiment 3/4: wider actor/critic network, isolated (pairs with the baseline env
+    cfg — no env changes here, just more capacity to see if the plateau is a capacity
+    limit rather than an exploration one).
+    """
+    def __post_init__(self):
+        super().__post_init__()
+        self.experiment_name = "arms/g1_arm_ik_left_wide_net"
+        self.policy.actor_hidden_dims = [512, 256, 128]
+        self.policy.critic_hidden_dims = [512, 256, 128]
+
+
+@configclass
+class G1ArmIKLeftEntropyPPORunnerCfg(G1ArmIKPPORunnerCfg):
+    """Experiment 4/4: higher entropy_coef, isolated (pairs with the baseline env cfg).
+
+    Targets the leading plateau theory directly: entropy_coef=0.0 gives no exploration
+    incentive, consistent with the observed early-and-flat training curve (see
+    known_issues.md). A prior attempt at entropy_coef=0.005 was bundled with the reward-
+    shaping change and regressed, but the two were never isolated from each other — this
+    is the first time entropy alone is tested. 0.01 (not 0.005) to give this a clearly
+    differentiated, less ambiguous test against that prior attempt.
+    """
+    def __post_init__(self):
+        super().__post_init__()
+        self.experiment_name = "arms/g1_arm_ik_left_entropy"
+        self.algorithm.entropy_coef = 0.01
 
 
 @configclass

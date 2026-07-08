@@ -15,10 +15,7 @@ from isaaclab.utils import configclass
 
 from . import mdp
 
-from isaaclab_tasks.manager_based.locomotion.velocity.config.g1.flat_env_cfg import (
-    G1FlatEnvCfg,
-    G1FlatEnvCfg_PLAY,
-)
+from isaaclab_tasks.manager_based.locomotion.velocity.config.g1.flat_env_cfg import G1FlatEnvCfg
 from isaaclab_tasks.manager_based.locomotion.velocity.config.g1.rough_env_cfg import (
     G1RoughEnvCfg,
     G1RoughEnvCfg_PLAY,
@@ -36,6 +33,14 @@ class G1LocomotionFlatEnvCfg(G1FlatEnvCfg):
 
     def __post_init__(self):
         super().__post_init__()
+
+        # Self-collision (Phase 2, item B1 in the roadmap plan — the "arm entering
+        # torso" fix). G1_MINIMAL_CFG ships with enabled_self_collisions=False; this is
+        # a shared-asset property so it's enabled here too, not just for the arm task,
+        # but it's NOT YET VISUALLY VERIFIED for stability or profiled for step-time
+        # cost — check via play.py (small num_envs) before the next real training run,
+        # same caveat as g1_arm_env.py's identical override.
+        self.scene.robot.spawn.articulation_props.enabled_self_collisions = True
 
         base_velocity = getattr(self.commands, "base_velocity", None)
         if base_velocity is not None:
@@ -64,6 +69,9 @@ class G1LocomotionFlatTransitionEnvCfg(G1FlatEnvCfg):
     def __post_init__(self):
         super().__post_init__()
 
+        # See G1LocomotionFlatEnvCfg's __post_init__ for the rationale/caveat.
+        self.scene.robot.spawn.articulation_props.enabled_self_collisions = True
+
         base_velocity = getattr(self.commands, "base_velocity", None)
         if base_velocity is not None:
             if hasattr(base_velocity, "rel_standing_envs"):
@@ -81,10 +89,31 @@ class G1LocomotionFlatTransitionEnvCfg(G1FlatEnvCfg):
 
 
 @configclass
-class G1LocomotionFlatEnvCfg_PLAY(G1FlatEnvCfg_PLAY):
-    """Play / evaluation variant of the flat env (fewer envs, no randomisation)."""
+class G1LocomotionFlatEnvCfg_PLAY(G1LocomotionFlatEnvCfg):
+    """Play / evaluation variant of the flat env (fewer envs, no randomisation).
 
-    pass
+    REVERTED FROM A BUG 2026-07-07: this used to inherit from Isaac Lab's stock
+    G1FlatEnvCfg_PLAY directly instead of from G1LocomotionFlatEnvCfg above — meaning
+    every project-level customization on walking (command ranges, and critically
+    enabled_self_collisions=True) silently never applied to this PLAY variant, only to
+    real training. g1_full_demo.py and any other PLAY-based interactive testing were
+    therefore always running under stock Isaac Lab settings, self-collision included —
+    this is why "arm colliding with hips during walking" was still visible in the full
+    demo despite the self-collision fix already being in place for training. Fixed by
+    inheriting from the customized class instead, and re-applying the same PLAY-specific
+    tweaks (fewer envs, no observation corruption, no random pushes) the stock
+    G1FlatEnvCfg_PLAY makes — same pattern G1LocomotionFlatTransitionEnvCfg_PLAY and
+    G1LocomotionStandingFlatEnvCfg_PLAY already correctly use below.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.scene.num_envs = 50
+        self.scene.env_spacing = 2.5
+        self.observations.policy.enable_corruption = False
+        self.events.base_external_force_torque = None
+        self.events.push_robot = None
 
 
 @configclass
@@ -129,6 +158,11 @@ class G1LocomotionStandingFlatEnvCfg(G1FlatEnvCfg):
     def __post_init__(self):
         super().__post_init__()
 
+        # See G1LocomotionFlatEnvCfg's __post_init__ for the rationale/caveat. Especially
+        # relevant here since standing's arm-motion disturbance curriculum is exactly the
+        # mechanism that swings an arm close to the torso.
+        self.scene.robot.spawn.articulation_props.enabled_self_collisions = True
+
         # Arm actuator gains are reduced for smoother, physically plausible trajectory tracking.
         if "arms" in self.scene.robot.actuators:
             self.scene.robot.actuators["arms"].stiffness = 25.0
@@ -171,16 +205,6 @@ class G1LocomotionStandingFlatEnvCfg(G1FlatEnvCfg):
             },
         )
 
-        # Apply mixed random pushes that are decoupled from arm-motion phase,
-        # so the policy experiences easy/hard combinations across the whole curriculum.
-        self.events.push_robot = EventTerm(
-            func=mdp.StandingRandomPushDisturbance,
-            mode="interval",
-            interval_range_s=(0.8, 1.8),
-            params={"asset_cfg": SceneEntityCfg("robot")},
-            is_global_time=False,
-        )
-
         base_velocity = getattr(self.commands, "base_velocity", None)
         if base_velocity is not None:
             if hasattr(base_velocity, "heading_command"):
@@ -212,6 +236,12 @@ class G1LocomotionStandingFlatEnvCfg(G1FlatEnvCfg):
                 rewards.dof_acc_l2.weight = -1.5e-7
             if hasattr(rewards, "feet_air_time"):
                 rewards.feet_air_time.weight = 0.0
+            if hasattr(rewards, "joint_deviation_torso"):
+                # Relaxed from the inherited -0.1 (experimental, phase 1): the torso needs to be
+                # free to act as a balance-compensation DOF when the arm-motion disturbance above
+                # shifts the CoG, instead of being penalized for moving at all. Re-tighten this
+                # first if standing looks too wobbly through the torso.
+                rewards.joint_deviation_torso.weight = 0.0
 
 
 @configclass
@@ -226,24 +256,11 @@ class G1LocomotionStandingFlatEnvCfg_PLAY(G1LocomotionStandingFlatEnvCfg):
         self.observations.policy.enable_corruption = False
         self.events.base_external_force_torque = None
 
-        # Keep perturbations in play mode, but slightly milder than training,
-        # so policy behavior is visible without instantly destabilizing demos.
-        if hasattr(self.events, "push_robot"):
-            self.events.push_robot.interval_range_s = (1.0, 2.0)
-            self.events.push_robot.params.update(
-                {
-                    "warmup_steps": 0,
-                    "push_probability": 0.45,
-                    "hard_push_probability": 0.12,
-                    "easy_lin_speed_range": (0.05, 0.16),
-                    "hard_lin_speed_range": (0.16, 0.30),
-                    "yaw_vel_range_easy": (-0.15, 0.15),
-                    "yaw_vel_range_hard": (-0.35, 0.35),
-                }
-            )
-
         # In play mode, begin arm-motion disturbances quickly for visualization.
         if hasattr(self.events, "standing_arm_motion_disturbance"):
-            self.events.standing_arm_motion_disturbance.params["phase_step_boundaries"] = (20, 80, 180, 320)
-            # Start play close to phase-3 so stronger motions appear quickly.
+            self.events.standing_arm_motion_disturbance.params["phase_step_boundaries"] = (20, 80, 180, 320, 500)
+            # Start play close to phase-3 so stronger motions appear quickly. To preview
+            # the new (untested) phase 5 instead, pass a phase_step_offset >= 320 - <first
+            # env-step this instance reaches> (or just let a long-enough play session
+            # advance into it naturally, per the boundaries above).
             self.events.standing_arm_motion_disturbance.params["phase_step_offset"] = 140

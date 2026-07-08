@@ -1,0 +1,25 @@
+# Arm testing checkpoint configuration.
+# Paste the path(s) to your trained .pt files here.
+# The demo scripts load from this file automatically,
+# and you can still override any entry with --checkpoint on the CLI.
+#
+# Algorithm is inferred from the path: "logs/rsl_rl/..." → rsl_rl
+#
+# Joint/arm reference (robot-local frame, base at origin):
+#   x  forward    reachable 0.1 – 0.5 m
+#   y  lateral    left arm: 0.05 – 0.45 m   right arm: -0.05 – -0.45 m
+#   z  height     reachable 0.9 – 1.2 m  (ground = 0)
+
+left:
+  # Training: scripts/rsl_rl/train.py  task=G1-Arm-IK-Left-v0
+  checkpoint: chosen_checkpoints/arm_left_latest.pt
+
+right:
+  # Training: scripts/rsl_rl/train.py  task=G1-Arm-IK-Right-v0
+  # (no right-arm run yet — fill in after training)
+  checkpoint: ~
+
+both:
+  # Training: scripts/rsl_rl/train.py  task=G1-Arm-IK-Both-v0
+  # Fill in after training a both-arm policy and curating a checkpoint.
+  checkpoint: ~

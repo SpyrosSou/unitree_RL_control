@@ -21,8 +21,9 @@ Main task families:
 Recent customizations include:
 
 - single walking policy with stronger transition exposure,
-- standing policy with phased arm-disturbance curriculum and random push disturbances,
-- early visible standing disturbances in play mode, including mild random pushes,
+- standing policy with a phased arm-motion-disturbance curriculum, teaching it to take a
+  corrective step rather than only balancing in place (no push/external-force disturbance —
+  that was tried and removed, see `training_regimes.md`),
 - arm action filtering and per-step delta limiting for smoother arm motion.
 
 Standing-policy details (current):
@@ -34,22 +35,20 @@ Standing-policy details (current):
     - `action_rate_l2 = -0.008`
     - `dof_acc_l2 = -1.5e-7`
     - `feet_air_time = 0.0`
+    - `joint_deviation_torso = 0.0` (relaxed so the torso can help with balance recovery)
 - Arm disturbance curriculum phases use per-step arm target deltas:
     - Phase 0: `0.00 rad/step`
     - Phase 1: `0.03 rad/step`
     - Phase 2: `0.05 rad/step`
     - Phase 3: `0.10 rad/step`
     - Phase 4: `0.25 rad/step`
-- Push disturbance is decoupled from arm phase and sampled as a mixed random distribution,
-    so policy training sees easy/hard combinations instead of only correlated easy/easy
-    and hard/hard cases.
 
 Standing logging details:
 
-- Standing training writes `standing_metrics.csv` in each standing run directory.
-- CSV now includes push-disturbance episode summaries:
-    - `max_push_lin_speed_m_s`
-    - `max_push_yaw_speed_rad_s`
+- Standing training writes `standing_summary.csv` (convergence-at-a-glance) and
+  `standing_detailed.csv` (everything, including a stepping-detection signal
+  `step_count`/`max_foot_air_time_s`) in each standing run directory — see
+  `logging_reference.md` for the full column reference and how to read them.
 
 ## Environment
 
@@ -96,25 +95,30 @@ python scripts/rsl_rl/play.py --task G1-Arm-IK-Left-Play-v0 --checkpoint chosen_
 ### Full Integrated Demo
 
 ```bash
-python general_testing/g1_full_demo.py
+python testing/general_testing/g1_full_demo.py
 ```
 
 The integrated demo reads default checkpoint paths from:
 
-- `walking_testing/checkpoints.yaml`
-- `arm_testing/checkpoints.yaml`
-- `general_testing/checkpoints.yaml`
+- `testing/walking_testing/checkpoints.yaml`
+- `testing/arm_testing/checkpoints.yaml`
+- `testing/general_testing/checkpoints.yaml`
 
 ## Repo Layout
 
 - `source/g1_locomotion/` — task registration and environment/task code
 - `scripts/` — train/play entry points
-- `walking_testing/` — locomotion demos and switch demos
-- `arm_testing/` — arm evaluation and mirror tests
-- `general_testing/` — combined demos
+- `testing/` — interactive demo/test scripts, one subdirectory per policy family:
+  - `testing/walking_testing/` — locomotion demos and switch demos
+  - `testing/arm_testing/` — arm evaluation and mirror tests
+  - `testing/general_testing/` — combined demos
+  - `testing/quickrun_tests.md` — how to run the scripts above
 - `chosen_checkpoints/` — curated deployable checkpoints
-- `quickrun.md` — command reference
+- `quickrun.md` — command reference (train/play/resume)
 - `training_regimes.md` — training setup summary
+- `algorithm_explanation.md` — PPO/network/observation-space reference
+- `logging_reference.md` — what gets logged during training, where, and what each metric means
+- `phase_logs/` — running change log per roadmap phase (see `training_regimes.md`)
 
 ## Notes On Ignored Files
 

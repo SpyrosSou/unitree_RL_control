@@ -1,0 +1,32 @@
+# General testing — integrated stand/walk + arm control.
+# Paste checkpoint paths here. The demo loads from this file automatically;
+# you can still override via CLI flags.
+#
+# Algorithm is inferred from the path: "logs/rsl_rl/..." → rsl_rl
+
+# ----- Locomotion -----
+
+walking:
+  # Flat-terrain walking policy.
+  checkpoint: chosen_checkpoints/walking_latest.pt
+
+standing:
+  # Zero-command standing stabiliser with arm-disturbance curriculum.
+  checkpoint: chosen_checkpoints/standing_latest.pt
+
+# ----- Arm control -----
+# arm_mode can be "left", "right", or "both".
+# The demo defaults to "left" if arm_mode is not specified here.
+
+arm_mode: left
+
+# Use the key matching arm_mode ("left", "right", or "both") to set the checkpoint.
+arm:
+  left:
+    checkpoint: chosen_checkpoints/arm_left_latest.pt
+  right:
+    # Fill in after training a right-arm policy (or use the mirror demo instead).
+    checkpoint: ~
+  both:
+    # Fill in after training a both-arm policy and curating a checkpoint.
+    checkpoint: ~
