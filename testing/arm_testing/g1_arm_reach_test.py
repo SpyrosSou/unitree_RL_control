@@ -30,9 +30,9 @@ Usage:
         --targets 0.3 0.2 1.0  0.4 0.3 1.1
 
 Target coordinate reference (robot-local frame, base at origin):
-    x  forward     reachable range  0.1 – 0.5 m
-    y  lateral     left arm: 0.05 – 0.45 m   right arm: -0.05 – -0.45 m
-    z  height      reachable range  0.9 – 1.2 m  (ground = 0)
+    x  forward     reachable range  0.20 – 0.42 m
+    y  lateral     left arm: 0.08 – 0.40 m   right arm: -0.40 – -0.08 m
+    z  height      reachable range  0.9 – 1.15 m  (ground = 0)
 """
 
 # ---------------------------------------------------------------------------

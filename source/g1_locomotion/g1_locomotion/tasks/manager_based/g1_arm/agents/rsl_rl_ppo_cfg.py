@@ -116,6 +116,16 @@ class G1ArmIKLeftGoalCurriculumPPORunnerCfg(G1ArmIKPPORunnerCfg):
 
 
 @configclass
+class G1ArmIKLeftStressRegionPPORunnerCfg(G1ArmIKPPORunnerCfg):
+    """1b: isolated diagnostic on the elbow-extension stress region (env cfg change
+    only, see g1_arm_env.py). Only pair with G1ArmIKLeftStressRegionEnvCfg.
+    """
+    def __post_init__(self):
+        super().__post_init__()
+        self.experiment_name = "arms/g1_arm_ik_left_stress_region"
+
+
+@configclass
 class G1ArmIKLeftWideNetPPORunnerCfg(G1ArmIKPPORunnerCfg):
     """Experiment 3/4: wider actor/critic network, isolated (pairs with the baseline env
     cfg — no env changes here, just more capacity to see if the plateau is a capacity
@@ -143,6 +153,26 @@ class G1ArmIKLeftEntropyPPORunnerCfg(G1ArmIKPPORunnerCfg):
         super().__post_init__()
         self.experiment_name = "arms/g1_arm_ik_left_entropy"
         self.algorithm.entropy_coef = 0.01
+
+
+@configclass
+class G1ArmIKLeftPPOTuningPPORunnerCfg(G1ArmIKPPORunnerCfg):
+    """PPO hyperparameter tuning (2026-07-08, isolated, pairs with the baseline env cfg —
+    no env changes here). Lowest-confidence of the three remaining experiments — no prior
+    evidence points at this specifically, unlike the other two (entropy has a direct
+    theory, wide-net has capacity reasoning); this is exploratory.
+
+    num_learning_epochs 5->8: more thorough optimization per collected rollout. Given the
+    training curve consistently shows fast early convergence into a hard plateau, this
+    tests whether the plateau is partly an under-optimization artifact within each PPO
+    update (not extracting enough signal from each rollout before moving on) rather than
+    purely an exploration (entropy) or capacity (network size) limit — orthogonal to both
+    of the other two experiments, safe to combine results with if it helps.
+    """
+    def __post_init__(self):
+        super().__post_init__()
+        self.experiment_name = "arms/g1_arm_ik_left_ppo_tuning"
+        self.algorithm.num_learning_epochs = 8
 
 
 @configclass

@@ -178,10 +178,37 @@ class G1ArmIKEnvCfg(DirectRLEnvCfg):
     torso_proximity_penalty_scale: float = 2.0
 
     # Root-pose wobble (Phase 2, item A2) — see _apply_root_wobble. Bounded, slow,
-    # per-env-randomized roll/pitch oscillation so the arm policy is actually exposed to
-    # (and must observe/adapt to) a moving reference frame, instead of a perfectly static
-    # one it's never seen a disturbed version of. Amplitude matches the max tilt actually
-    # observed in validation/eval_standing.py's summary (~6° at the hardest phase).
+    # per-env-randomized oscillation so the arm policy is actually exposed to (and must
+    # observe/adapt to) a moving reference frame, instead of a perfectly static one it's
+    # never seen a disturbed version of.
+    #
+    # Amplitudes widened 2026-07-09 — the original roll/pitch values (0.10 rad, ~5.7°)
+    # were matched to validation/eval_standing.py's summary, i.e. the *standing-alone*
+    # task with no arm reaching happening. That was the wrong reference: once arm
+    # reaching runs on top of standing (validation/integration_validation/eval_full_demo.py),
+    # actual measured mean_max_tilt_deg during standing_arm_left_reach ran 54-64° — the
+    # policy had only ever been asked to cope with ~1/10th of the tilt it actually meets
+    # in the field, which was borne out concretely: a standalone diagnostic against the
+    # actual trained checkpoint (no Isaac Sim — reconstructed the actor MLP straight from
+    # the checkpoint's state_dict) found the network's response to base-tilt features
+    # diverges further from mirror-symmetric the larger the tilt gets, i.e. behavior in
+    # that regime is close to undefined/untrained rather than a considered response. New
+    # values below aim to cover "starting to struggle but still plausibly recoverable"
+    # (roughly 3.5x the old cap), not the 60°+ range, which is already-falling territory
+    # no arm behavior is going to fix regardless of how well-trained it is. First-pass
+    # estimate from the integration eval's numbers, not a rigorously tuned value — revisit
+    # after seeing how a policy trained under this range actually performs.
+    #
+    # Two axes added at the same time, previously always exactly zero even after the
+    # curriculum turned on: yaw rate and base linear velocity. The base_lin_vel comment
+    # used to read "faking a linear velocity... risked a misleading training signal for
+    # no real benefit" — reasonable when nothing else here modeled *why* the base would
+    # be moving, but the integration eval now shows real, non-negligible base_lin_vel
+    # during actual standing+reach failures, so leaving the arm policy with zero training
+    # exposure to it is itself the misleading signal (an always-static-base assumption
+    # deployment doesn't honor). Driven by the same smooth per-env-randomized sinusoid
+    # style as roll/pitch, not white noise, for the same reason the original comment
+    # cared about a "clean" signal — see _apply_root_wobble.
     #
     # Curriculum, not constant-on: phase 0 (env-steps < root_wobble_enable_step) has no
     # wobble at all, so the policy learns the core reaching skill on an easy/static base
@@ -191,16 +218,20 @@ class G1ArmIKEnvCfg(DirectRLEnvCfg):
     # far milder, doesn't need more. Default boundary is 25% of the default 5000-iteration
     # budget (num_steps_per_env=24 -> 120,000 env-steps total, so 30,000 here).
     #
-    # Visually confirmed via scripts/zero_agent.py (2026-07-07): smooth per-env wobble,
-    # no jitter/explosions, self-collision behaved. Some minor coupled leg movement
-    # observed — expected (see known_issues.md): the root is kinematically re-snapped
-    # every step, so the hip joints feel a brief reaction each time before the legs'
-    # strong PD hold corrects it back; watch that this stays bounded on longer runs
-    # rather than growing.
+    # Visually confirmed via scripts/zero_agent.py (2026-07-07) for the original
+    # (narrower) roll/pitch-only version: smooth per-env wobble, no jitter/explosions,
+    # self-collision behaved, some minor coupled leg movement (expected — the root is
+    # kinematically re-snapped every step, so the hip joints feel a brief reaction each
+    # time before the legs' strong PD hold corrects it back). The widened range and the
+    # two new axes below have NOT been visually re-verified the same way — do that via
+    # scripts/zero_agent.py before trusting this for a real training run, same standing
+    # instruction as any other untested curriculum change in this repo.
     enable_root_wobble: bool = True
     root_wobble_enable_step: int = 30_000
-    root_wobble_max_roll_rad: float = 0.10  # ~5.7 deg
-    root_wobble_max_pitch_rad: float = 0.10
+    root_wobble_max_roll_rad: float = 0.35  # ~20 deg, was 0.10 (~5.7 deg)
+    root_wobble_max_pitch_rad: float = 0.35  # ~20 deg, was 0.10 (~5.7 deg)
+    root_wobble_max_yaw_rate_rad_s: float = 0.5  # new axis, was always exactly 0
+    root_wobble_max_lin_vel_mps: float = 0.3  # new axis, was always the real (~0) reading
     root_wobble_freq_hz_range: tuple[float, float] = (0.1, 0.3)
 
     # Observation noise magnitudes — matches the same terms/values G1FlatEnvCfg already
@@ -210,6 +241,24 @@ class G1ArmIKEnvCfg(DirectRLEnvCfg):
     projected_gravity_noise: float = 0.05
     joint_pos_noise: float = 0.01
     joint_vel_noise: float = 1.5
+
+    # Null-space regularization (2026-07-08, isolated retrain #2 on top of the joint_vel
+    # fix — see known_issues.md). This is a 5-DOF arm reaching a 3-DOF (position-only)
+    # goal: for most goals there's a whole family of joint configurations that all reach
+    # the same point (manipulator redundancy), and a standard PPO policy's unimodal
+    # Gaussian action distribution is a poor structural fit for a target with multiple
+    # equally-valid solutions — it can waver between them instead of consistently
+    # committing to one. This term breaks the tie: a small, constant penalty for the
+    # arm's *joint angles* drifting far from a fixed reference pose (default_joint_pos,
+    # the asset's own rest pose — same value reset() and the interactive test scripts
+    # already use as "home"), biasing the policy toward one consistent solution per goal
+    # instead of leaving the redundant DOF free to wander. Deliberately weak relative to
+    # position_reward_scale so reaching the goal always dominates when the goal is far
+    # from the reference pose — this is a tiebreaker among valid solutions, not a leash
+    # pulling the arm back to rest. Does NOT touch end-effector orientation at all (the
+    # goal stays position-only, x/y/z) — this is a joint-space preference, unrelated to
+    # what direction the palm points.
+    null_space_penalty_scale: float = 0.05
 
     # Goal-difficulty curriculum — one of 3 isolated overnight experiments (2026-07-07)
     # targeting the confirmed ~55% success plateau (see known_issues.md). OFF by default
@@ -225,6 +274,15 @@ class G1ArmIKEnvCfg(DirectRLEnvCfg):
     enable_goal_curriculum: bool = False
     goal_curriculum_start_fraction: float = 0.4  # 40% of full box extent at step 0
     goal_curriculum_full_step: int = 60_000  # linearly reaches 100% by here (50% of budget)
+
+    # Goal-box x-range override (2026-07-08, elbow-extension stress test — see
+    # known_issues.md). None = use _GOAL_BOUNDS as-is (default). When set, replaces just
+    # the x-range for every active arm, leaving y/z untouched — used to restrict training
+    # to the outer "far face" of the box (the region needing near-full elbow extension,
+    # per the joint-config correlation check), instead of the full volume. x rather than
+    # y/z specifically because x (forward reach) was already established as the dominant
+    # lever for reach difficulty (see the reachability check's per-axis octant data).
+    goal_bounds_x_override: tuple[float, float] | None = None
 
     # Robot — G1 asset with prim_path set for multi-env cloning.
     # Uses G1_MINIMAL_CFG (fewer collision meshes than G1_CFG) since this task doesn't
@@ -276,7 +334,20 @@ class G1ArmIKEnvCfg(DirectRLEnvCfg):
         self.robot.spawn.articulation_props.solver_position_iteration_count = 4
         self.robot.spawn.articulation_props.solver_velocity_iteration_count = 1
 
-        # Higher gains for position-control on the arm joints (the only RL-actuated ones).
+        # Reverted 2026-07-12 to 200/20 after a same-day attempt to switch to Unitree's
+        # real arm5-SDK gains (Kp=60, Kd=1.5 — unitree_sdk2_python's
+        # example/g1/high_level/g1_arm5_sdk_dds_example.py) measurably regressed reach
+        # quality when retrained under it: success rate 86% -> 30% in this task's own
+        # native eval, nothing to do with deployment mismatch. Root cause, confirmed by
+        # reading isaaclab's ImplicitActuator.compute() directly: it's pure PD
+        # (stiffness*pos_error + damping*vel_error), no gravity-compensation feedforward
+        # anywhere in the pipeline. The real SDK's low gains are almost certainly meant to
+        # ride on top of a separate gravity-comp term in the real controller (that
+        # example's own weight/weight_rate blend-in over its first 3s is exactly that
+        # pattern) — applied as the *only* torque source here, the arm is simply too weak
+        # to hold itself against gravity, let alone track a target precisely. Not worth
+        # chasing sim-to-real gain fidelity for a sim-only pipeline anyway; 200/20 is what
+        # this task's own checkpoints actually perform well under.
         self.robot.actuators["arms"] = ImplicitActuatorCfg(
             joint_names_expr=[
                 ".*_shoulder_pitch_joint",
@@ -359,6 +430,20 @@ class G1ArmIKLeftGoalCurriculumEnvCfg(G1ArmIKLeftEnvCfg):
 
 
 @configclass
+class G1ArmIKLeftStressRegionEnvCfg(G1ArmIKLeftEnvCfg):
+    """1b (2026-07-08): isolated diagnostic — train exclusively on the elbow-extension
+    stress region (see known_issues.md), to test whether focused training there actually
+    improves precision, before investing in a proper curriculum (1a) if it does.
+
+    Restricts x to the outer ~30% of the box (0.35-0.42 vs the full 0.20-0.42), y/z
+    untouched — traces the whole "far face" of the box (all the corners on that face and
+    everything between them), not one isolated corner, so the region has real variety
+    rather than being a single repeated point.
+    """
+    goal_bounds_x_override: tuple[float, float] = (0.35, 0.42)
+
+
+@configclass
 class G1ArmIKLeftEnvCfg_PLAY(G1ArmIKLeftEnvCfg):
     def __post_init__(self):
         super().__post_init__()
@@ -407,9 +492,32 @@ _TORSO_BODY = "torso_link"
 
 # Goal workspace bounds in the robot's local frame [m]
 # (env origin is added later to convert to world frame)
+#
+# Reshaped 2026-07-08 (see known_issues.md) after validation/check_arm_reachability.py
+# showed only ~47% of the previous box (x:0.1-0.5, y:0.05-0.45, z:0.9-1.2) was within 2cm
+# of anything kinematically reachable — a hard ceiling on success rate no amount of
+# training could cross. Two distinct problems, fixed on opposite edges of the box:
+#   - Far corner (max x, max y, max z simultaneously) was genuinely unreachable — needs
+#     max forward + max lateral + max height reach all at once, beyond arm length. Pulled
+#     all three upper bounds in.
+#   - Near corner (min x, min y, min z) wasn't unreachable, but sits ~3cm from
+#     torso_link's collision geometry (derived from the real G1 URDF) — well inside the
+#     12cm safety margin torso_proximity_penalty_scale already enforces, so the policy
+#     was being asked to violate its own anti-collision incentive to succeed there.
+#     Pushed the x lower bound out to clear the margin.
+#
+# Refined again 2026-07-08 after training on the first reshape (74.7%/76.8% success, up
+# from ~55-59% — confirms reachability was the dominant factor) and re-running the
+# reachability check against the *new* bounds: coverage improved a lot (2cm tolerance:
+# 47.1% -> 65.3%, median nearest-reachable distance 2.65cm -> 0.76cm) but the low-x/low-y
+# octant was still clearly the worst (mean 4.1-4.6cm, vs <1cm for high-x/low-y) — the
+# first x push (0.10->0.15) helped but didn't fully clear the torso margin. Per-axis
+# octant data showed x is the dominant lever (holding y low, moving x from low->high
+# alone dropped that corner's mean distance from ~4.6cm to ~0.9cm) with y a secondary
+# contributor (~4.6cm -> ~1.8cm) — pushed x further, y a smaller amount.
 _GOAL_BOUNDS = {
-    "left":  {"x": (0.1, 0.5), "y": (0.05, 0.45), "z": (0.9, 1.2)},
-    "right": {"x": (0.1, 0.5), "y": (-0.45, -0.05), "z": (0.9, 1.2)},
+    "left":  {"x": (0.20, 0.42), "y": (0.08, 0.40), "z": (0.9, 1.15)},
+    "right": {"x": (0.20, 0.42), "y": (-0.40, -0.08), "z": (0.9, 1.15)},
 }
 
 # REVERTED 2026-07-07 — see known_issues.md. A first attempt at this used hand-picked
@@ -446,6 +554,12 @@ class G1ArmIKEnv(DirectRLEnv):
         # Post-init: build arm-group list (safe after sim is running)
         # ------------------------------------------------------------------
         # Each entry: {joint_tensor, ee_idx, bounds}
+        def _bounds_for(side: str) -> dict:
+            b = dict(_GOAL_BOUNDS[side])
+            if cfg.goal_bounds_x_override is not None:
+                b["x"] = cfg.goal_bounds_x_override
+            return b
+
         self._arm_groups: list[dict] = []
         if cfg.arm in ("left", "both"):
             ids, _ = self.robot.find_joints(_LEFT_ARM_JOINTS)
@@ -453,7 +567,7 @@ class G1ArmIKEnv(DirectRLEnv):
             self._arm_groups.append({
                 "joint_tensor": torch.tensor(ids, dtype=torch.long, device=self.device),
                 "ee_idx": ee[0],
-                "bounds": _GOAL_BOUNDS["left"],
+                "bounds": _bounds_for("left"),
             })
         if cfg.arm in ("right", "both"):
             ids, _ = self.robot.find_joints(_RIGHT_ARM_JOINTS)
@@ -461,7 +575,7 @@ class G1ArmIKEnv(DirectRLEnv):
             self._arm_groups.append({
                 "joint_tensor": torch.tensor(ids, dtype=torch.long, device=self.device),
                 "ee_idx": ee[0],
-                "bounds": _GOAL_BOUNDS["right"],
+                "bounds": _bounds_for("right"),
             })
 
         self.n_arms = len(self._arm_groups)
@@ -472,12 +586,57 @@ class G1ArmIKEnv(DirectRLEnv):
         )
         self.arm_joint_indices = self.arm_joint_indices_tensor.tolist()
 
+        # Per-joint null-space weight (2026-07-08, joint-config correlation check round
+        # 2 — see known_issues.md). Goal-position logging showed the ~22% "near-limit
+        # elbow" failure mode isn't tied to any goal-box region at all — it's a free,
+        # roughly goal-independent choice between two redundant solution branches for
+        # the *same* goals (one with elbow_pitch bent ~42deg, ~91% success; one with it
+        # pinned near -0.1deg, ~59% success). The plain (unweighted) null-space penalty
+        # doesn't discriminate between the branches well: total deviation-from-default
+        # across all 5 joints is actually *similar* for both (~79deg bad vs ~82deg
+        # good), because shoulder_pitch is far from default in both branches, diluting
+        # the one joint that actually differs a lot (elbow_pitch: ~50deg off in the bad
+        # branch vs ~8deg off in the good one). Weighting elbow_pitch's contribution 3x
+        # separates the branches clearly (~162deg bad vs ~85deg good) — a much sharper,
+        # more targeted signal than just turning up the scale uniformly, which would
+        # pressure all 5 joints toward default without specifically discouraging the
+        # branch that's actually the problem.
+        joint_names_all = self.robot.data.joint_names
+        for arm in self._arm_groups:
+            weights = [3.0 if "elbow_pitch" in joint_names_all[idx] else 1.0 for idx in arm["joint_tensor"].tolist()]
+            arm["null_space_weight"] = torch.tensor(weights, device=self.device)
+
         # Real hardware joint range (soft_joint_pos_limits) — the action-target clamp and
         # the joint-limit-avoidance reward both use this directly (see _apply_action /
         # _get_rewards), restoring exactly the reachability this task had before the
         # reverted tighter-range attempt above. Cached once here since it's read every
         # step/reset.
         self._arm_hw_limits = self.robot.data.soft_joint_pos_limits[0, self.arm_joint_indices_tensor].clone()
+
+        # Per-joint, per-bound joint-limit-penalty margin fraction (2026-07-08, joint-
+        # config correlation check — see known_issues.md). Found via the new
+        # *_deg_at_min_dist eval columns: elbow_pitch's range (-2.5deg, 185.5deg) is
+        # heavily asymmetric — 0deg is roughly a straight, fully-extended arm, and the
+        # joint barely goes past straight (-2.5deg) but folds a lot (up to 185.5deg).
+        # Full extension is a normal, necessary pose for far reaches, not a dangerous
+        # edge case — but the flat 5%-of-range margin applied to every joint uniformly
+        # doesn't know that, and was penalizing exactly the pose needed for precise far
+        # reaches. Deliberately asymmetric, not just a smaller flat margin for the whole
+        # joint: 100% of the near-limit failures found were at the lower bound (-2.5deg),
+        # 0% at the upper (185.5deg), so only the lower-bound margin is reduced — the
+        # upper bound (and both bounds on the other 4 joints, which showed zero
+        # near-limit involvement in either success or failure episodes) keep the
+        # original, more conservative 5%. Shape (n_joints, 2), columns are [lower, upper].
+        joint_names = self.robot.data.joint_names
+        margin_lo, margin_hi = [], []
+        for idx in self.arm_joint_indices:
+            name = joint_names[idx]
+            is_elbow_pitch = "elbow_pitch" in name
+            margin_lo.append(0.01 if is_elbow_pitch else 0.05)
+            margin_hi.append(0.05)
+        self._joint_limit_margin_fraction = torch.tensor(
+            list(zip(margin_lo, margin_hi)), device=self.device
+        )
 
         # Torso body index, for the proximity penalty (B2)
         torso_ids, _ = self.robot.find_bodies(_TORSO_BODY)
@@ -501,9 +660,23 @@ class G1ArmIKEnv(DirectRLEnv):
         self._wobble_pitch_freq = torch.zeros(self.num_envs, device=self.device)
         self._wobble_roll_phase = torch.zeros(self.num_envs, device=self.device)
         self._wobble_pitch_phase = torch.zeros(self.num_envs, device=self.device)
+        # Yaw-rate axis — single sinusoid (yaw itself isn't observed, only its rate, so
+        # there's no analogous "yaw angle" to track the way roll/pitch track a fake quat).
+        self._wobble_yaw_amp = torch.zeros(self.num_envs, device=self.device)
+        self._wobble_yaw_freq = torch.zeros(self.num_envs, device=self.device)
+        self._wobble_yaw_phase = torch.zeros(self.num_envs, device=self.device)
+        # Linear-velocity axis — one shared amp/freq/phase driving a circular drift
+        # (lin_vel_x = amp*cos, lin_vel_y = amp*sin(phase-shifted)) rather than two fully
+        # independent oscillators, so the direction smoothly rotates instead of two
+        # unrelated sinusoids happening to overlap; z left at 0 (no vertical bobbing
+        # modeled, root height isn't part of this observation anyway).
+        self._wobble_lin_amp = torch.zeros(self.num_envs, device=self.device)
+        self._wobble_lin_freq = torch.zeros(self.num_envs, device=self.device)
+        self._wobble_lin_phase = torch.zeros(self.num_envs, device=self.device)
         self._wobble_t = torch.zeros(self.num_envs, device=self.device)
         self._synthetic_ang_vel = torch.zeros((self.num_envs, 3), device=self.device)
         self._synthetic_projected_gravity = self.robot.data.projected_gravity_b.clone()
+        self._synthetic_lin_vel = self.robot.data.root_lin_vel_b.clone()
 
         # Goal visualisation markers
         marker_cfg = SPHERE_MARKER_CFG.copy()
@@ -532,28 +705,32 @@ class G1ArmIKEnv(DirectRLEnv):
     # ------------------------------------------------------------------
 
     def _apply_root_wobble(self):
-        """Compute a synthetic bounded roll/pitch wobble for the *observation* only.
+        """Compute a synthetic bounded roll/pitch/yaw-rate/lin-vel wobble for the
+        *observation* only.
 
         The root itself stays physically fixed (fix_root_link=True) — this does not move
         anything. It only fills self._synthetic_ang_vel / self._synthetic_projected_gravity
-        with what those observation terms *would* read if the base were actually tilting,
-        so the policy still has to learn to reach despite a varying base-state input.
+        / self._synthetic_lin_vel with what those observation terms *would* read if the
+        base were actually tilting and drifting, so the policy still has to learn to reach
+        despite a varying base-state input.
 
         REVERTED from an earlier version that used real (fix_root_link=False) kinematic
         root pose writes: with no active balance controller, a free root left the whole
         robot standing on nothing but passive leg stiffness, and random arm actions
         reliably tipped it over forward — see known_issues.md. This synthetic-only
         version carries zero fall risk since nothing physically moves, at the cost of not
-        capturing how a real tilting base would also change the arm's own gravity-
-        compensation dynamics — judged an acceptable trade for how small these tilts are
-        (a few degrees).
+        capturing how a real tilting/drifting base would also change the arm's own
+        gravity-compensation dynamics — judged an acceptable trade (see
+        root_wobble_max_roll_rad's docstring for how the amplitude/axis choices below
+        were set, and why the original "a few degrees, roll/pitch only" scope changed).
         """
         if not self.cfg.enable_root_wobble:
             return
         if self.common_step_counter < self.cfg.root_wobble_enable_step:
-            # Curriculum phase 0: report the real (untilted) sensor values.
+            # Curriculum phase 0: report the real (untilted, undrifting) sensor values.
             self._synthetic_ang_vel[:] = 0.0
             self._synthetic_projected_gravity[:] = self.robot.data.projected_gravity_b
+            self._synthetic_lin_vel[:] = 0.0
             return
 
         self._wobble_t += self.step_dt
@@ -569,6 +746,9 @@ class G1ArmIKEnv(DirectRLEnv):
         pitch_rate = self._wobble_pitch_amp * self._wobble_pitch_freq * 2.0 * torch.pi * torch.cos(
             2.0 * torch.pi * self._wobble_pitch_freq * self._wobble_t + self._wobble_pitch_phase
         )
+        yaw_rate = self._wobble_yaw_amp * torch.sin(
+            2.0 * torch.pi * self._wobble_yaw_freq * self._wobble_t + self._wobble_yaw_phase
+        )
 
         zero = torch.zeros_like(roll)
         wobble_quat = quat_from_euler_xyz(roll, pitch, zero)
@@ -578,7 +758,15 @@ class G1ArmIKEnv(DirectRLEnv):
         self._synthetic_projected_gravity[:] = quat_apply_inverse(fake_quat, gravity_dir_w)
         self._synthetic_ang_vel[:, 0] = roll_rate  # small-angle approx: body-frame roll/pitch rate
         self._synthetic_ang_vel[:, 1] = pitch_rate
-        self._synthetic_ang_vel[:, 2] = 0.0
+        self._synthetic_ang_vel[:, 2] = yaw_rate
+
+        # Circular drift: one amp/freq/phase pair drives both x and y (y phase-shifted by
+        # 90°) so the drift direction smoothly rotates over time instead of two unrelated
+        # sinusoids happening to overlap. z left at 0 — no vertical bobbing modeled.
+        lin_phase = 2.0 * torch.pi * self._wobble_lin_freq * self._wobble_t + self._wobble_lin_phase
+        self._synthetic_lin_vel[:, 0] = self._wobble_lin_amp * torch.cos(lin_phase)
+        self._synthetic_lin_vel[:, 1] = self._wobble_lin_amp * torch.sin(lin_phase)
+        self._synthetic_lin_vel[:, 2] = 0.0
 
     # ------------------------------------------------------------------
     # Step logic
@@ -614,14 +802,14 @@ class G1ArmIKEnv(DirectRLEnv):
     def _get_observations(self) -> dict:
         # Base-state prefix (Phase 2, A1) — same per-arm block, duplicated for "both" so
         # each 26-D arm block stays independently mirror-transformable (see A4 plan).
-        # base_ang_vel/projected_gravity read the synthetic wobble buffers (see
-        # _apply_root_wobble), not the real (always-static) sensor values — the root is
-        # physically fixed, this is what makes it *look* tilted to the policy without
-        # actually moving anything. base_lin_vel is left as the real reading (always ~0
-        # for a fixed root); faking a linear velocity with no clear physical meaning here
-        # risked a misleading training signal for no real benefit.
+        # base_lin_vel/base_ang_vel/projected_gravity all read the synthetic wobble
+        # buffers (see _apply_root_wobble), not the real (always-static) sensor values —
+        # the root is physically fixed, this is what makes it *look* tilted and drifting
+        # to the policy without actually moving anything. base_lin_vel used to be left as
+        # the real (always ~0) reading — see root_wobble_max_lin_vel_mps's docstring for
+        # why that changed.
         base_lin_vel = uniform_noise(
-            self.robot.data.root_lin_vel_b,
+            self._synthetic_lin_vel,
             UniformNoiseCfg(n_min=-self.cfg.base_lin_vel_noise, n_max=self.cfg.base_lin_vel_noise),
         )
         base_ang_vel = uniform_noise(
@@ -633,7 +821,7 @@ class G1ArmIKEnv(DirectRLEnv):
             UniformNoiseCfg(n_min=-self.cfg.projected_gravity_noise, n_max=self.cfg.projected_gravity_noise),
         )
 
-        # Build per-arm block, then concatenate (→ 26 or 52 total)
+        # Build per-arm block, then concatenate (→ 28 or 56 total)
         parts = []
         for i, arm in enumerate(self._arm_groups):
             jt = arm["joint_tensor"]
@@ -679,14 +867,30 @@ class G1ArmIKEnv(DirectRLEnv):
             torso_dist = torch.norm(ee_pos - torso_pos, dim=-1)
             total += -torch.clamp(margin - torso_dist, min=0.0) * self.cfg.torso_proximity_penalty_scale
 
+            # Null-space regularization — see cfg field docstring. A soft tiebreaker
+            # among the multiple joint configurations that reach the same (x, y, z)
+            # goal, not a constraint on the goal itself. Per-joint weighted (see
+            # arm["null_space_weight"] in __init__) — elbow_pitch counts 3x so this
+            # actually discriminates between the two solution branches found in the
+            # joint-config correlation check, instead of being diluted by shoulder_pitch
+            # (which is far from default in both branches and doesn't distinguish them).
+            jt = arm["joint_tensor"]
+            ref_pose = self.robot.data.default_joint_pos[:, jt]
+            pose_deviation = torch.norm(
+                (self.robot.data.joint_pos[:, jt] - ref_pose) * arm["null_space_weight"], dim=-1
+            )
+            total += -pose_deviation * self.cfg.null_space_penalty_scale
+
         # Smoothness and joint-limit penalties (shared across all arm joints)
         total += -torch.norm(self.previous_actions, dim=-1) * self.cfg.action_smoothness_scale
 
         joint_pos = self.robot.data.joint_pos[:, self.arm_joint_indices_tensor]
         limits = self._arm_hw_limits
-        margin_limit = 0.05 * (limits[:, 1] - limits[:, 0])
+        span = limits[:, 1] - limits[:, 0]
+        margin_lo = self._joint_limit_margin_fraction[:, 0] * span
+        margin_hi = self._joint_limit_margin_fraction[:, 1] * span
         at_limit = (
-            (joint_pos < limits[:, 0] + margin_limit) | (joint_pos > limits[:, 1] - margin_limit)
+            (joint_pos < limits[:, 0] + margin_lo) | (joint_pos > limits[:, 1] - margin_hi)
         ).float().sum(-1)
         total += -at_limit * self.cfg.joint_limit_penalty_scale
 
@@ -751,6 +955,16 @@ class G1ArmIKEnv(DirectRLEnv):
         self._wobble_pitch_freq[env_ids_tensor] = freq_lo + torch.rand(num_resets, device=self.device) * freq_span
         self._wobble_roll_phase[env_ids_tensor] = torch.rand(num_resets, device=self.device) * 2.0 * torch.pi
         self._wobble_pitch_phase[env_ids_tensor] = torch.rand(num_resets, device=self.device) * 2.0 * torch.pi
+        self._wobble_yaw_amp[env_ids_tensor] = (
+            torch.rand(num_resets, device=self.device) * self.cfg.root_wobble_max_yaw_rate_rad_s
+        )
+        self._wobble_yaw_freq[env_ids_tensor] = freq_lo + torch.rand(num_resets, device=self.device) * freq_span
+        self._wobble_yaw_phase[env_ids_tensor] = torch.rand(num_resets, device=self.device) * 2.0 * torch.pi
+        self._wobble_lin_amp[env_ids_tensor] = (
+            torch.rand(num_resets, device=self.device) * self.cfg.root_wobble_max_lin_vel_mps
+        )
+        self._wobble_lin_freq[env_ids_tensor] = freq_lo + torch.rand(num_resets, device=self.device) * freq_span
+        self._wobble_lin_phase[env_ids_tensor] = torch.rand(num_resets, device=self.device) * 2.0 * torch.pi
         self._wobble_t[env_ids_tensor] = 0.0
 
         # Sample goals in robot-local frame, shift to world frame via env origins

@@ -129,8 +129,8 @@ When `--trained_arm != --active_arm` the script automatically:
 | `--hold_steps` | no | `150` | Steps before prompting for next target |
 
 Target y-coordinate sign:
-- `--active_arm left` → y positive (0.05 – 0.45 m)
-- `--active_arm right` → y negative (-0.05 – -0.45 m)
+- `--active_arm left` → y positive (0.08 – 0.40 m)
+- `--active_arm right` → y negative (-0.40 – -0.08 m)
 
 ### Run left-trained policy on the right arm (mirrored)
 
@@ -245,9 +245,9 @@ python testing/arm_testing/g1_arm_reach_test.py \
 
 | Axis | Direction | Trained range |
 |------|-----------|---------------|
-| x | forward | 0.1 – 0.5 m |
-| y | lateral — left arm: positive, right arm: negative | ±(0.05 – 0.45) m |
-| z | height above ground | 0.9 – 1.2 m |
+| x | forward | 0.20 – 0.42 m |
+| y | lateral — left arm: positive, right arm: negative | ±(0.08 – 0.40) m |
+| z | height above ground | 0.9 – 1.15 m |
 
 > Targets outside the trained range will still be attempted but expect degraded accuracy.
 
@@ -366,7 +366,8 @@ right arm by negating `y`. So `0.3 0.2 1.0` becomes:
 | `T` | Open a terminal prompt for a new arm target |
 | `L` | Select left arm as the active prompt target in `--arm both` mode |
 | `R` | Select right arm as the active prompt target in `--arm both` mode |
-| `C` | Toggle camera mode |
+| `C` | Toggle camera follow (off lets you orbit freely with the mouse) |
+| `V` | Reset camera to the default chase view (re-enables follow) |
 
 Pressing `T` blocks the simulation briefly and opens a console prompt for a new target in robot-local
 coordinates.
@@ -375,9 +376,9 @@ coordinates.
 
 | Axis | Direction | Typical trained range |
 | --- | --- | --- |
-| x | forward from robot base | 0.1 - 0.5 m |
-| y | left positive, right negative | 0.05 - 0.45 m on left, -0.05 - -0.45 m on right |
-| z | height above ground | 0.9 - 1.2 m |
+| x | forward from robot base | 0.20 - 0.42 m |
+| y | left positive, right negative | 0.08 - 0.40 m on left, -0.40 - -0.08 m on right |
+| z | height above ground | 0.9 - 1.15 m |
 
 ### Useful help command
 

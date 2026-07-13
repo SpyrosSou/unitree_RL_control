@@ -172,6 +172,37 @@ broad control-quality gap than a reachability/control-authority one. Fixed to ob
 - **Self-collision.** `enabled_self_collisions` changed from `False` to `True` (was `False` on every G1 asset variant, project-wide — this fixes the "arm entering torso" interpenetration reported during testing). Applied to all three tasks (arm/standing/walking), not just this one, since it's a shared asset property. Visually confirmed via `scripts/random_agent.py` (2026-07-07): no interpenetration, no explosions. A cheap, safe complement ships alongside it regardless: a soft distance penalty (`torso_proximity_margin_m = 0.12`) discouraging the end-effector from getting within 12 cm of `torso_link`.
 - **Joint range restriction — tried, broke reachability, reverted.** `random_agent.py` (2026-07-07) showed the arm occasionally reaching hardware-safe-but-useless poses (arm behind the body, forearm rotated most of the way around) — confirmed against a real Unitree G1 URDF (`g1_29dof.urdf`, found locally) that these are genuine hardware ranges (shoulder_yaw ~300°, elbow_roll/wrist_roll ~226°), not a bug. First fix (`_ARM_JOINT_TASK_RANGES_RAD`, hand-reasoned tighter per-joint bounds applied to reset randomization *and* the action-target clamp) was never verified against actual forward kinematics, and a 1500-iteration test run confirmed it broke reachability: 0% success the entire run, and a distance-to-goal distribution (p0=1.3cm, p50=17.7cm, p90=29cm, flat across all of training) that's the signature of unreachable goals, not slow learning. **Reverted 2026-07-07**: the action-target clamp and joint-limit reward are back to the real hardware range (`self._arm_hw_limits`) — restores the reachability this task had and converged under before. Only reset randomization keeps a narrower spread now (`cfg.reset_range_fraction`, 0.3 → 0.15, same formula as before, smaller fraction) — safe regardless of the exact value since it only affects the starting pose, never what's reachable via actions. The 1500-iteration checkpoint from the broken version should not be used or resumed — see `known_issues.md`.
 
+**Phase 2 continued (2026-07-08/09) — reachability, redundancy, and the final
+consolidated policy.** Full blow-by-blow with exact numbers lives in `known_issues.md`
+and `phase_logs/phase_2.md`; this is the condensed version:
+
+- **Goal workspace reshaped twice, based on measured kinematic reachability, not
+  guessed.** Built `validation/check_arm_reachability.py` (samples random joint configs
+  within real hardware limits, no RL involved) and found only ~47% of the original
+  `_GOAL_BOUNDS` box was actually reachable within the 2cm threshold. Reshaped the box
+  (`x:(0.1,0.5)→(0.20,0.42) y:(0.05,0.45)→(0.08,0.40) z:(0.9,1.2)→(0.9,1.15)`, mirrored
+  for the right arm) to remove a genuinely-unreachable far corner and a near corner that
+  conflicted with the torso safety margin. **Success rate went from ~55% to ~85.6%** —
+  confirms reachability, not policy quality, was the dominant factor the whole time.
+- **`elbow_pitch`'s joint-limit reward margin made per-joint, per-bound** — that joint's
+  hardware range is heavily asymmetric (barely goes past straight, folds a lot), and a
+  flat 5%-of-range margin was penalizing full extension, a normal pose needed for far
+  reaches. Fixed to 1% on that joint's lower bound only, 5% everywhere else unchanged.
+- **Null-space regularization added**, later made per-joint-weighted (`elbow_pitch` 3x) —
+  a real, reproducible improvement to mean/p90 distance, but does not fix a separate,
+  deeper issue found via goal-position + joint-config logging: manipulator redundancy
+  causes the policy to land on one of two valid solutions for the same goal roughly 20%
+  of the time, one meaningfully less reliable (~59% vs ~91% success) than the other, with
+  no dependency on goal position. Three targeted reward-shaping fixes all failed to move
+  this — likely needs a bigger architectural change (e.g. a more expressive action
+  distribution) to actually resolve, not more reward tuning.
+- **Final consolidated policy**: wide network (`[512,256,128]` vs. the original
+  `[256,128,64]`) was the one change (of three tested — entropy, wide-net, PPO
+  hyperparameter tuning) that showed a clear, reproducible improvement (best p90/tail,
+  shown twice now on two different baselines) — folded into a final 5000-iteration
+  training run (`G1-Arm-IK-Left-WideNet-v0`, `run_name=final_consolidated`). This is the
+  checkpoint integration work should use going forward — see `phase_logs/phase_2.md`.
+
 Mirroring / right-arm usage:
 
 - Right-arm behavior can be obtained by mirroring the trained left-arm policy at inference time (`g1_arm_mirror_test.py`) — the mirror math now lives in `g1_arm/mdp/symmetry.py` (imported, not duplicated) so the deployment-time transform can't silently drift out of sync with what training actually used, which is exactly what happened to this script's old hardcoded indices when the observation layout changed above.

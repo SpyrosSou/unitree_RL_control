@@ -10,10 +10,16 @@ Override any field here to tune or extend the base configs.
 """
 
 from isaaclab.managers import EventTermCfg as EventTerm
+from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils import configclass
 
 from . import mdp
+
+# For mdp.base_height_l2 — a stock Isaac Lab reward, not one of this project's custom
+# terms, so it isn't in the project's own `mdp` package above. Aliased to avoid shadowing
+# that import.
+import isaaclab_tasks.manager_based.locomotion.velocity.mdp as locomotion_mdp
 
 from isaaclab_tasks.manager_based.locomotion.velocity.config.g1.flat_env_cfg import G1FlatEnvCfg
 from isaaclab_tasks.manager_based.locomotion.velocity.config.g1.rough_env_cfg import (
@@ -163,10 +169,18 @@ class G1LocomotionStandingFlatEnvCfg(G1FlatEnvCfg):
         # mechanism that swings an arm close to the torso.
         self.scene.robot.spawn.articulation_props.enabled_self_collisions = True
 
-        # Arm actuator gains are reduced for smoother, physically plausible trajectory tracking.
+        # Kept at 60/1.5 (2026-07-12) — unlike the same-day attempt to use this value for
+        # the arm-IK task (reverted there, see g1_arm_env.py — regressed reach accuracy
+        # badly), this softer gain measurably *helped* standing: fall rate 0% either way,
+        # but mean tilt in eval_standing_ikreach.py dropped from 26.3deg (old 25/8) to
+        # 5.8deg (this value) — the best standing result across every gain tried. Arm-IK
+        # reaching needs a stiff gain for precision; standing's compliant/shock-absorbing
+        # arm response benefits from a soft one — no single value serves both, which is
+        # why deployment (eval_full_demo.py) now applies gains per-bucket instead of one
+        # global override, matching whichever policy's own training each bucket tests.
         if "arms" in self.scene.robot.actuators:
-            self.scene.robot.actuators["arms"].stiffness = 25.0
-            self.scene.robot.actuators["arms"].damping = 8.0
+            self.scene.robot.actuators["arms"].stiffness = 60.0
+            self.scene.robot.actuators["arms"].damping = 1.5
 
         # Keep action dimension unchanged, but override arm-joint targets from disturbance curriculum.
         if hasattr(self.actions, "joint_pos"):
@@ -264,3 +278,191 @@ class G1LocomotionStandingFlatEnvCfg_PLAY(G1LocomotionStandingFlatEnvCfg):
             # env-step this instance reaches> (or just let a long-enough play session
             # advance into it naturally, per the boundaries above).
             self.events.standing_arm_motion_disturbance.params["phase_step_offset"] = 140
+
+
+@configclass
+class G1LocomotionStandingFlatIKReachEnvCfg(G1LocomotionStandingFlatEnvCfg):
+    """Standing-flat config using real per-arm differential IK to drive the arm-reach
+    disturbance during training, instead of StandingArmTrajectoryDisturbance's scripted
+    joint-space random walk — see mdp.StandingArmIKReachDisturbance's docstring for the
+    full rationale (short version: a real x/y/z reach target, solved with actual IK, is
+    symmetric between arms by construction and matches what deployment actually tests,
+    unlike an arbitrary scripted joint-angle trajectory).
+
+    Isolated variant (new gym id, not a change to G1LocomotionStandingFlatEnvCfg itself,
+    2026-07-10): the existing standing checkpoint was trained entirely under the scripted
+    disturbance, and swapping the disturbance mechanism out from under an in-progress run
+    mid-curriculum risks an unintended distribution shift. This is for a deliberate,
+    separate experiment — either a fresh run or an explicit fine-tune from an existing
+    standing checkpoint via --resume/--load_run, your choice.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.events.standing_arm_motion_disturbance = EventTerm(
+            func=mdp.StandingArmIKReachDisturbance,
+            mode="interval",
+            interval_range_s=(self.sim.dt * self.decimation, self.sim.dt * self.decimation),
+            params={"asset_cfg": SceneEntityCfg("robot")},
+            is_global_time=False,
+        )
+        # standing_arm_motion_reset (reset_arm_targets_to_default) is inherited unchanged
+        # — it only resets the shared _standing_arm_motion_targets buffer to default pose,
+        # independent of which disturbance term is actually generating it.
+
+
+@configclass
+class G1LocomotionStandingFlatIKReachHeightEnvCfg(G1LocomotionStandingFlatIKReachEnvCfg):
+    """Same as G1LocomotionStandingFlatIKReachEnvCfg (analytic-IK disturbance, dwell-until-
+    timeout goal cycling — the arm holds a reached target instead of moving on instantly)
+    with exactly one addition: a direct base-height reward.
+
+    2026-07-13: found while chasing why standing had started resolving into a deep,
+    stable squat (~0.4-0.5m root height vs. the ~0.75m it spawns at) as its general
+    strategy under disturbance. Checked every reward term touching hip/knee joints —
+    joint_deviation_hip only covers hip_yaw/hip_roll (not hip_pitch, the squat-depth
+    joint); hip/knee otherwise only appear in dof_acc_l2/dof_torques_l2, which penalize
+    jerkiness and effort, not pose. Nothing anywhere in this reward stack penalizes
+    settling into a slow, smooth, low-torque squat — that's inherited correctly from
+    Isaac Lab's walking-oriented reward set (a gait needs hip-pitch/knee flexion, so
+    excluding them from a deviation penalty there is right), but standing never added
+    anything back to cover the gap, so a lower CoM was a genuinely free way to buy
+    stability once the disturbance got harder. mdp.base_height_l2 (stock Isaac Lab,
+    isaaclab/envs/mdp/rewards.py) is the direct fix — an L2 penalty on root height
+    against a target, rather than another indirect joint-deviation proxy. target_height
+    matches G1_MINIMAL_CFG's own spawn height (0.75m, isaaclab_assets/robots/unitree.py).
+    Weight is a starting point (-10.0), not a tuned value — check standing's own reward
+    curves after training and adjust if it's either not discouraging the squat enough or
+    fighting the disturbance-recovery crouch too hard to let it absorb anything at all.
+
+    Isolated as its own gym id, built directly on G1LocomotionStandingFlatIKReachEnvCfg
+    (not on either of last night's two experiments — joint_deviation_torso re-tightening
+    measurably didn't help and is dropped; the arm-policy-driven disturbance solved
+    standing_still but wrecked standing_arm_left_reach, most likely because the deep
+    squat it also produced puts the torso at a height/geometry the arm-IK policy — fixed-
+    root-trained at nominal height — was never built to reach relative to. Fixing the
+    squat directly here, on the baseline that was already reasonably balanced, is a
+    cleaner single-variable step than compounding it on top of that result).
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.rewards.base_height_l2 = RewTerm(
+            func=locomotion_mdp.base_height_l2,
+            weight=-10.0,
+            params={"target_height": 0.75},
+        )
+
+
+@configclass
+class G1LocomotionStandingFlatIKReachHeightEnvCfg_PLAY(G1LocomotionStandingFlatIKReachHeightEnvCfg):
+    """Eval variant, same pattern as G1LocomotionStandingFlatIKReachEnvCfg_PLAY."""
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.observations.policy.enable_corruption = True
+        self.events.standing_arm_motion_disturbance.params["enable_step"] = 0
+        self.events.standing_arm_motion_disturbance.params["ramp_full_step"] = 0
+
+
+@configclass
+class G1LocomotionStandingFlatIKReachEnvCfg_PLAY(G1LocomotionStandingFlatIKReachEnvCfg):
+    """Eval variant for an *already-trained* IK-reach checkpoint (validation/eval_standing_ikreach.py) —
+    disturbance fully on from step 0 (enable_step=ramp_full_step=0, see
+    mdp.StandingArmIKReachDisturbance._ramp_fraction) instead of training's own 30k-step
+    curriculum delay, since there's no policy left to protect from an abrupt disturbance
+    here — the whole point is measuring how the finished policy handles it. Observation
+    noise restored (the inherited _PLAY convention disables it for clean visualization;
+    this needs training-representative noise for a fair eval, same reasoning
+    eval_full_demo.py's _build_env_cfg already documents for the same fix)."""
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.observations.policy.enable_corruption = True
+        self.events.standing_arm_motion_disturbance.params["enable_step"] = 0
+        self.events.standing_arm_motion_disturbance.params["ramp_full_step"] = 0
+
+
+@configclass
+class G1LocomotionStandingFlatIKReachTorsoEnvCfg(G1LocomotionStandingFlatIKReachEnvCfg):
+    """Same as G1LocomotionStandingFlatIKReachEnvCfg (analytic-IK disturbance, dwell-until-
+    timeout goal cycling) with exactly one additional change: joint_deviation_torso's
+    weight, relaxed to 0.0 in G1LocomotionStandingFlatEnvCfg to let the torso act as a
+    free balance-compensation DOF (see that class's own comment: "re-tighten this first
+    if standing looks too wobbly through the torso"). 2026-07-13: partially re-tightened,
+    not reverted to the original -0.1 — the torso still needs *some* freedom to
+    compensate, this just discourages committing to an extreme, sustained lean now that
+    goals are held for up to 15s instead of cycling continuously (see the dwell-until-
+    timeout fix in mdp.StandingArmIKReachDisturbance). Isolated as its own gym id so this
+    is a single-variable experiment against the already-validated dwell-phase-fix
+    baseline, not bundled with the separate arm-policy-driven-disturbance experiment
+    (G1LocomotionStandingFlatPolicyReachEnvCfg) — same reasoning, different lever, run
+    independently so results are attributable.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.rewards.joint_deviation_torso.weight = -0.05
+
+
+@configclass
+class G1LocomotionStandingFlatIKReachTorsoEnvCfg_PLAY(G1LocomotionStandingFlatIKReachTorsoEnvCfg):
+    """Eval variant, same pattern as G1LocomotionStandingFlatIKReachEnvCfg_PLAY."""
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.observations.policy.enable_corruption = True
+        self.events.standing_arm_motion_disturbance.params["enable_step"] = 0
+        self.events.standing_arm_motion_disturbance.params["ramp_full_step"] = 0
+
+
+@configclass
+class G1LocomotionStandingFlatPolicyReachEnvCfg(G1LocomotionStandingFlatIKReachEnvCfg):
+    """Same as G1LocomotionStandingFlatIKReachEnvCfg (dwell-until-timeout goal cycling,
+    same curriculum ramp) but drives the arm-reach disturbance with the actual trained
+    arm-IK policy instead of analytic IK — see mdp.StandingArmPolicyReachDisturbance's
+    docstring for the full rationale (short version: a checkpoint trained against clean
+    analytic IK scored 0.13% fall rate in its own native eval under this exact disturbance
+    but 73%+ when deployed against the real policy's actual — visibly jittery near a
+    reached goal — behavior; every other difference between those two environments has
+    been ruled out, so this closes the one that's left).
+
+    Isolated as its own gym id, not a change to G1LocomotionStandingFlatIKReachEnvCfg
+    itself, same reasoning that class documents for its own isolation from the original
+    scripted-disturbance config: this is a deliberate, separate experiment against the
+    already-validated dwell-phase-fix baseline, run independently from the torso-reward
+    experiment (G1LocomotionStandingFlatIKReachTorsoEnvCfg) so each change's effect is
+    attributable on its own.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.events.standing_arm_motion_disturbance = EventTerm(
+            func=mdp.StandingArmPolicyReachDisturbance,
+            mode="interval",
+            interval_range_s=(self.sim.dt * self.decimation, self.sim.dt * self.decimation),
+            params={
+                "asset_cfg": SceneEntityCfg("robot"),
+                "arm_checkpoint": "chosen_checkpoints/arm_left_latest.pt",
+            },
+            is_global_time=False,
+        )
+
+
+@configclass
+class G1LocomotionStandingFlatPolicyReachEnvCfg_PLAY(G1LocomotionStandingFlatPolicyReachEnvCfg):
+    """Eval variant, same pattern as G1LocomotionStandingFlatIKReachEnvCfg_PLAY."""
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.observations.policy.enable_corruption = True
+        self.events.standing_arm_motion_disturbance.params["enable_step"] = 0
+        self.events.standing_arm_motion_disturbance.params["ramp_full_step"] = 0

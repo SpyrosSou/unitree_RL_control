@@ -6,9 +6,9 @@
 # Algorithm is inferred from the path: "logs/rsl_rl/..." → rsl_rl
 #
 # Joint/arm reference (robot-local frame, base at origin):
-#   x  forward    reachable 0.1 – 0.5 m
-#   y  lateral    left arm: 0.05 – 0.45 m   right arm: -0.05 – -0.45 m
-#   z  height     reachable 0.9 – 1.2 m  (ground = 0)
+#   x  forward    reachable 0.20 – 0.42 m
+#   y  lateral    left arm: 0.08 – 0.40 m   right arm: -0.40 – -0.08 m
+#   z  height     reachable 0.9 – 1.15 m  (ground = 0)
 
 left:
   # Training: scripts/rsl_rl/train.py  task=G1-Arm-IK-Left-v0

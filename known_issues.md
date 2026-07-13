@@ -6,18 +6,24 @@ Not a duplicate of the roadmap plan; this is specifically things found *while do
 work, with enough context to act on them later. Update this file directly when an item
 gets resolved (move it to the bottom under "Resolved", don't just delete it).
 
-## Arm policy — current state, for discussion (2026-07-07)
+## Arm policy — current state, for discussion (last updated 2026-07-08)
 
-Short version: **not yet practically usable.** Reachability and self-collision are fixed
-and confirmed. The core reaching accuracy is not — it's stuck at ~55% success (2cm
-threshold) with a real, unaddressed tail of harder goals. Full detail below; this section
-is meant to be skimmable on its own.
+Short version, **now materially better than this section's original framing (2026-07-07
+morning) suggested** — kept below as history, but don't read the opening paragraphs as
+current status. As of today: **85.6%/84.6% success** (up from the original ~55%),
+p90 ~3cm (down from ~12cm) — no more long tail of badly-missed goals, remaining failures
+are near-misses. The dominant cause (a genuinely unreachable chunk of the goal workspace)
+is fixed and confirmed. What's left is a smaller, well-characterized issue: manipulator
+redundancy causing the policy to sometimes land on a less-reliable of two valid solutions
+for the same goal — a targeted fix for that is written, training now (see the bottom of
+this section for the current state and what's next).
 
-**The core problem**: a 5-DOF single-arm reaching policy (`G1-Arm-IK-Left-v0`), trained
-with PPO, plateaus at **~55% success rate**, median distance-to-goal 1.98cm (right at the
-2cm threshold) but **p90 ~12cm** — a real subset of goals the policy just doesn't solve,
-not noise around a good average. Confirmed via `validation/eval_arm.py` (deterministic,
-fixed-seed) at two checkpoints: 1500 iterations and 4998 iterations (full budget).
+**The original core problem** (2026-07-07): a 5-DOF single-arm reaching policy
+(`G1-Arm-IK-Left-v0`), trained with PPO, plateaued at **~55% success rate**, median
+distance-to-goal 1.98cm (right at the 2cm threshold) but **p90 ~12cm** — a real subset of
+goals the policy just didn't solve, not noise around a good average. Confirmed via
+`validation/eval_arm.py` (deterministic, fixed-seed) at two checkpoints: 1500 iterations
+and 4998 iterations (full budget).
 
 **More training does not fix it — confirmed, not assumed.** Bucketing the full
 5000-iteration training curve into 20 slices: success rate reaches ~47% by iteration
@@ -129,6 +135,355 @@ on top.** This is a real bug fix (not a hyperparameter guess), and the diagnosti
 points at it more directly than any of the 4 swept experiments did — worth seeing how far
 it moves the needle on its own first. Target before reconsidering further additions: ~80%
 success (up from the current ~55-59% ceiling across every variant tried so far).
+
+**Result: `joint_vel` fix alone (1500-iteration test run, `run_name=joint_vel_fix`) —
+no meaningful change.** 57.0%/56.3% success vs. baseline's 55.5%/56.4% — within noise.
+Bucketing the run's own training-time episodes by env_step showed the identical shape as
+before the fix: success jumps ~30% → ~48% in the first ~15% of training, then flatlines
+for the rest. TensorBoard's loss curves looked improved, but that's expected regardless
+of task performance (the observation change alone shifts what the value function has to
+fit) — this is exactly why `eval_arm.py`'s success-rate metric, not loss, is treated as
+ground truth here. Correct bug, real fix, worth keeping — but not the plateau's cause.
+
+**Next isolated test (2026-07-08): null-space regularization.** This is a 5-DOF arm
+reaching a 3-DOF (position-only) goal — manipulator redundancy means most goals have a
+whole family of valid joint configurations, and PPO's unimodal Gaussian policy is a poor
+structural fit for a target with multiple equally-valid solutions (it can waver between
+them rather than consistently committing to one), which fits the observed failure
+pattern (uniform ~45% failure rate regardless of difficulty, missing by a real margin —
+not a near-miss). Added a small, deliberately weak reward penalty
+(`null_space_penalty_scale=0.05`) on the arm's joint angles deviating from
+`default_joint_pos` (the asset's own rest pose, already used elsewhere as "home") — a
+soft tiebreaker among valid solutions, not a constraint on the goal itself; doesn't touch
+end-effector orientation (goal stays position-only). One variable, on top of the
+joint_vel-fixed baseline, nothing else changed.
+
+**Result (2026-07-08): real effect, but not on success rate.** 56.0%/57.7% success —
+still flat, same training-time plateau shape/timing as every other variant. But mean
+distance and p90 both improved meaningfully and consistently in both buckets (mean dist
+down ~8-11%, p90 down ~12-13% vs. baseline) — a real, non-noise effect (unlike the
+joint_vel fix, which was flat on every metric), so the earlier concern about the scale
+being too weak to matter is resolved — it clearly changed behavior, just not on the
+specific discrete threshold. Reading: redundancy has *some* real effect (episodes that
+fail land closer on average) but isn't the dominant cause of the plateau.
+
+**Found: a large fraction of the goal workspace is not actually reachable within the
+success threshold (2026-07-08).** Built `validation/check_arm_reachability.py` — samples
+random joint configs within the real hardware limits (no RL/reward involved at all, pure
+kinematics) and checks how much of `_GOAL_BOUNDS` is covered by the arm's actual reach.
+Result (`validation/arm_reachability/left_summary.md`): only 47.1% of the goal box is
+within 2cm of anything reachable, and the *median* distance from an arbitrary box point
+to the nearest reachable point is 2.65cm — already past the 2cm success threshold. The
+per-octant breakdown is physically coherent: hardest region is far-forward + far-to-the-
+side + high-up simultaneously (mean 7.48cm, max 20.38cm — the natural edge of the arm's
+reach), easiest is close-in + to-the-side + high-up (mean 1.42cm). The raw 47.1% number
+understates true reachability (random joint sampling under-explores boundary
+configurations that need several joints simultaneously near their limits — a curse-of-
+dimensionality effect that RL's gradient-guided search doesn't suffer from, which is why
+every trained variant actually lands at 54-59%, above the naive 47% estimate) — but the
+qualitative conclusion looks solid: a meaningful, physically-explicable chunk of the goal
+box is at or beyond the edge of what the arm can reach, and this is very plausibly the
+dominant reason every arm-policy variant tried so far (baseline, joint_vel fix,
+null-space reg, entropy, wide-net, reward-shape, goal-curriculum) has landed in the same
+~55-59% band regardless of what else changed — no amount of retraining can cross a
+success-rate ceiling set by the task definition itself.
+
+**Fixed 2026-07-08: reshaped `_GOAL_BOUNDS`, two distinct problems on opposite edges of
+the box.** Tried to get a live Isaac Sim reading of `torso_link`'s position to check the
+"close-in, low" octant's poor score (6.44cm mean) directly, but two consecutive sim
+launches hung (one with an "X connection broken" error mid-startup — looked like a
+transient environment issue, not a script bug — both needed SIGKILL, `timeout`'s SIGTERM
+didn't work, same as Isaac Sim processes elsewhere in this project). Fell back to the
+real G1 URDF (`g1_29dof.urdf`, the same source used for joint limits earlier) instead of
+retrying — `torso_link`'s collision box (`<box size="0.13 0.20 0.30"/>`, converted through
+the URDF's joint-origin chain into the same local frame `_GOAL_BOUNDS` uses) works out to
+roughly `x:[-0.056,0.070] y:[-0.10,0.10] z:[0.785,1.085]`. Two separate findings, not one:
+
+- **The far corner (max x, max y, max z simultaneously) was genuinely unreachable** — a
+  pure arm-length limit, nothing to do with collision. Needs max forward + max lateral +
+  max height reach all at once, beyond what a ~50-60cm arm can do.
+- **The near corner (min x, min y, min z) is not unreachable, but sits only ~3cm from
+  the torso's surface** — well inside the 12cm safety margin `torso_proximity_penalty_scale`
+  already enforces elsewhere. Not a collision (boxes don't literally intersect), but the
+  policy was being asked to violate its own anti-collision incentive to succeed there.
+
+Reshaped both arms' bounds accordingly (`x: (0.1,0.5)→(0.15,0.42)`,
+`y: (0.05,0.45)→(0.05,0.40)` / mirrored for right, `z: (0.9,1.2)→(0.9,1.15)`) — pulled the
+far corner in, pushed the near-x edge out past the torso margin. **This makes every prior
+arm eval number (baseline through null-space, all ~55-59% band) non-comparable to
+whatever trains next** — that's expected and intended, not a regression; a smaller,
+better-clipped box should raise the achievable ceiling, but part of any jump is "the task
+got fairer," not purely "the policy got better," worth remembering when reading the next
+results.
+
+**Result (2026-07-08): confirms reachability was the dominant factor.** 74.7%/76.8%
+success (no_wobble/with_wobble), up from ~55-59% across every variant tried on the old
+box. Failure profile changed character, not just rate: median timeout distance dropped
+8.5cm -> 4.9cm, max dropped 20.0cm -> 12.5cm, ~51% of remaining timeouts are now near-misses
+(<5cm) vs. 20% before — no more long tail of "nowhere close" failures.
+
+**Re-ran the reachability check against the new bounds — still a residual gap, precisely
+localized.** Coverage improved (2cm tolerance: 47.1% -> 65.3%, median nearest-reachable
+distance 2.65cm -> 0.76cm) but the low-x/low-y octant is still clearly the worst (mean
+4.1-4.6cm vs. <1cm for high-x/low-y) — the first x push (0.10->0.15) helped but didn't
+fully clear the torso margin. Per-axis octant data isolated x as the dominant lever
+(holding y low, x alone: low->high dropped that corner's mean distance ~4.6cm -> ~0.9cm)
+with y a smaller secondary contributor (~4.6cm -> ~1.8cm). Pushed further:
+`x: (0.15,0.42)→(0.20,0.42)`, `y: (0.05,0.40)→(0.08,0.40)` (mirrored for right). Not yet
+retrained/evaluated on this second refinement.
+
+Also worth a plain note on the >100% joint-range-utilization numbers seen in these evals
+(e.g. left_elbow_pitch at 100.7% under `with_wobble`) — not a bug. `_arm_hw_limits` is
+actually the *soft* limit (`soft_joint_pos_limit_factor=0.9` on the G1 asset, already 90%
+of the true mechanical range) — targets are clamped to it, but the PD controller isn't
+infinitely stiff, so momentum can carry the actual joint briefly past that soft boundary
+into the buffer zone before the true hardware limit. That buffer is what soft limits are
+for; a small transient overshoot there is expected, not a safety concern.
+
+**Result (2026-07-08): second box refinement (`reachability_v2`) — 85.6%/84.6% success.**
+Mean dist 2.15/2.17cm, median 1.89/1.90cm (essentially at the 2cm threshold), p90 down to
+2.93/3.16cm — no more long-tail failures, everything is a near-miss now. Confirmed via
+`g1_arm_reach_test.py` that motion quality at both the new box's far and near corners
+still looks like genuine full-range reaching (joint-range utilization 65-87% across all 5
+joints), not something clipped/trivial — some residual shaking near the target reported
+visually, see the joint-config finding below for the likely cause.
+
+**Clarification: null-space regularization was never removed.** It was added directly to
+the base `G1ArmIKEnvCfg` (not a toggleable opt-in like the sweep experiments), so it's
+been silently active in every run since — including `reshaped_goal_bounds` and
+`reachability_v2`. Nothing to "reintroduce."
+
+**Found: joint-config correlation check (2026-07-08) — elbow_pitch's asymmetric range
+conflicts with the joint-limit penalty at exactly the pose needed for far reaches.**
+Extended `ArmMetricsCsvWrapper` to log each joint's angle at the episode's *closest
+approach* (not episode end, which for a timeout is just wherever the policy drifted to
+afterward) — reused the already-trained `reachability_v2` checkpoint, no retrain needed.
+Result: `left_elbow_pitch_joint` was within 5% of a hardware limit at closest approach in
+56.8%/51.5% of failures vs. only 17.5%/15.2% of successes (no_wobble/with_wobble) — every
+other joint showed ~0% near-limit involvement in either group. All of the near-limit
+failures (100%) were at the *lower* bound (-2.5°), none at the upper (185.5°).
+Mechanism: elbow_pitch's range is heavily asymmetric — 0° is roughly a straight, fully-
+extended arm, and the joint barely goes past straight (-2.5°) but folds a lot (up to
+185.5°). Full extension is a normal, necessary pose for far reaches (not a dangerous edge
+case), but the flat 5%-of-range joint-limit penalty applied uniformly to every joint
+doesn't know that, and was fighting the policy exactly when it needed to confidently
+commit to full extension — plausibly also the cause of the shaking near the target
+reported after the last visual check.
+
+**Refined before training** (your own good instinct, not silly at all): the first version
+reduced elbow_pitch's margin uniformly on *both* ends, but the data only supports it at
+the lower bound (100% of near-limit failures there, 0% at the upper). Reworked
+`_joint_limit_margin_fraction` to be per-joint *and* per-bound (`g1_arm_env.py`
+`__init__`, shape `(n_joints, 2)`): elbow_pitch's lower-bound margin is 0.01, its upper
+bound stays 0.05, and both bounds on the other 4 joints stay 0.05 (unchanged — no
+near-limit involvement in either success or failure episodes). Same fix where there's
+evidence, zero change everywhere there isn't. Doesn't touch the actual hard clamp either
+(`_arm_hw_limits`, already 90% of the true mechanical range via
+`soft_joint_pos_limit_factor=0.9`) — this only changes the reward-shaping margin on top
+of that already-conservative bound, not what the policy can ever physically command.
+Isolated, single change on top of the reachability-fixed baseline.
+
+**Result: no improvement, and the mechanism itself didn't move.** 84.5%/83.3% vs.
+85.6%/84.6% before — flat to very slightly down (likely noise). More importantly: even
+with the reward penalty relaxed 5x in that zone, elbow_pitch was *still* near its lower
+limit in 57.8%/56.0% of failures at closest approach — essentially unchanged from before
+the fix (56.8%/51.5%). If the penalty had actually been fighting the policy out of a pose
+it needed, relaxing it should have changed *behavior* even before it moved success rate.
+It didn't move at all — so the correlation between "elbow near full extension" and
+failure isn't caused by the reward penalty. More likely a genuine control-precision
+characteristic of that pose (small angle errors near full extension may translate to
+larger position errors, or it needs finer control than other configurations).
+
+**Follow-up checked: is this actually a rare edge case, safe to just exclude from
+training?** No — checked before assuming. Across all episodes, elbow_pitch sits within
+10° of the extension limit in 22.6% of them, within 20° in 35.1%, and the 10th percentile
+is already at the boundary. This is a substantial, regularly-occurring part of normal
+usage, not a corner case — excluding it from the goal box would be trading away real,
+mostly-working capability (only ~15-17% of episodes landing there fail) to inflate the
+success-rate number, not fixing anything. Decided against.
+
+**Next: 1b, isolated diagnostic — does focused training on the stress region actually
+improve precision there, before building a full curriculum (1a)?** Added
+`goal_bounds_x_override` (`g1_arm_env.py`) so a cfg variant can restrict just the x-range
+of `_GOAL_BOUNDS` without touching y/z or the module-level default. New opt-in variant
+`G1ArmIKLeftStressRegionEnvCfg` / task `G1-Arm-IK-Left-StressRegion-v0`: trains
+exclusively with `x` restricted to (0.35, 0.42) — the outer ~30% of the box, tracing the
+whole "far face" (all its corners and everything between them, not one isolated point) —
+y/z untouched, since x (forward reach) was already established as the dominant lever for
+reach difficulty. Also added `--goal_x_range` to `eval_arm.py` so *any* checkpoint
+(baseline or stress-region-trained) can be evaluated against exactly the same restricted
+region, for a fair before/after comparison.
+
+**1b result: no improvement (78.2%/76.4% vs. 78.4%/76.3% baseline scored on the same
+region) — but this uncovered a real bug in how the region was defined, not a genuine
+negative result.** Added goal-position logging (`goal_x_m/y_m/z_m` columns,
+`ArmMetricsCsvWrapper`) to check directly, and found: in ~3000 combined episodes
+restricted to `x∈[0.35,0.42]`, **zero** had elbow_pitch anywhere near its limit. The
+x-only restriction was based on misremembering the *original* reachability octant
+finding (which needed x AND y AND z all high *simultaneously*) as "x alone is the
+dominant lever" — leaving y/z free meant most sampled points never actually needed near-
+full extension at all. 1b never touched the real hard condition, so its negative result
+doesn't mean "more training doesn't help" — it means the experiment tested the wrong
+thing.
+
+**Re-diagnosed properly with goal-position data — the real finding is bigger than a
+wrong region.** Cross-referencing goal position against the near-limit condition across
+the *whole* box (not just the mis-defined slice): near-limit and non-near-limit episodes
+have statistically identical goal positions (same mean, same full range, every axis).
+Bucketing by forward distance and by distance-from-near-corner, the near-limit fraction
+stays flat (19-25%) with no trend toward the extreme edges — if anything the farthest
+bucket has the *lowest* rate. **This isn't a goal-difficulty problem at all — it's
+manipulator redundancy.** For any given goal, the policy sometimes lands on one solution
+branch (elbow bent ~42°, ~91% success) and sometimes on a different one for the *same*
+goal (elbow pinned near -0.1°, its lower limit, ~59% success) — a free, roughly goal-
+independent ~20%-of-episodes choice. This retroactively explains why both earlier fixes
+failed: the joint-limit margin fix didn't help because no goal *requires* the bad
+branch (relaxing the penalty didn't change anything to relax toward); 1b's misdefined
+region didn't help because there's no region where the bad branch concentrates.
+
+**Fix: null-space penalty is now per-joint-weighted, not just present.** The existing
+`null_space_penalty_scale` (0.05, unweighted L2 across all 5 joints) doesn't actually
+discriminate between the branches — total deviation-from-default is *similar* for both
+(~79° bad vs ~82° good), because `shoulder_pitch` is far from default in both branches,
+diluting the one joint that actually differs (`elbow_pitch`: ~50° off in the bad branch,
+~8° off in the good one). Weighting `elbow_pitch`'s contribution 3x in the null-space
+distance (`arm["null_space_weight"]`, `g1_arm_env.py` `__init__`/`_get_rewards`)
+separates the branches clearly (~162° bad vs ~85° good) — a targeted signal, not a blind
+scale increase (which would pressure all 5 joints toward default without specifically
+discouraging the one branch that's the problem, and cost general reaching flexibility
+for no reason). Isolated, single change on top of the reachability-fixed baseline.
+
+**Result: no effect, mechanism didn't move either.** 84.1%/85.2% success — noise around
+the last two checkpoints (84.5-85.6%), not a real change. Checked the actual mechanism
+directly, not just the aggregate: bad-branch fraction 21.1%/21.8% (was 21.8%/23.4% before
+this fix — unchanged), success on the bad branch 59.3%/61.2% (was 58.9%/60.1% —
+unchanged), success on the good branch 90.8%/91.9% (was 91.6%/90.4% — unchanged). The 3x
+elbow_pitch weighting didn't shift which branch the policy lands on at all, despite being
+specifically designed to. Joint-range utilization shows no overcorrection sign either
+(shoulder ranges didn't creep up, elbow's didn't shrink abnormally) — the fix simply had
+no effect in either direction.
+
+**This is the third targeted attempt at the redundancy/branch issue to cleanly fail**
+(joint-limit margin, then weighted null-space). Leading theory now: this may be a
+structural mismatch between PPO's single (unimodal) Gaussian policy and a genuinely
+bimodal solution space — a reward-shaping nudge can bias which solution *looks* better on
+paper, but may not be enough leverage to actually collapse the policy's tendency to
+stochastically land on either mode. A real fix would likely need a more expressive action
+distribution (e.g. a mixture policy) — a bigger architectural change, out of scope for
+now. Not chasing this further today; the ~85% success rate itself is still a large,
+confirmed improvement over the original ~55%, and the branch issue accounts for a bounded
+(~15-20% of episodes), well-characterized, but not-yet-solved remainder.
+
+**Queued (2026-07-08): overnight sweep v2, once the weighted-null-space result is
+in.** 3 isolated experiments — entropy (`G1-Arm-IK-Left-Entropy-v0`), wide network
+(`G1-Arm-IK-Left-WideNet-v0`), and a new PPO hyperparameter tuning variant
+(`G1-Arm-IK-Left-PPOTuning-v0`, `num_learning_epochs` 5→8, lowest confidence of the
+three — no specific prior evidence points at it, unlike the other two). All three pair
+with the *current* `G1ArmIKLeftEnvCfg` (every fix above already baked in), not the old
+~55% baseline, via `overnight_train.sh` (rewritten for this sweep — same file gets
+reused/edited per sweep rather than accumulating separate scripts). 1500 iterations
+each, sequential, eval after each. Script shuts the machine down once the queue
+finishes — see the script's own comments for the passwordless-shutdown-permission
+caveat to verify before relying on it unattended.
+
+**Overnight sweep v2 result: none of the three fixes the branch-selection issue
+(bad-branch frequency stayed 20-21% across all three, same as baseline), but wide-net
+reproduces its earlier-shown strength.** vs. `null_space_weighted` baseline
+(84.1%/85.2%, p90 3.70/3.61):
+
+| Run | Success % | p90 dist (cm) | Success on bad branch |
+|---|---|---|---|
+| baseline | 84.1 / 85.2 | 3.70 / 3.61 | 59.3% |
+| entropy_v2 | 86.3 / 85.1 | 3.33 / 3.43 | 64.0% |
+| wide_net_v2 | 85.3 / 84.5 | **3.02 / 3.19** | 63.5% |
+| ppo_tuning | 84.2 / 85.4 | 3.20 / 3.18 | 60.7% |
+
+Interesting secondary effect: entropy and wide-net both modestly improve *precision
+within* the bad branch (~59%→~64% success on those episodes) without changing how often
+the policy lands there — a different, complementary improvement to mode-selection, not a
+fix for it. wide-net gives the best p90/tail by a clear margin, and this is the *second*
+time it's shown this exact strength (first on the old ~55% baseline, now on the current
+~85% one) — reproducible, not a one-off. **Decision: fold wide-net alone into the final
+consolidated arm policy** (entropy was mixed, PPO-tuning showed the least effect —
+neither adopted).
+
+**Queued (2026-07-09): final consolidation pass.** `overnight_train.sh` rewritten again
+(same file, reused per sweep as established) for 2 sequential steps: (1) arm —
+`G1-Arm-IK-Left-WideNet-v0` at the full 5000-iteration budget (already bundles
+everything else confirmed good — reachability-fixed box, weighted null-space,
+asymmetric elbow_pitch margin — since those live in the shared `G1ArmIKLeftEnvCfg`, not
+a separate toggle); (2) standing — resumes the phase-5-curriculum run manually stopped
+at iteration ~5650 back up to its original 8000-iteration target, into the same run
+folder. Estimated ~2.5 hours total. Not yet run.
+
+**Noted, not urgent — arm-vs-arm collision for `arm="both"` training.** Self-collision
+(`enabled_self_collisions=True`) is a whole-robot property, so it already physically
+prevents literal left-arm/right-arm interpenetration, same as it does for arm-vs-torso.
+What's missing: torso got *both* the structural fix (self-collision) *and* a soft reward
+penalty discouraging the policy from approaching it in the first place
+(`torso_proximity_penalty_scale`) — there's no equivalent arm-to-arm proximity penalty
+yet. So today, two simultaneous goals pulling the arms close together would rely entirely
+on physical contact response (abrupt, reactive) rather than a learned, smooth avoidance.
+Check/add before ever training `G1-Arm-IK-Both-v0` for real — not needed for single-arm
+work.
+
+**Status of the three items below, as of 2026-07-08 (superseding the earlier version of
+this list, which is now stale):**
+
+1. **Null-space regularization — confirmed real, kept, and now sharpened.** Originally a
+   uniform (unweighted) penalty — confirmed real but modest (mean/p90 distance improved
+   ~8-13%, success rate unchanged). Root-caused *why* it wasn't enough (see the
+   joint-config correlation entry below — it's a redundancy/branch-selection problem, and
+   the unweighted version doesn't discriminate between branches) and reworked it to be
+   per-joint-weighted (`elbow_pitch` 3x). Training now — see the bottom of this section.
+2. **Joint-config correlation check — done, and it found something bigger than
+   expected.** Not "does failure correlate with a joint near its limit" in the abstract —
+   concretely: ~20-23% of episodes land on a less-reliable of two valid solution branches
+   for the *same* goal (elbow pinned near its lower limit, ~59% success, vs. elbow bent
+   ~42°, ~91% success), independent of goal position. Full story is the last several
+   entries in this section. This is *the* current lead, not a deferred item anymore.
+3. **PPO hyperparameter tuning — queued, lowest confidence of the three, not yet run.**
+   `num_learning_epochs` 5→8 is the one concrete variant defined so far (see the overnight
+   sweep v2 entry below); learning rate schedule/`num_mini_batches`/`clip_param` remain
+   untouched. Still genuinely lower-priority than the other two — no specific evidence
+   points at optimizer settings the way the redundancy finding points at null-space.
+
+**1a (curriculum oversampling a "hard" geometric region) — superseded, not just
+deferred.** The original plan was: if 1b (isolated training on a hard region) helps,
+build a proper curriculum (1a) that biases sampling toward it during normal training. 1b
+turned out to be testing the wrong thing (see below — the region was misdefined, and once
+corrected, it turned out there's no hard geometric region at all, just a goal-independent
+redundancy issue). A curriculum over goal *position* can't fix a problem that doesn't
+depend on goal position — 1a doesn't make sense as stated anymore. If the weighted
+null-space fix doesn't fully resolve the redundancy issue, the right next lever is
+something that acts on the redundancy directly (e.g. a stronger/differently-shaped
+null-space term), not a goal-sampling curriculum.
+
+**Option 2 (base repositioning for out-of-envelope targets) — real idea, scoped for
+integration, not today's work.** User proposal: rather than trying to make the arm alone
+handle 100% of the theoretical workspace, treat a smaller region as the arm's reliable
+envelope and have the *robot* (via walking) reposition itself when a requested target
+falls outside it, then reach once close enough. Assessed as more tractable than it first
+sounds: it only needs *sequential* walk-then-reach (check reachability against the
+trained envelope, compute a base offset, walk there, switch to standing+arm mode — all of
+which either already exists or is straightforward geometry), not simultaneous
+arm+walking coordination (genuinely hard, unstarted, real Phase 3 territory). Not
+avoidance/overfitting in the way blindly shrinking the goal box would have been — it
+relocates capability to a subsystem well-suited to it (walking's whole job is
+repositioning the body) rather than deleting it. Explicitly deferred to the integration
+work (tomorrow+), not touched today.
+
+**Verification to do once the weighted null-space training/eval comes back**: user's own
+good methodological question — does weighting `elbow_pitch` more heavily in the
+null-space penalty risk over-correcting into *avoiding* elbow bend entirely, pushing
+everything onto shoulder rotation instead? Reasoning why this is unlikely (the reference
+pose is `default_joint_pos`'s ~49.8° elbow bend, a moderate bend, not 0° — the term
+discourages deviating from that, not bending in general — and the overall scale is
+unchanged, still deliberately weak relative to `position_reward_scale`), but reasoning
+isn't verification. Check directly: joint-range-utilization table (did shoulder ranges
+creep up while elbow's shrank abnormally?) and the near-limit-branch population size (did
+it actually shrink, confirming the mechanism, without a new failure mode appearing
+elsewhere?).
 
 ## Open
 
@@ -465,7 +820,59 @@ genuinely Phase 3 territory (arm+walking integration) rather than something to c
 down in isolation right now; worth a smoother arm-retraction profile during the
 transition rather than an instant drop, whenever this gets picked up.
 
+### Standing: leans/drifts and takes small stationary corrective steps (phase-5-curriculum checkpoint, 2026-07-09)
+
+Noticed while testing `g1_full_demo.py` (see `phase_logs/phase_2.md`'s integration-
+testing section) after swapping `chosen_checkpoints/standing_latest.pt` to the
+phase-5-curriculum run: the robot leans to one side during normal standing and takes
+small "stationary" corrective steps (feet lifting/placing with no real disturbance).
+Reverting to the pre-phase-5 checkpoint resolved both for now. The stepping behavior
+specifically is consistent with — not necessarily a new bug on top of — the existing
+"corrective stepping is unreliable" item below (phase-5 was trained specifically to try
+to improve stepping, so seeing it actually manifest for the first time on the first
+checkpoint trained under it isn't surprising). The lean is unconfirmed as
+checkpoint-specific vs. a broader issue. **Being picked up in a separate, dedicated
+debugging session**, not part of the integration-testing work above — noted here so it
+isn't lost between sessions.
+
+### Multi-arm mirror generalization — implemented, not yet exercised (2026-07-09)
+
+`g1_full_demo.py` gained `Y`/`U` keys to drive the right arm — and both arms
+simultaneously — by mirroring the left-trained policy (`mdp/symmetry.py`'s
+`mirror_arm_obs`/`mirror_arm_actions`, the same transform `g1_arm_mirror_test.py`
+already validates one-arm-at-a-time in isolation, and what the policy is actually
+*trained* to satisfy via symmetry-augmented PPO). This is the first time the transform
+has been exercised driving *both* arms at once against the real, standing robot rather
+than one arm in isolation — known_issues.md's "arm-vs-arm collision for `arm=\"both\"`"
+gap (below) is exactly the kind of thing this could surface. Not yet tested — next
+session should actually run `U` and report whether it holds up, which directly informs
+whether training a real `G1-Arm-IK-Both-v0` policy is worth prioritizing.
+
+### Arm actuator gains: walking's gait may be affected by a stiffness change (2026-07-09)
+
+`g1_full_demo.py` now overrides the shared walking/standing env's arm actuator gains to
+match the arm-IK task's own training config (`stiffness=200, damping=20`, up from the
+walking task's stock `stiffness=40, damping=10`) — see `phase_logs/phase_2.md`'s
+integration-testing section, item 6. Necessary for the arm-IK policy to track its commanded targets with the precision it
+was trained to expect, but the walking policy's own natural arm-swing gait was trained
+under the *softer* stock gains — not yet independently re-verified that walking still
+looks/behaves the same under the new, stiffer gains.
+
 ## Resolved
 
-*(nothing yet — the above are code changes made 2026-07-07, not yet trained/verified, so
-they stay under Open until an actual training run or play.py check confirms them.)*
+**2026-07-09 (integration testing) — five real bugs in `g1_full_demo.py`, found by
+actually running the combined demo:** reset-anchor using a stale pre-spawn pose
+(initial `--target` only), an `inference_mode` crash on the `T`-key prompt, a z-height
+convention mismatch that placed every target far too high to reach, the untouched arm
+running on the standing policy's meaningless raw output whenever only one arm had a
+target, and a camera whose transform was re-locked every frame (making manual orbit
+impossible). Full detail, root causes, and fixes in `phase_logs/phase_2.md`'s
+integration-testing section. Also refreshed
+`chosen_checkpoints/arm_left_latest.pt`/`standing_latest.pt` (both stale since before
+this phase) and fixed six goal-box-bounds references across
+`testing/*.py`/`testing/quickrun_tests.md` that still quoted the pre-reachability-fix
+numbers (display-only, never affected actual validation logic).
+
+*(the items below this line predate this phase — nothing yet, the above are code changes
+made 2026-07-07, not yet trained/verified, so they stay under Open until an actual
+training run or play.py check confirms them.)*

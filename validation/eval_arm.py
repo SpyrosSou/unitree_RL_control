@@ -62,6 +62,16 @@ parser.add_argument(
 )
 parser.add_argument("--seed", type=int, default=42, help="Fixed seed for reproducible rollouts.")
 parser.add_argument(
+    "--goal_x_range", type=float, nargs=2, default=None, metavar=("X_MIN", "X_MAX"),
+    help=(
+        "Override the goal box's x-range for this eval only (y/z untouched) — e.g. "
+        "--goal_x_range 0.35 0.42 to evaluate any checkpoint against just the elbow-"
+        "extension stress region (2026-07-08, see known_issues.md), for a fair "
+        "before/after comparison independent of which checkpoint was trained on it. "
+        "Default: None (use the checkpoint's own G1ArmIKLeftEnvCfg_PLAY bounds)."
+    ),
+)
+parser.add_argument(
     "--hidden_dims", type=int, nargs="+", default=None,
     help=(
         "Override actor/critic hidden dims to match the checkpoint being evaluated — "
@@ -123,6 +133,8 @@ def _build_base_env() -> G1ArmIKEnv:
     env_cfg = G1ArmIKLeftEnvCfg_PLAY()
     env_cfg.scene.num_envs = args_cli.num_envs
     env_cfg.seed = args_cli.seed
+    if args_cli.goal_x_range is not None:
+        env_cfg.goal_bounds_x_override = tuple(args_cli.goal_x_range)
     return G1ArmIKEnv(env_cfg)
 
 
@@ -205,6 +217,8 @@ def main():
 
     print(f"[Eval] Checkpoint : {args_cli.checkpoint}")
     print(f"[Eval] Buckets    : {args_cli.buckets}")
+    if args_cli.goal_x_range is not None:
+        print(f"[Eval] goal_x_range override: {tuple(args_cli.goal_x_range)}")
     print(f"[Eval] num_envs   : {args_cli.num_envs}   steps_per_bucket: {args_cli.steps_per_bucket}")
 
     print("[Eval] Building simulation (once, reused across all buckets)...")

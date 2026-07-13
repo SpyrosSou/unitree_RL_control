@@ -57,6 +57,16 @@ gym.register(
 )
 
 gym.register(
+    id="G1-Arm-IK-Left-StressRegion-v0",
+    entry_point="g1_locomotion.tasks.manager_based.g1_arm.g1_arm_env:G1ArmIKEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.g1_arm_env:G1ArmIKLeftStressRegionEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1ArmIKLeftStressRegionPPORunnerCfg",
+    },
+)
+
+gym.register(
     id="G1-Arm-IK-Left-WideNet-v0",
     entry_point="g1_locomotion.tasks.manager_based.g1_arm.g1_arm_env:G1ArmIKEnv",
     disable_env_checker=True,
@@ -73,6 +83,16 @@ gym.register(
     kwargs={
         "env_cfg_entry_point": f"{__name__}.g1_arm_env:G1ArmIKLeftEnvCfg",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1ArmIKLeftEntropyPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="G1-Arm-IK-Left-PPOTuning-v0",
+    entry_point="g1_locomotion.tasks.manager_based.g1_arm.g1_arm_env:G1ArmIKEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.g1_arm_env:G1ArmIKLeftEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1ArmIKLeftPPOTuningPPORunnerCfg",
     },
 )
 

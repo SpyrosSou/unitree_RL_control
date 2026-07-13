@@ -71,23 +71,36 @@ class _DualCsvWriter:
     both files, so they can be joined back together (e.g. in pandas) if needed.
     """
 
-    def __init__(self, log_dir: str, name: str, detailed_fieldnames: list[str], summary_fieldnames: list[str]):
+    def __init__(
+        self,
+        log_dir: str,
+        name: str,
+        detailed_fieldnames: list[str],
+        summary_fieldnames: list[str],
+        write_summary: bool = True,
+    ):
         os.makedirs(log_dir, exist_ok=True)
         self.detailed_path = os.path.join(log_dir, f"{name}_detailed.csv")
-        self.summary_path = os.path.join(log_dir, f"{name}_summary.csv")
         self._summary_fieldnames = summary_fieldnames
+        self._write_summary = write_summary
 
         self._detailed_file = open(self.detailed_path, "a", newline="")
-        self._summary_file = open(self.summary_path, "a", newline="")
         self._detailed_writer = csv.DictWriter(self._detailed_file, fieldnames=detailed_fieldnames)
-        self._summary_writer = csv.DictWriter(self._summary_file, fieldnames=summary_fieldnames)
-
         if self._detailed_file.tell() == 0:
             self._detailed_writer.writeheader()
             self._detailed_file.flush()
-        if self._summary_file.tell() == 0:
-            self._summary_writer.writeheader()
-            self._summary_file.flush()
+
+        if self._write_summary:
+            self.summary_path = os.path.join(log_dir, f"{name}_summary.csv")
+            self._summary_file = open(self.summary_path, "a", newline="")
+            self._summary_writer = csv.DictWriter(self._summary_file, fieldnames=summary_fieldnames)
+            if self._summary_file.tell() == 0:
+                self._summary_writer.writeheader()
+                self._summary_file.flush()
+        else:
+            self.summary_path = None
+            self._summary_file = None
+            self._summary_writer = None
 
     def next_episode_index(self) -> int:
         # The detailed file is a strict superset of the summary file's rows, so its
@@ -97,8 +110,9 @@ class _DualCsvWriter:
     def write_row(self, row: dict):
         self._detailed_writer.writerow(row)
         self._detailed_file.flush()
-        self._summary_writer.writerow({k: row[k] for k in self._summary_fieldnames})
-        self._summary_file.flush()
+        if self._write_summary:
+            self._summary_writer.writerow({k: row[k] for k in self._summary_fieldnames})
+            self._summary_file.flush()
 
     def close(self):
         for f in (self._detailed_file, self._summary_file):
@@ -129,10 +143,10 @@ class StandingMetricsCsvWrapper(gym.Wrapper):
         "arm_disturbance_phase",
     ]
 
-    def __init__(self, env: gym.Env, log_dir: str):
+    def __init__(self, env: gym.Env, log_dir: str, write_summary: bool = True):
         super().__init__(env)
         self.log_dir = log_dir
-        self._csv = _DualCsvWriter(log_dir, "standing", self._fieldnames(), self._SUMMARY_FIELDS)
+        self._csv = _DualCsvWriter(log_dir, "standing", self._fieldnames(), self._SUMMARY_FIELDS, write_summary)
         self.csv_path = self._csv.detailed_path  # kept for validation/eval_standing.py
 
         self._device = torch.device(self.unwrapped.device)
@@ -347,10 +361,10 @@ class WalkingMetricsCsvWrapper(gym.Wrapper):
         "heading_drift_deg",
     ]
 
-    def __init__(self, env: gym.Env, log_dir: str):
+    def __init__(self, env: gym.Env, log_dir: str, write_summary: bool = True):
         super().__init__(env)
         self.log_dir = log_dir
-        self._csv = _DualCsvWriter(log_dir, "walking", self._fieldnames(), self._SUMMARY_FIELDS)
+        self._csv = _DualCsvWriter(log_dir, "walking", self._fieldnames(), self._SUMMARY_FIELDS, write_summary)
         self.csv_path = self._csv.detailed_path
 
         self._device = torch.device(self.unwrapped.device)
@@ -567,14 +581,37 @@ class ArmMetricsCsvWrapper(gym.Wrapper):
         "wobble_active",
     ]
 
-    def __init__(self, env: gym.Env, log_dir: str):
+    def __init__(self, env: gym.Env, log_dir: str, write_summary: bool = True):
         super().__init__(env)
         self.log_dir = log_dir
-        self._csv = _DualCsvWriter(log_dir, "arm", self._fieldnames(), self._SUMMARY_FIELDS)
-        self.csv_path = self._csv.detailed_path
-
+        self._write_summary = write_summary
         self._device = torch.device(self.unwrapped.device)
         self._num_envs = int(self.unwrapped.num_envs)
+
+        # Joint configuration at the episode's closest approach (2026-07-08, joint-config
+        # correlation check — see known_issues.md). Answers "does failure correlate with a
+        # specific joint being pinned near its limit, or a specific multi-joint combination"
+        # rather than just goal difficulty — a question the reachability-workspace fix
+        # couldn't answer on its own. Only wired up for the arm task (needs
+        # arm_joint_indices_tensor and joint_names); silently skipped (empty columns) for
+        # envs that don't expose it. Computed before _fieldnames()/_csv construction below
+        # since the field list depends on it.
+        self._arm_joint_ids = getattr(self.unwrapped, "arm_joint_indices_tensor", None)
+        if self._arm_joint_ids is not None:
+            all_names = self.unwrapped.robot.data.joint_names
+            self._arm_joint_names = [all_names[i] for i in self._arm_joint_ids.tolist()]
+            self._episode_joint_pos_at_min_dist = torch.zeros(
+                (self._num_envs, len(self._arm_joint_ids)), dtype=torch.float32, device=self._device
+            )
+        else:
+            self._arm_joint_names = []
+        self._log_goal_position = hasattr(self.unwrapped, "goal_positions") and hasattr(
+            self.unwrapped.scene, "env_origins"
+        )
+
+        self._csv = _DualCsvWriter(log_dir, "arm", self._fieldnames(), self._SUMMARY_FIELDS, self._write_summary)
+        self.csv_path = self._csv.detailed_path
+
         self._episode_index = torch.full(
             (self._num_envs,), self._csv.next_episode_index(), dtype=torch.long, device=self._device
         )
@@ -591,9 +628,8 @@ class ArmMetricsCsvWrapper(gym.Wrapper):
             (self._num_envs,), float("inf"), dtype=torch.float32, device=self._device
         )
 
-    @staticmethod
-    def _fieldnames() -> list[str]:
-        return [
+    def _fieldnames(self) -> list[str]:
+        base = [
             "episode_index",
             "env_id",
             "env_step",
@@ -607,6 +643,10 @@ class ArmMetricsCsvWrapper(gym.Wrapper):
             "wobble_active",
             "min_torso_dist_cm",
         ]
+        base += [f"{name}_deg_at_min_dist" for name in self._arm_joint_names]
+        if self._log_goal_position:
+            base += ["goal_x_m", "goal_y_m", "goal_z_m"]
+        return base
 
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
@@ -639,6 +679,8 @@ class ArmMetricsCsvWrapper(gym.Wrapper):
         self._episode_min_dist[env_ids] = float("inf")
         self._episode_max_dist[env_ids] = 0.0
         self._episode_min_torso_dist[env_ids] = float("inf")
+        if self._arm_joint_ids is not None:
+            self._episode_joint_pos_at_min_dist[env_ids] = 0.0
 
     def _update_step_metrics(self, env):
         worst_dist = torch.zeros(env.num_envs, device=env.device)
@@ -654,8 +696,19 @@ class ArmMetricsCsvWrapper(gym.Wrapper):
                 closest_torso_dist = torch.minimum(closest_torso_dist, torso_dist)
 
         self._episode_steps += 1
-        self._episode_min_dist = torch.minimum(self._episode_min_dist, worst_dist.detach().float())
-        self._episode_max_dist = torch.maximum(self._episode_max_dist, worst_dist.detach().float())
+        worst_dist = worst_dist.detach().float()
+        # Capture the joint configuration exactly on the step(s) where a new per-episode
+        # minimum distance is set, before overwriting _episode_min_dist below — this is
+        # "the pose at closest approach", the thing the joint-config correlation check
+        # actually wants (not the pose at episode end, which for a timeout is often just
+        # wherever the policy happened to drift to after already passing its best shot).
+        if self._arm_joint_ids is not None:
+            is_new_min = worst_dist < self._episode_min_dist
+            if bool(is_new_min.any().item()):
+                current_joint_pos = env.robot.data.joint_pos[:, self._arm_joint_ids]
+                self._episode_joint_pos_at_min_dist[is_new_min] = current_joint_pos[is_new_min].detach().float()
+        self._episode_min_dist = torch.minimum(self._episode_min_dist, worst_dist)
+        self._episode_max_dist = torch.maximum(self._episode_max_dist, worst_dist)
         if torso_body_idx is not None:
             self._episode_min_torso_dist = torch.minimum(
                 self._episode_min_torso_dist, closest_torso_dist.detach().float()
@@ -698,6 +751,21 @@ class ArmMetricsCsvWrapper(gym.Wrapper):
                 "wobble_active": wobble_active,
                 "min_torso_dist_cm": min_torso_dist * 100.0 if min_torso_dist != float("inf") else "",
             }
+            if self._arm_joint_ids is not None:
+                joint_pos_deg = torch.rad2deg(self._episode_joint_pos_at_min_dist[env_id]).tolist()
+                for name, deg in zip(self._arm_joint_names, joint_pos_deg):
+                    row[f"{name}_deg_at_min_dist"] = deg
+            if self._log_goal_position:
+                # 2026-07-08: goal position wasn't logged at all before — the
+                # joint-config-at-min-dist columns above show *what pose the arm ended
+                # up in*, but not *what goal it was trying to reach*, so there was no way
+                # to check whether a geometric goal-box region (e.g. "far x") actually
+                # corresponds to the poses that trigger joint-limit involvement, or
+                # whether that assumption was wrong (see known_issues.md — it was).
+                # Local frame (env origin subtracted), matching _GOAL_BOUNDS's own
+                # convention, so it's directly comparable to the goal-box definition.
+                goal_local = (env.goal_positions[env_id, 0, :] - env.scene.env_origins[env_id]).tolist()
+                row["goal_x_m"], row["goal_y_m"], row["goal_z_m"] = goal_local
             self._csv.write_row(row)
             self._episode_index[env_id] += 1
         self._reset_buffers(env_ids)

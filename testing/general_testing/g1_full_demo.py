@@ -13,12 +13,23 @@ Behaviour:
 - When standing again, arm policy resumes.
 - Press T to type a new arm target at the console (same pattern as testing/arm_testing).
 - Press L / R to select which arm to address when arm_mode=both (default: left).
-- Press C to toggle third-person / free camera.
+- Press Y (arm_mode=left only) to type a target for the RIGHT arm, driven by mirroring
+  the left-trained policy (see mdp/symmetry.py) — no separate right-arm checkpoint
+  needed. Shown as a blue marker, vs. the native target's red.
+- Press U (arm_mode=left only) to type two independent targets, one per arm (left
+  native, right mirrored) — tests whether the mirror-generalized policy holds up
+  driving both arms simultaneously, not just one at a time. Two separate targets, not
+  one auto-mirrored position, since sending both arms to the same physical point makes
+  them collide.
+- Press C to toggle camera follow off/on (off lets you orbit freely with the mouse).
+- Press V to reset the camera to the default chase view (and re-enable follow).
 
-Arm target format (robot-local frame, base at origin):
-    x  forward     reachable 0.1 – 0.5 m
-    y  lateral     left arm: 0.05 – 0.45 m   right arm: -0.05 – -0.45 m
-    z  height      reachable 0.9 – 1.2 m
+Arm target format (robot-local frame, base at origin — see g1_arm_env.py's _GOAL_BOUNDS,
+the authoritative source; these numbers are just a quick reference and can drift out of
+date if that box is reshaped again, always trust the live prompt output over this):
+    x  forward     reachable 0.20 – 0.42 m
+    y  lateral     left arm: 0.08 – 0.40 m   right arm: -0.40 – -0.08 m
+    z  height      reachable 0.9 – 1.15 m  (ground = 0)
 
 Usage:
     conda activate isaac_g1_control
@@ -47,6 +58,7 @@ Usage:
 import argparse
 import importlib.util as _ilu
 import os
+
 import yaml
 
 ISAACLAB_PATH = os.path.expanduser("~/Elm/Code/IsaacLab")
@@ -95,39 +107,43 @@ simulation_app = app_launcher.app
 # ---------------------------------------------------------------------------
 # Everything after sim is up
 # ---------------------------------------------------------------------------
+import g1_locomotion.tasks  # noqa: F401 — registers gym envs
 import torch
-from rsl_rl.runners import OnPolicyRunner
+from g1_locomotion.tasks.manager_based.g1_arm.agents.rsl_rl_ppo_cfg import (
+    G1ArmIKBothPPORunnerCfg,
+    G1ArmIKLeftPPORunnerCfg,
+    G1ArmIKRightPPORunnerCfg,
+)
+from g1_locomotion.tasks.manager_based.g1_arm.g1_arm_env import (
+    _GOAL_BOUNDS,
+    _LEFT_ARM_JOINTS,
+    _LEFT_EE_BODY,
+    _RIGHT_ARM_JOINTS,
+    _RIGHT_EE_BODY,
+)
+from g1_locomotion.tasks.manager_based.g1_arm.mdp.symmetry import (
+    mirror_arm_actions,
+    mirror_arm_obs,
+)
+from g1_locomotion.tasks.manager_based.g1_locomotion.g1_locomotion_env_cfg import (
+    G1LocomotionFlatEnvCfg_PLAY,
+)
+from g1_locomotion.tasks.manager_based.g1_locomotion.mdp import StandingArmBlendJointPositionAction
 from rsl_rl.modules import ActorCritic
+from rsl_rl.runners import OnPolicyRunner
 from tensordict import TensorDict
-
-import isaaclab.sim as sim_utils
-from isaaclab.envs import ManagerBasedRLEnv
-from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
-from isaaclab.sim.utils.stage import get_current_stage
-from isaaclab.utils.math import quat_apply
-
-from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper
 
 from omni.kit.viewport.utility import get_viewport_from_window_name
 from omni.kit.viewport.utility.camera_state import ViewportCameraState
 from pxr import Gf, Sdf
 
-import g1_locomotion.tasks  # noqa: F401 — registers gym envs
-from g1_locomotion.tasks.manager_based.g1_locomotion.g1_locomotion_env_cfg import (
-    G1LocomotionFlatEnvCfg_PLAY,
-)
-from g1_locomotion.tasks.manager_based.g1_arm.g1_arm_env import (
-    _LEFT_ARM_JOINTS,
-    _RIGHT_ARM_JOINTS,
-    _LEFT_EE_BODY,
-    _RIGHT_EE_BODY,
-    _GOAL_BOUNDS,
-)
-from g1_locomotion.tasks.manager_based.g1_arm.agents.rsl_rl_ppo_cfg import (
-    G1ArmIKLeftPPORunnerCfg,
-    G1ArmIKRightPPORunnerCfg,
-    G1ArmIKBothPPORunnerCfg,
-)
+import isaaclab.sim as sim_utils
+from isaaclab.envs import ManagerBasedRLEnv
+from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
+from isaaclab.sim.utils.stage import get_current_stage
+from isaaclab.utils.math import quat_apply, quat_apply_inverse
+
+from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper
 
 # ---------------------------------------------------------------------------
 # Switch demo constants (identical to g1_stand_walk_switch_demo.py)
@@ -145,17 +161,50 @@ TRANSITION_STEPS_TO_STAND   = 22
 
 # Arm action scale (must match what the arm policy was trained with)
 ARM_ACTION_SCALE = 0.5
-# Cap arm target changes to realistic joint speed for sim integration.
-# 2.5 rad/s at 50 Hz policy rate => 0.05 rad per policy step.
-ARM_MAX_JOINT_DELTA_PER_STEP = 0.05
+# Matches G1ArmIKEnvCfg.max_action_delta_per_step (was 0.05 here — a stale mismatch, not
+# a deliberate choice; g1_arm_env.py's actual training value is 0.06).
+ARM_MAX_JOINT_DELTA_PER_STEP = 0.06
+# Matches G1ArmIKEnvCfg.action_filter_alpha. Training never hands the raw policy output
+# straight to the actuator: g1_arm_env.py's _pre_physics_step does
+# filtered = alpha*raw + (1-alpha)*filtered_prev, THEN scales/clamps that — an EMA low-
+# pass meant to emulate actuator lag and avoid abrupt jumps. This script was applying the
+# raw, unfiltered policy output directly instead (found 2026-07-09 chasing why
+# validation/integration_validation/eval_full_demo.py's standing_arm_reach fall rate was
+# far worse than casual manual testing here suggested).
+ARM_ACTION_FILTER_ALPHA = 0.25
 
-# Goal-sphere colours
+# Per-mode arm PD gain (2026-07-12, replaces one static 200/20 applied for the whole
+# demo regardless of mode) — matches eval_full_demo.py's _STANDING_ARM_GAIN/_ARM_IK_GAIN/
+# _WALKING_ARM_GAIN split: arm-IK reach precision and standing's compliant-arm balance
+# strategy need genuinely different gains (confirmed 2026-07-12, arm-IK reach success
+# regressed 86%->30% when retrained under standing's softer value), and walking was never
+# touched at all so it should see its own stock training gain, not either policy's. The
+# demo switches live between these with write_joint_stiffness_to_sim/write_joint_damping_to_sim
+# (see G1FullDemo._update_arm_gains) since which policy/overlay is in control changes
+# every step based on user input.
+_GAIN_STANDING = (60.0, 1.5)   # matches g1_locomotion_env_cfg.py's standing training gain
+_GAIN_ARM_IK = (200.0, 20.0)   # matches g1_arm_env.py's arm-IK training gain
+_GAIN_WALKING = (40.0, 10.0)   # stock Isaac Lab default — walking never overrides "arms"
+
+# Goal-sphere colours. Red = native (left-trained-policy-driven) target. Blue = the
+# mirror-testing target — right arm, driven by mirroring the same left-trained policy
+# (see mdp/symmetry.py) — kept visually distinct so it's obvious at a glance which
+# target is "the real thing" vs. "the mirror-generalization experiment".
 _RED_SPHERE_CFG = VisualizationMarkersCfg(
     prim_path="/Visuals/FullDemoTargets",
     markers={
         "sphere": sim_utils.SphereCfg(
             radius=0.04,
             visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.0, 0.0)),
+        )
+    },
+)
+_BLUE_SPHERE_CFG = VisualizationMarkersCfg(
+    prim_path="/Visuals/FullDemoMirrorTargets",
+    markers={
+        "sphere": sim_utils.SphereCfg(
+            radius=0.04,
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 0.3, 1.0)),
         )
     },
 )
@@ -244,19 +293,41 @@ class G1FullDemo:
         env_cfg.episode_length_s = 1_000_000
         env_cfg.curriculum = None
 
+        # Use the same action term standing's own training env uses (2026-07-12) — see
+        # validation/integration_validation/eval_full_demo.py's _build_env_cfg for the full
+        # rationale. In short: overwriting loco_action's arm columns before handing it to
+        # .step() (the previous approach here, in _hold_arms_at_default/_arm_action_override/
+        # _mirror_action_override) also corrupts the "last_action" observation the standing
+        # policy reads back next step — ActionManager stores whatever raw tensor is passed
+        # to .step() verbatim, independent of what an action term actually simulates.
+        # StandingArmBlendJointPositionAction decouples the two correctly: it only
+        # overrides the *simulated* arm target (via env._standing_arm_motion_targets/
+        # _standing_arm_motion_joint_ids, set live in _update_arm_sim_targets), while the
+        # policy's raw output keeps flowing into last_action untouched, exactly matching
+        # training. Falls through to identical stock behavior when those two env
+        # attributes are unset (walking mode — see _update_arm_sim_targets).
+        env_cfg.actions.joint_pos.class_type = StandingArmBlendJointPositionAction
+
         loco_env = ManagerBasedRLEnv(cfg=env_cfg)
         self.env = RslRlVecEnvWrapper(loco_env)
         self.device = loco_env.device
         self.robot = loco_env.scene["robot"]
+        # Ground-level world z for this env slot. Arm targets' z is "height above ground"
+        # (same convention g1_arm_env.py's _GOAL_BOUNDS and g1_arm_reach_test.py use — the
+        # latter adds local targets straight onto env_origins, whose z is ground level),
+        # not "height above the robot's root link" — the root sits ~0.75-0.8m off the
+        # ground for a standing G1, so anchoring z to root_pos_w directly (as this file
+        # used to) silently added that offset on top of an already-ground-referenced z,
+        # placing every target far too high to ever reach.
+        self._ground_z_w = loco_env.scene.env_origins[0, 2].clone()
 
-        # ------ identify arm joint indices in the locomotion action vector ------
-        # The locomotion env uses joint_names=[".*"] — all joints appear in the action.
-        # We keep separate index sets for:
-        #   - the arm(s) controlled by the IK policy
-        #   - all arm joints, which must be held neutral while standing without a target
-        self.arm_joint_ids_in_action, self.arm_joint_names_ordered = \
-            self._find_arm_action_indices(include_all_arms=False)
-        self.all_arm_joint_ids_in_action, _ = self._find_arm_action_indices(include_all_arms=True)
+        # ------ identify arm joint indices on the robot asset (not the action vector) ------
+        # StandingArmBlendJointPositionAction (installed above) overrides simulated arm
+        # targets by asset joint id, via env._standing_arm_motion_joint_ids — see
+        # _update_arm_sim_targets. all_arm_joint_ids_robot covers both arms, used as the
+        # "hold at default" baseline whenever standing without an active target.
+        all_arm_ids, _ = self.robot.find_joints(list(_LEFT_ARM_JOINTS) + list(_RIGHT_ARM_JOINTS))
+        self.all_arm_joint_ids_robot = torch.tensor(all_arm_ids, dtype=torch.long, device=self.device)
 
         # ------ load locomotion policies ------
         self.standing_policy = self._load_loco_policy(agent_cfg, self.standing_ckpt)
@@ -265,6 +336,10 @@ class G1FullDemo:
         # ------ load arm policy (separate runner, arm-shaped env for obs inference) ------
         self.arm_policy, self.arm_body_ids, self.arm_joint_ids_robot = \
             self._load_arm_policy()
+        # Column of each actively-controlled arm joint within all_arm_joint_ids_robot —
+        # env._standing_arm_motion_targets is always laid out in that fixed order, so this
+        # is where _update_arm_sim_targets writes the IK policy's output.
+        self._active_arm_cols = self._cols_in_all_arm(self.arm_joint_ids_robot)
 
         # ------ switch-demo state ------
         self.mode = "standing"
@@ -282,6 +357,12 @@ class G1FullDemo:
         n_arms = 2 if self.arm_mode == "both" else 1
         self.goal_pos_local = torch.zeros(n_arms, 3, device=self.device)
         self.arm_target_active = torch.zeros(n_arms, dtype=torch.bool, device=self.device)
+        # EMA action-filter state (see ARM_ACTION_FILTER_ALPHA) — (1, 5) per arm, matching
+        # g1_arm_env.py's own self.filtered_actions. Reset per-arm whenever that arm gets a
+        # new target (_set_arm_target), same as training resets it per-env on every episode
+        # reset — a fresh target shouldn't start pre-biased by whatever the previous
+        # target's filter had converged to.
+        self._filtered_arm_delta = torch.zeros(1, 5 * n_arms, device=self.device)
 
         if args_cli.target is not None:
             init_tgt = torch.tensor(args_cli.target, dtype=torch.float32, device=self.device)
@@ -297,18 +378,44 @@ class G1FullDemo:
         # Which arm the T-key prompt edits (only relevant for both mode)
         self._active_arm_idx = 0  # 0=left, 1=right
 
-        # Arm targets are specified in robot-local coordinates, but once placed
-        # they stay fixed in world space until the robot respawns.
-        self._goal_anchor_pos_w = self.robot.data.root_pos_w[0].clone()
-        self._goal_anchor_quat_w = self.robot.data.root_quat_w[0].clone()
+        # Arm targets are specified in robot-local coordinates and stay a fixed offset
+        # from the torso — _goal_positions_world() recomputes the world position from the
+        # robot's *current* pose every call, it does not snapshot one. See that method's
+        # docstring for why (2026-07-09 fix: a world-fixed goal forced the arm to
+        # compensate for base tilt/drift it was never trained to handle, which fed back
+        # into the tilt that caused it).
 
         # Goal visualisation
         self._goal_vis = VisualizationMarkers(_RED_SPHERE_CFG)
         self._update_goal_markers()
 
-        # Prompt state for T-key arm targets.
+        # ------ mirror-testing state (right arm, driven by mirroring the LEFT-trained
+        # policy — known_issues.md flags two-arm generalization via this exact mirror
+        # transform as unverified; Y/U let you test it directly against the real robot
+        # instead of only in isolation via g1_arm_mirror_test.py). Only meaningful when
+        # arm_mode="left" — arm_mode="right"/"both" already have their own native
+        # control path for the right arm (once a real checkpoint exists for them). ------
+        self._mirror_enabled = self.arm_mode == "left"
+        if self._mirror_enabled:
+            r_joints, _ = self.robot.find_joints(_RIGHT_ARM_JOINTS)
+            r_bodies, _ = self.robot.find_bodies(_RIGHT_EE_BODY)
+            self._mirror_joint_ids_robot = torch.tensor(r_joints, dtype=torch.long, device=self.device)
+            self._mirror_ee_body_id = r_bodies[0]
+            self._mirror_arm_cols = self._cols_in_all_arm(self._mirror_joint_ids_robot)
+
+            self.mirror_goal_pos_local = torch.zeros(3, device=self.device)
+            self.mirror_target_active = False
+            self._filtered_mirror_delta = torch.zeros(1, 5, device=self.device)
+            # Same "fixed offset from the torso, not from the world" treatment as the
+            # primary target — see _mirror_goal_world()'s docstring.
+
+            self._mirror_goal_vis = VisualizationMarkers(_BLUE_SPHERE_CFG)
+            self._update_mirror_goal_marker()
+
+        # Prompt state for T/Y/U-key arm targets.
         self._target_prompt_requested = False
         self._target_prompt_active = False
+        self._pending_prompt_kind = "left"
 
         self._create_camera()
         self._setup_keyboard()
@@ -317,46 +424,21 @@ class G1FullDemo:
         print("  W/A/D/Q/E  — walk commands    S  — stop")
         print("  T          — type new arm target (blocks simulation briefly)")
         print("  L / R      — switch active arm (only for arm_mode=both)")
-        print("  C          — toggle camera\n")
+        if self._mirror_enabled:
+            print("  Y          — type a target for the right arm (mirrored via the left policy)")
+            print("  U          — type two targets, one per arm (left native, right mirrored)")
+        print("  C          — toggle camera follow (off = orbit freely with the mouse)")
+        print("  V          — reset camera to the default chase view\n")
 
     # ------------------------------------------------------------------ utils
 
-    def _find_arm_action_indices(self, include_all_arms: bool = False) -> tuple[torch.Tensor, list[str]]:
-        """Return (action_vector_indices, joint_names) for the arm joints.
-
-        The locomotion action manager sorts joints by the order returned by
-        robot.find_joints([".*"]).  We query each arm joint name and record
-        its position in that ordering.
-        """
-        if include_all_arms:
-            arm_names = list(_LEFT_ARM_JOINTS) + list(_RIGHT_ARM_JOINTS)
-        elif self.arm_mode in ("left", "both"):
-            arm_names = list(_LEFT_ARM_JOINTS)
-        else:
-            arm_names = list(_RIGHT_ARM_JOINTS)
-        if self.arm_mode == "both" and not include_all_arms:
-            arm_names += list(_RIGHT_ARM_JOINTS)
-
-        # Get ALL joints in the same order the action manager uses
-        all_joint_ids, all_joint_names = self.robot.find_joints([".*"])
-        name_to_action_idx = {name: i for i, name in enumerate(all_joint_names)}
-
-        ordered_names = []
-        action_indices = []
-        for jname in arm_names:
-            if jname in name_to_action_idx:
-                action_indices.append(name_to_action_idx[jname])
-                ordered_names.append(jname)
-            else:
-                print(
-                    f"[FullDemo] WARNING: arm joint '{jname}' not found in action space — "
-                    "arm override will be partial."
-                )
-
-        return (
-            torch.tensor(action_indices, dtype=torch.long, device=self.device),
-            ordered_names,
-        )
+    def _cols_in_all_arm(self, joint_ids: torch.Tensor) -> torch.Tensor:
+        """Column indices of `joint_ids` within self.all_arm_joint_ids_robot — that
+        tensor's order is env._standing_arm_motion_targets' fixed column layout, so this
+        is how _update_arm_sim_targets locates where to write a given arm's targets."""
+        id_to_col = {int(j): i for i, j in enumerate(self.all_arm_joint_ids_robot.tolist())}
+        cols = [id_to_col[int(j)] for j in joint_ids.tolist()]
+        return torch.tensor(cols, dtype=torch.long, device=self.device)
 
     def _load_loco_policy(self, agent_cfg: RslRlOnPolicyRunnerCfg, ckpt: str):
         runner = OnPolicyRunner(self.env, agent_cfg.to_dict(), log_dir=None, device=self.device)
@@ -469,13 +551,23 @@ class G1FullDemo:
                 "goal": goal_world[goal_idx],
             })
 
+        root_quat = self.robot.data.root_quat_w[0].unsqueeze(0)  # (1, 4)
         for g in arm_groups:
             jids = g["joint_ids"]
             joint_pos = self.robot.data.joint_pos[0, jids].unsqueeze(0)    # (1, 5)
             joint_vel = self.robot.data.joint_vel[0, jids].unsqueeze(0)    # (1, 5)
             ee_pos    = self.robot.data.body_pos_w[0, g["ee_idx"], :].unsqueeze(0)  # (1, 3)
             goal      = g["goal"].unsqueeze(0)                               # (1, 3)
-            error     = goal - ee_pos                                        # (1, 3)
+            # Rotate into the robot's current body frame before handing to the policy.
+            # g1_arm_env.py trains with a physically fixed (never-rotating) root, so its
+            # world frame *is* body frame throughout training — error's x/y/z always mean
+            # forward/lateral/up relative to the robot. Here the robot can actually turn
+            # (walking, or just reset_base's spawn-yaw randomization), so a raw world-frame
+            # difference stops meaning that the moment the robot isn't at ~0 yaw — the
+            # policy would be reaching in a direction rotated by whatever the robot's
+            # current heading is. Only correcting `error` (not ee_pos/goal individually)
+            # keeps this a minimal, targeted fix — error is what actually drives reaching.
+            error = quat_apply_inverse(root_quat, goal - ee_pos)             # (1, 3)
             # Base-state prefix duplicated per arm block, matching g1_arm_env.py's
             # layout (same convention "both" mode needs there too, for the mirror
             # transform to work block-by-block).
@@ -483,12 +575,22 @@ class G1FullDemo:
 
         return torch.cat(parts, dim=-1)  # (1, 28) or (1, 56)
 
-    # ------------------------------------------------------------------ arm delta → action override
+    # ------------------------------------------------------------------ arm delta → simulated target
 
-    def _arm_action_override(self, loco_action: torch.Tensor) -> torch.Tensor:
-        """Run arm policy and substitute its output into the locomotion action."""
+    def _compute_arm_targets(self) -> torch.Tensor:
+        """Run the arm-IK policy and return new absolute joint targets (1, n_arm_joints)
+        for the actively-controlled arm(s). Used to overlay onto
+        env._standing_arm_motion_targets in _update_arm_sim_targets — this no longer
+        touches the locomotion action tensor at all (see that method's docstring)."""
         arm_obs = self._build_arm_obs()
         arm_delta = self.arm_policy({"policy": arm_obs})  # (1, 5) or (1, 10)
+
+        # EMA low-pass on the raw policy output, matching g1_arm_env.py's own
+        # self.filtered_actions — see ARM_ACTION_FILTER_ALPHA.
+        self._filtered_arm_delta = (
+            ARM_ACTION_FILTER_ALPHA * arm_delta + (1.0 - ARM_ACTION_FILTER_ALPHA) * self._filtered_arm_delta
+        )
+        arm_delta = self._filtered_arm_delta
 
         # Compute new arm joint targets from current position + delta
         current = self.robot.data.joint_pos[0, self.arm_joint_ids_robot]  # (n_arm_joints,)
@@ -499,23 +601,162 @@ class G1FullDemo:
         new_targets = (current + delta).clamp(
             limits[:, 0], limits[:, 1]
         )
+        return new_targets.unsqueeze(0)
 
-        # Convert absolute targets → action-space offset:
-        #   loco_action = (target - default_pos) / scale
-        default = self.robot.data.default_joint_pos[0, self.arm_joint_ids_robot]
-        action_delta = (new_targets - default) / ARM_ACTION_SCALE  # (n_arm_joints,)
+    # ------------------------------------------------------------------ mirror testing
+    # (right arm, driven by mirroring the left-trained policy — see mdp/symmetry.py and
+    # the module docstring's note on why this exists.) Only ever constructed/called when
+    # self._mirror_enabled (arm_mode="left").
 
-        # Substitute into the locomotion action vector
-        modified = loco_action.clone()
-        modified[0, self.arm_joint_ids_in_action] = action_delta
+    def _build_mirror_source_obs(self) -> torch.Tensor:
+        """Right arm's own real (unmirrored) 28-D observation block — same layout
+        _build_arm_obs() builds for the left arm, just sourced from the right arm's own
+        joints/end-effector/goal."""
+        base_lin_vel = self.robot.data.root_lin_vel_b[0].unsqueeze(0)
+        base_ang_vel = self.robot.data.root_ang_vel_b[0].unsqueeze(0)
+        projected_gravity = self.robot.data.projected_gravity_b[0].unsqueeze(0)
 
-        return modified
+        joint_pos = self.robot.data.joint_pos[0, self._mirror_joint_ids_robot].unsqueeze(0)
+        joint_vel = self.robot.data.joint_vel[0, self._mirror_joint_ids_robot].unsqueeze(0)
+        ee_pos = self.robot.data.body_pos_w[0, self._mirror_ee_body_id, :].unsqueeze(0)
+        goal = self._mirror_goal_world().unsqueeze(0)
+        # See _build_arm_obs()'s identical comment — error must be in the robot's current
+        # body frame, not raw world, or reaching direction is wrong whenever the robot
+        # isn't at ~0 yaw.
+        root_quat = self.robot.data.root_quat_w[0].unsqueeze(0)
+        error = quat_apply_inverse(root_quat, goal - ee_pos)
 
-    def _hold_arms_at_default(self, loco_action: torch.Tensor) -> torch.Tensor:
-        """Zero the arm slice so the locomotion action holds the default arm posture."""
-        modified = loco_action.clone()
-        modified[0, self.all_arm_joint_ids_in_action] = 0.0
-        return modified
+        return torch.cat(
+            [base_lin_vel, base_ang_vel, projected_gravity, joint_pos, joint_vel, ee_pos, goal, error], dim=-1
+        )
+
+    def _compute_mirror_targets(self) -> torch.Tensor:
+        """Run the left-trained arm policy on a mirrored right-arm observation, then
+        mirror its output back — same transform g1_arm_mirror_test.py already validates
+        in isolation, applied here against the real, standing robot. Returns new absolute
+        joint targets (1, n_arm_joints) for the mirror-driven right arm; see
+        _compute_arm_targets for why this no longer touches the action tensor."""
+        raw_obs = self._build_mirror_source_obs()
+        mirrored_obs = mirror_arm_obs(raw_obs)
+        delta_left_frame = self.arm_policy({"policy": mirrored_obs})
+        delta = mirror_arm_actions(delta_left_frame)
+
+        # EMA low-pass on the raw (mirrored-back) policy output, matching g1_arm_env.py's
+        # own self.filtered_actions — see ARM_ACTION_FILTER_ALPHA. Filtering here (post
+        # mirror) vs. pre-mirror is equivalent since the mirror is a fixed linear sign
+        # flip, but this keeps the persisted buffer directly interpretable as "the
+        # effective smoothed right-arm delta," matching _filtered_arm_delta's convention.
+        self._filtered_mirror_delta = (
+            ARM_ACTION_FILTER_ALPHA * delta + (1.0 - ARM_ACTION_FILTER_ALPHA) * self._filtered_mirror_delta
+        )
+        delta = self._filtered_mirror_delta.squeeze(0)
+
+        current = self.robot.data.joint_pos[0, self._mirror_joint_ids_robot]
+        limits = self.robot.data.soft_joint_pos_limits[0, self._mirror_joint_ids_robot]
+        delta = (delta * ARM_ACTION_SCALE).clamp(-ARM_MAX_JOINT_DELTA_PER_STEP, ARM_MAX_JOINT_DELTA_PER_STEP)
+        new_targets = (current + delta).clamp(limits[:, 0], limits[:, 1])
+        return new_targets.unsqueeze(0)
+
+    # ------------------------------------------------------------------ simulated arm targets + gain
+
+    def _update_arm_sim_targets(self, arm_active: bool, mirror_active: bool):
+        """Set env._standing_arm_motion_targets/_standing_arm_motion_joint_ids so
+        StandingArmBlendJointPositionAction drives the *simulated* arm targets — called
+        every step while standing_ish (see select_action). Both arms start held at
+        default; the actively-controlled arm(s) then overwrite their own columns. The
+        locomotion policy's raw action output is never touched by this — it keeps
+        flowing into the env's stored action, and therefore into next step's last_action
+        observation, exactly as it did during training. See env_cfg.actions.joint_pos's
+        assignment in __init__ for the full rationale."""
+        env = self.env.unwrapped
+        env._standing_arm_motion_joint_ids = self.all_arm_joint_ids_robot
+        targets = self.robot.data.default_joint_pos[0:1, self.all_arm_joint_ids_robot].clone()
+        if arm_active:
+            targets[:, self._active_arm_cols] = self._compute_arm_targets()
+        if mirror_active:
+            targets[:, self._mirror_arm_cols] = self._compute_mirror_targets()
+        env._standing_arm_motion_targets = targets
+
+    def _clear_arm_sim_targets(self):
+        """Walking mode: let StandingArmBlendJointPositionAction fall through to stock
+        JointPositionAction behavior (whatever the walking policy itself outputs for the
+        arm columns), same as before this refactor — only standing ever held arms at a
+        fixed pose."""
+        env = self.env.unwrapped
+        env._standing_arm_motion_targets = None
+        env._standing_arm_motion_joint_ids = None
+
+    def _update_arm_gains(self, standing_ish: bool, arm_active: bool, mirror_active: bool):
+        """Live per-mode arm PD gain (2026-07-12) — see _GAIN_STANDING/_GAIN_ARM_IK/
+        _GAIN_WALKING's module-level comment for why one static gain doesn't serve every
+        policy. Splits the two arms independently: whichever arm(s) are actively
+        IK-driven (native or mirrored) get the arm-IK gain, everything else gets whichever
+        locomotion policy currently holds control's own trained gain."""
+        active_cols = []
+        if arm_active:
+            active_cols.append(self._active_arm_cols)
+        if mirror_active:
+            active_cols.append(self._mirror_arm_cols)
+        active_ids = (
+            self.all_arm_joint_ids_robot[torch.cat(active_cols)] if active_cols
+            else self.all_arm_joint_ids_robot[:0]
+        )
+        held_mask = torch.ones(self.all_arm_joint_ids_robot.numel(), dtype=torch.bool, device=self.device)
+        if active_cols:
+            held_mask[torch.cat(active_cols)] = False
+        held_ids = self.all_arm_joint_ids_robot[held_mask]
+
+        held_gain = _GAIN_STANDING if standing_ish else _GAIN_WALKING
+        if active_ids.numel() > 0:
+            self.robot.write_joint_stiffness_to_sim(_GAIN_ARM_IK[0], joint_ids=active_ids)
+            self.robot.write_joint_damping_to_sim(_GAIN_ARM_IK[1], joint_ids=active_ids)
+        if held_ids.numel() > 0:
+            self.robot.write_joint_stiffness_to_sim(held_gain[0], joint_ids=held_ids)
+            self.robot.write_joint_damping_to_sim(held_gain[1], joint_ids=held_ids)
+
+    def _mirror_goal_world(self) -> torch.Tensor:
+        """Recomputed every call from the robot's *current* pose — see
+        _goal_positions_world()'s docstring for why this must not snapshot a pose once
+        and hold it. Same fix, mirror-path copy."""
+        pos = self.robot.data.root_pos_w[0].clone()
+        pos[2] = self._ground_z_w
+        return quat_apply(self.robot.data.root_quat_w[0], self.mirror_goal_pos_local) + pos
+
+    def _update_mirror_goal_marker(self):
+        pos = self._mirror_goal_world().unsqueeze(0).clone()
+        if not self.mirror_target_active:
+            pos[0, 2] = -10.0
+        self._mirror_goal_vis.visualize(pos)
+
+    def _set_mirror_target(self, target_local: torch.Tensor):
+        self.mirror_goal_pos_local = target_local
+        self.mirror_target_active = True
+
+        # Same reset-between-targets fix _set_arm_target uses (2026-07-07) — without it
+        # the right arm keeps going from wherever it physically ended up chasing the
+        # *previous* mirror target.
+        default_pos = self.robot.data.default_joint_pos[0:1, self._mirror_joint_ids_robot]
+        zero_vel = torch.zeros_like(default_pos)
+        with torch.inference_mode():
+            self.robot.write_joint_state_to_sim(
+                default_pos, zero_vel,
+                joint_ids=self._mirror_joint_ids_robot, env_ids=torch.tensor([0], device=self.device),
+            )
+
+            # Reset the mirror path's EMA action filter too — same reasoning as the
+            # joint-state reset just above, and same "must stay inside inference_mode" fix
+            # as _set_arm_target's identical pattern (see that method's comment).
+            self._filtered_mirror_delta[:] = 0.0
+
+        self._update_mirror_goal_marker()
+        print(f"[FullDemo] Mirror target (right, via left policy): {target_local.tolist()}")
+
+    def _clear_mirror_target(self):
+        if not self.mirror_target_active:
+            return
+        self.mirror_target_active = False
+        self._update_mirror_goal_marker()
+        print("[FullDemo] Cleared mirror target.")
 
     def _has_active_arm_target(self) -> bool:
         if self.arm_mode == "both":
@@ -523,6 +764,8 @@ class G1FullDemo:
         return bool(self.arm_target_active[0].item())
 
     def _clear_arm_targets(self):
+        if self._mirror_enabled:
+            self._clear_mirror_target()
         if not bool(torch.any(self.arm_target_active).item()):
             return
         self.arm_target_active.zero_()
@@ -530,18 +773,27 @@ class G1FullDemo:
         print("[FullDemo] Cleared arm target(s).")
 
     def _goal_positions_world(self) -> torch.Tensor:
-        """Transform anchored robot-local arm targets into world coordinates."""
-        world_goals = []
-        for target_local in self.goal_pos_local:
-            world_goals.append(
-                quat_apply(self._goal_anchor_quat_w, target_local) + self._goal_anchor_pos_w
-            )
-        return torch.stack(world_goals, dim=0)
+        """Transform robot-local arm targets into world coordinates, using the robot's
+        *current* pose — recomputed on every call, not a pose snapshotted once when the
+        target was set (found 2026-07-09 to be a real bug, not just a simplification: a
+        goal fixed in world space forces the arm to compensate for base tilt/drift it was
+        never trained to handle — g1_arm_env.py trains with fix_root_link=True, so the
+        policy has zero experience with a moving base. As reaching itself perturbed the
+        base, the fixed-world goal effectively receded, the policy pushed the arm further
+        to chase it — out-of-distribution behavior, not considered compensation — adding
+        more destabilizing torque and tilting the base further: a runaway feedback loop.
+        Treating the target as a fixed offset from the torso instead (recomputed from the
+        live root pose every call) reproduces what training's fixed root gave the policy
+        for free: a goal that only moves because the robot pursuing it does.
 
-    def _anchor_targets_to_current_base(self):
-        self._goal_anchor_pos_w = self.robot.data.root_pos_w[0].clone()
-        self._goal_anchor_quat_w = self.robot.data.root_quat_w[0].clone()
-        self._update_goal_markers()
+        x/y and orientation track the robot's actual current base; z stays
+        ground-referenced (see the _ground_z_w comment in __init__), not tied to the root
+        link's own height, which bounces/settles independent of where a target "on the
+        wall at 1.0m" should be."""
+        pos = self.robot.data.root_pos_w[0].clone()
+        pos[2] = self._ground_z_w
+        quat = self.robot.data.root_quat_w[0]
+        return torch.stack([quat_apply(quat, target_local) + pos for target_local in self.goal_pos_local], dim=0)
 
     def _handle_env_resets(self, dones: torch.Tensor):
         if not bool(torch.any(dones > 0).item()):
@@ -555,9 +807,10 @@ class G1FullDemo:
         self._transition_step = 0
         self.cmd_filtered.zero_()
 
-        if self._has_active_arm_target():
-            self._anchor_targets_to_current_base()
-            print("[FullDemo] Respawn detected. Re-anchored arm target to robot base.")
+        # No re-anchoring needed on respawn any more — targets are a fixed offset from
+        # the torso, recomputed from the live pose every call (_goal_positions_world /
+        # _mirror_goal_world), so a respawn's new pose is picked up automatically on the
+        # very next read, same as any other step's base movement.
 
     # ------------------------------------------------------------------ locomotion mode
 
@@ -622,14 +875,34 @@ class G1FullDemo:
                 self._in_transition = False
                 print(f"[FullDemo] mode settled: {self.mode}")
 
-        # Overlay arm policy when standing (or transitioning to stand)
+        # Whenever standing, hold *both* arms at their default pose first — the standing
+        # policy's own raw action output for arm joints is never meaningful (standing
+        # trains with a mechanism that always overrides arm targets with a scripted
+        # disturbance signal, so nothing ever shapes what the policy itself would output
+        # there) — then overlay the arm-IK policy on top for whichever arm(s) actually
+        # have an active target. Any arm *not* currently being driven by the arm-IK policy
+        # (e.g. the right arm while only the left has a target) still gets held at default.
+        #
+        # This is now done entirely through env._standing_arm_motion_targets (see
+        # _update_arm_sim_targets), never by editing loco_action itself. Editing the action
+        # tensor before returning it used to also corrupt the "last_action" observation the
+        # locomotion policy reads back next step (ActionManager stores whatever raw tensor
+        # is passed to .step() verbatim, independent of what an action term actually
+        # simulates) — found 2026-07-12 chasing why validation/integration_validation/
+        # eval_full_demo.py's standing_still bucket (zero commanded velocity, zero arm
+        # activity) still had a ~100% fall rate despite the standing policy being flawless
+        # in its own native eval. loco_action below is returned completely untouched,
+        # whatever the (possibly transition-blended) locomotion policy actually output.
+        standing_ish = self.mode == "standing" or (self._in_transition and self._transition_to == "standing")
         arm_active = self._has_active_arm_target() and (self.mode == "standing") and (
             not self._in_transition or self._transition_to == "standing"
         )
-        if arm_active:
-            loco_action = self._arm_action_override(loco_action)
-        elif self.mode == "standing" or (self._in_transition and self._transition_to == "standing"):
-            loco_action = self._hold_arms_at_default(loco_action)
+        mirror_active = self._mirror_enabled and self.mirror_target_active and standing_ish
+        if standing_ish:
+            self._update_arm_sim_targets(arm_active, mirror_active)
+        else:
+            self._clear_arm_sim_targets()
+        self._update_arm_gains(standing_ish, arm_active, mirror_active)
 
         return loco_action
 
@@ -644,7 +917,6 @@ class G1FullDemo:
         self._goal_vis.visualize(world_goals)
 
     def _set_arm_target(self, arm_idx: int, target_local: torch.Tensor):
-        self._anchor_targets_to_current_base()
         self.goal_pos_local[arm_idx] = target_local
         self.arm_target_active[arm_idx] = True
 
@@ -662,10 +934,29 @@ class G1FullDemo:
         joint_ids = self.arm_joint_ids_robot[start:start + n_per_arm]
         default_pos = self.robot.data.default_joint_pos[0:1, joint_ids]
         zero_vel = torch.zeros_like(default_pos)
-        self.robot.write_joint_state_to_sim(
-            default_pos, zero_vel,
-            joint_ids=joint_ids, env_ids=torch.tensor([0], device=self.device),
-        )
+        # _set_arm_target is called from the T-key prompt path, which runs in main()'s
+        # loop *before* the `with torch.inference_mode():` block that wraps env.step() —
+        # but write_joint_state_to_sim does in-place writes into tensors that were
+        # already created under inference_mode by that same step loop, and PyTorch only
+        # allows in-place writes to an inference tensor from inside inference_mode
+        # (same restriction noted in validation/eval_standing.py). Scope it explicitly
+        # here rather than requiring every caller to remember to wrap it.
+        with torch.inference_mode():
+            self.robot.write_joint_state_to_sim(
+                default_pos, zero_vel,
+                joint_ids=joint_ids, env_ids=torch.tensor([0], device=self.device),
+            )
+
+            # Reset this arm's slice of the EMA action filter too — same reasoning as the
+            # joint-state reset just above, applied to ARM_ACTION_FILTER_ALPHA's persisted
+            # state instead of the physical joints. Must stay inside this inference_mode
+            # block: _filtered_arm_delta gets reassigned inside the main loop's own
+            # inference_mode-wrapped step (_compute_arm_targets's EMA update), which makes
+            # it an inference tensor — an in-place write from outside inference_mode (this
+            # function runs in main()'s loop *before* that block) raises "Inplace update to
+            # inference tensor outside InferenceMode is not allowed" (found 2026-07-12,
+            # triggered by re-targeting the same arm a second time in one session).
+            self._filtered_arm_delta[0, start:start + n_per_arm] = 0.0
 
         self._update_goal_markers()
         arm_label = ["left", "right"][arm_idx] if self.arm_mode == "both" else self.arm_mode
@@ -673,27 +964,67 @@ class G1FullDemo:
 
     # ------------------------------------------------------------------ keyboard / target input
 
-    def _prompt_target(self):
-        """Request a blocking arm-target prompt on the main loop."""
+    def _prompt_target(self, kind: str = "left"):
+        """Request a blocking arm-target prompt on the main loop.
+
+        kind:
+            "left"   — T key. Sets the arm_mode-selected slot (unchanged from before).
+            "mirror" — Y key. Sets the mirrored right-arm target, right-arm coordinate
+                       frame (only when arm_mode="left" — see self._mirror_enabled).
+            "both"   — U key. One left-frame target, applied to the left arm directly
+                       and mirrored (y negated) to the right arm at the same time —
+                       the "does the mirror-generalized policy work on both arms
+                       simultaneously" test.
+        """
         if self._target_prompt_active:
             print("[FullDemo] Target prompt already open.")
             return
 
+        self._pending_prompt_kind = kind
         self._target_prompt_requested = True
+
+    def _parse_and_confirm_target(self, parts: list[str], bounds: dict) -> torch.Tensor | None:
+        """Parse 3 numbers, confirm if out of *bounds*. Returns None to re-prompt."""
+        target = torch.tensor([float(p) for p in parts], dtype=torch.float32, device=self.device)
+        out_of_range = not (
+            bounds["x"][0] <= target[0].item() <= bounds["x"][1]
+            and bounds["y"][0] <= target[1].item() <= bounds["y"][1]
+            and bounds["z"][0] <= target[2].item() <= bounds["z"][1]
+        )
+        if out_of_range:
+            # Not just "harder" — the policy has never trained on anything outside this
+            # box, so it can produce genuinely erratic motion trying to reach one, not
+            # just fall a bit short.
+            confirm = input(
+                "  Outside the trained range — the policy has never seen this "
+                "and may behave strangely. Send anyway? [y/N] "
+            ).strip().lower()
+            if confirm != "y":
+                return None
+        return target
 
     def _run_target_prompt(self):
         """Blocking console prompt for a new arm target on the main thread."""
         self._target_prompt_requested = False
         self._target_prompt_active = True
+        kind = self._pending_prompt_kind
 
-        arm_label = (
-            ["left", "right"][self._active_arm_idx]
-            if self.arm_mode == "both"
-            else self.arm_mode
-        )
-        b = _GOAL_BOUNDS["left" if arm_label == "left" else "right"]
+        if kind == "both":
+            self._run_both_target_prompt()
+            return
+
+        if kind == "mirror":
+            arm_label, b = "right (mirrored via left policy)", _GOAL_BOUNDS["right"]
+        else:
+            arm_label = (
+                ["left", "right"][self._active_arm_idx]
+                if self.arm_mode == "both"
+                else self.arm_mode
+            )
+            b = _GOAL_BOUNDS["left" if arm_label == "left" else "right"]
+
         prompt = (
-            f"\n[FullDemo] New target for {arm_label} arm (x y z)\n"
+            f"\n[FullDemo] New target for {arm_label} (x y z)\n"
             f"  x: {b['x']}, y: {b['y']}, z: {b['z']}\n"
             "  > "
         )
@@ -711,31 +1042,85 @@ class G1FullDemo:
                 print("  Need exactly 3 numbers: x y z")
                 continue
             try:
-                target = torch.tensor(
-                    [float(p) for p in parts],
-                    dtype=torch.float32,
-                    device=self.device,
-                )
-                out_of_range = not (
-                    b["x"][0] <= target[0].item() <= b["x"][1]
-                    and b["y"][0] <= target[1].item() <= b["y"][1]
-                    and b["z"][0] <= target[2].item() <= b["z"][1]
-                )
-                if out_of_range:
-                    # Not just "harder" — the policy has never trained on anything
-                    # outside this box, so it can produce genuinely erratic motion
-                    # trying to reach one, not just fall a bit short.
-                    confirm = input(
-                        "  Outside the trained range — the policy has never seen this "
-                        "and may behave strangely. Send anyway? [y/N] "
-                    ).strip().lower()
-                    if confirm != "y":
-                        continue
-                self._set_arm_target(self._active_arm_idx, target)
+                target = self._parse_and_confirm_target(parts, b)
+                if target is None:
+                    continue
+
+                if kind == "mirror":
+                    if self._mirror_enabled:
+                        self._set_mirror_target(target)
+                    else:
+                        print("  [FullDemo] Mirror control only available when arm_mode=left.")
+                else:
+                    self._set_arm_target(self._active_arm_idx, target)
+
                 self._target_prompt_active = False
                 return
             except ValueError:
                 print(f"  Could not parse: {line!r}")
+
+    def _run_both_target_prompt(self):
+        """U — two independent targets, one per arm (left native, right mirrored via
+        the left-trained policy). Two separate triplets, not one auto-mirrored target —
+        sending the same (mirrored) position to both arms means they reach for the same
+        physical point and collide."""
+        if not self._mirror_enabled:
+            print("  [FullDemo] Mirror control only available when arm_mode=left.")
+            self._target_prompt_active = False
+            return
+
+        b_left, b_right = _GOAL_BOUNDS["left"], _GOAL_BOUNDS["right"]
+        left_target = None
+        while left_target is None:
+            prompt = (
+                f"\n[FullDemo] New target for LEFT arm (x y z)\n"
+                f"  x: {b_left['x']}, y: {b_left['y']}, z: {b_left['z']}\n"
+                "  > "
+            )
+            try:
+                line = input(prompt).strip()
+            except (EOFError, KeyboardInterrupt):
+                self._target_prompt_active = False
+                return
+            if not line:
+                self._target_prompt_active = False
+                return
+            parts = line.split()
+            if len(parts) != 3:
+                print("  Need exactly 3 numbers: x y z")
+                continue
+            try:
+                left_target = self._parse_and_confirm_target(parts, b_left)
+            except ValueError:
+                print(f"  Could not parse: {line!r}")
+
+        right_target = None
+        while right_target is None:
+            prompt = (
+                f"\n[FullDemo] New target for RIGHT arm (mirrored via left policy) (x y z)\n"
+                f"  x: {b_right['x']}, y: {b_right['y']}, z: {b_right['z']}\n"
+                "  > "
+            )
+            try:
+                line = input(prompt).strip()
+            except (EOFError, KeyboardInterrupt):
+                self._target_prompt_active = False
+                return
+            if not line:
+                self._target_prompt_active = False
+                return
+            parts = line.split()
+            if len(parts) != 3:
+                print("  Need exactly 3 numbers: x y z")
+                continue
+            try:
+                right_target = self._parse_and_confirm_target(parts, b_right)
+            except ValueError:
+                print(f"  Could not parse: {line!r}")
+
+        self._set_arm_target(0, left_target)
+        self._set_mirror_target(right_target)
+        self._target_prompt_active = False
 
     def _apply_pending_target(self):
         if not self._target_prompt_requested:
@@ -744,8 +1129,9 @@ class G1FullDemo:
         self._run_target_prompt()
 
     def _setup_keyboard(self):
-        from isaaclab.devices.keyboard import Se2Keyboard, Se2KeyboardCfg
         import numpy as np
+
+        from isaaclab.devices.keyboard import Se2Keyboard, Se2KeyboardCfg
 
         kb_cfg = Se2KeyboardCfg(sim_device=str(self.device))
         self._keyboard = Se2Keyboard(kb_cfg)
@@ -757,11 +1143,15 @@ class G1FullDemo:
             "E": np.array([0.0, -LIN_VEL,     0.0]),
         }
         self._keyboard.add_callback("S", self._keyboard.reset)
-        self._keyboard.add_callback("C", self._toggle_camera)
+        self._keyboard.add_callback("C", self._toggle_camera_follow)
+        self._keyboard.add_callback("V", self._reset_camera)
         self._keyboard.add_callback("T", self._prompt_target)
         if self.arm_mode == "both":
             self._keyboard.add_callback("L", lambda: self._select_arm(0))
             self._keyboard.add_callback("R", lambda: self._select_arm(1))
+        if self._mirror_enabled:
+            self._keyboard.add_callback("Y", lambda: self._prompt_target("mirror"))
+            self._keyboard.add_callback("U", lambda: self._prompt_target("both"))
 
     def _select_arm(self, idx: int):
         self._active_arm_idx = idx
@@ -770,11 +1160,14 @@ class G1FullDemo:
 
     # ------------------------------------------------------------------ camera
 
+    # Chase-cam offset from the robot base, robot-local frame (behind + above).
+    _CAMERA_OFFSET = (-2.5, 0.0, 0.8)
+    _CAMERA_TARGET_HEIGHT_OFFSET = 0.6
+
     def _create_camera(self):
         stage = get_current_stage()
         self.viewport = get_viewport_from_window_name("Viewport")
         self.camera_path = "/World/Camera"
-        self.perspective_path = "/OmniverseKit_Persp"
 
         cam = stage.DefinePrim(self.camera_path, "Camera")
         cam.GetAttribute("focalLength").Set(8.5)
@@ -788,16 +1181,27 @@ class G1FullDemo:
             ).Set(Gf.Vec3d(0, 0, -10))
         self.viewport.set_active_camera(self.camera_path)
 
-    def _toggle_camera(self):
-        active = self.viewport.get_active_camera()
-        self.viewport.set_active_camera(
-            self.perspective_path if active == self.camera_path else self.camera_path
-        )
+        # When True, update_camera() re-locks the camera behind the robot every frame
+        # (the original always-on behavior). When False, update_camera() is a no-op, so
+        # the camera stays exactly where the mouse last left it — that's what makes
+        # manual orbiting possible at all (a camera whose transform gets overwritten
+        # every frame can never hold a manual drag).
+        self._camera_follow = True
 
-    def update_camera(self):
+    def _toggle_camera_follow(self):
+        self._camera_follow = not self._camera_follow
+        print(f"[FullDemo] Camera follow: {'ON' if self._camera_follow else 'OFF (orbit freely with the mouse)'}")
+
+    def _reset_camera(self):
+        """Snap back to the default chase framing and re-enable follow."""
+        self._camera_follow = True
+        self._position_camera()
+        print("[FullDemo] Camera reset to chase view.")
+
+    def _position_camera(self):
         base_pos  = self.robot.data.root_pos_w[0]
         base_quat = self.robot.data.root_quat_w[0]
-        offset = torch.tensor([-2.5, 0.0, 0.8], device=self.device)
+        offset = torch.tensor(self._CAMERA_OFFSET, device=self.device)
         cam_pos = quat_apply(base_quat, offset) + base_pos
 
         state = ViewportCameraState(self.camera_path, self.viewport)
@@ -805,8 +1209,13 @@ class G1FullDemo:
             Gf.Vec3d(cam_pos[0].item(), cam_pos[1].item(), cam_pos[2].item()), True
         )
         state.set_target_world(
-            Gf.Vec3d(base_pos[0].item(), base_pos[1].item(), base_pos[2].item() + 0.6), True
+            Gf.Vec3d(base_pos[0].item(), base_pos[1].item(), base_pos[2].item() + self._CAMERA_TARGET_HEIGHT_OFFSET),
+            True,
         )
+
+    def update_camera(self):
+        if self._camera_follow:
+            self._position_camera()
 
 
 # ---------------------------------------------------------------------------
@@ -816,10 +1225,17 @@ class G1FullDemo:
 def main():
     demo = G1FullDemo()
     obs, _ = demo.env.reset()
+    # No re-anchoring needed here any more (a --target-supplied goal used to be anchored
+    # to the robot's pose at construction time, before this reset's randomized spawn was
+    # known) — targets are now a fixed offset from the torso, recomputed from the live
+    # pose every call, so this reset's real spawn pose is picked up automatically.
     step = 0
 
     while simulation_app.is_running():
         demo.update_camera()
+        demo._update_goal_markers()
+        if demo._mirror_enabled:
+            demo._update_mirror_goal_marker()
         demo._apply_pending_target()
 
         with torch.inference_mode():

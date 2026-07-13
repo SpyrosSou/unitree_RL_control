@@ -1,13 +1,35 @@
 #!/usr/bin/env bash
-# Overnight sweep (2026-07-07): 3 isolated arm-policy experiments (targeting the
-# confirmed ~55% success plateau, see known_issues.md) + 1 standing retrain with the
-# new phase-5 (33 rad/s) curriculum. Runs sequentially (single GPU) — each training is
-# immediately followed by its matching eval script so results are ready by morning
-# instead of needing to be run by hand one at a time.
+# Standing baseline follow-up (2026-07-13, replaces the previous torso/policy-driven
+# queue from last night): 1 training step + both evals.
 #
-# Deliberately does NOT use `set -e`: one failed step (e.g. an OOM on one run) should
-# not silently kill the rest of an unattended overnight queue. Each step's pass/fail is
-# logged instead; check the log for FAILED lines in the morning.
+# Last night's two experiments are both dropped from this queue:
+#   - torso_retighten (joint_deviation_torso 0.0 -> -0.05): measurably didn't help —
+#     integration fall rates were flat or slightly worse across every bucket.
+#   - policy_driven_disturbance (real arm-IK policy instead of analytic IK): fixed
+#     standing_still outright (94% -> 0% fail) but standing_arm_left_reach got much worse
+#     (73% -> 96.5% fail). Root cause found afterward: nothing in the whole reward stack
+#     penalizes hip-pitch/knee deviation from default, so standing had been free to sink
+#     into a deep, stable squat (~0.4-0.5m root height vs. ~0.75m spawn) as a genuinely
+#     free way to buy stability — worse under the harder, policy-driven disturbance. The
+#     squat is almost certainly what broke arm-reach too: the arm-IK policy is fixed-root
+#     trained at nominal standing height, so a habitually crouched torso puts the arm in a
+#     geometry it never learned to reach from.
+#
+# This queue instead builds directly on the LAST GOOD baseline (dwell_phase_fix,
+# 2026-07-12 — analytic IK + dwell-until-timeout goal holding, i.e. it already trains
+# "reach and hold", not just continuous motion) and adds exactly one new, mechanistically
+# targeted thing: mdp.base_height_l2 (stock Isaac Lab), a direct L2 penalty on root height
+# against target_height=0.75 (G1's own spawn height) — see
+# G1LocomotionStandingFlatIKReachHeightEnvCfg's docstring in g1_locomotion_env_cfg.py for
+# the full mechanism. Single-variable change against a baseline that was already
+# reasonably balanced, not another stack of guesses.
+#
+# Deliberately does NOT use `set -e`: one failed step shouldn't silently kill the rest of
+# an unattended queue. Each step's pass/fail is logged instead; check the log for FAILED
+# lines afterward.
+#
+# Deliberately no shutdown/poweroff command anywhere in this script — leave the machine
+# running when it's done.
 #
 # Usage:
 #   cd ~/Elm/Code/g1_locomotion
@@ -18,8 +40,9 @@ set -o pipefail
 
 CONDA_ENV="isaac_g1_control"
 PROJECT_ROOT="$HOME/Elm/Code/g1_locomotion"
-ARM_ITERS=5000
-STANDING_ITERS=8000
+STANDING_ITERS=6000
+WALKING_CKPT="chosen_checkpoints/walking_latest.pt"
+ARM_CKPT="chosen_checkpoints/arm_left_latest.pt"
 
 cd "$PROJECT_ROOT"
 mkdir -p phase_logs
@@ -51,7 +74,7 @@ run_step() {
     fi
 }
 
-# $1 = experiment_name (e.g. arms/g1_arm_ik_left_reward_shape) -> newest run dir, or empty
+# $1 = experiment_name (e.g. standing/g1_locomotion_flat) -> newest run dir, or empty
 latest_run_dir() {
     ls -td "logs/rsl_rl/$1"/*/ 2>/dev/null | head -1
 }
@@ -61,76 +84,33 @@ latest_checkpoint() {
     [ -n "$1" ] && ls -v "$1"/model_*.pt 2>/dev/null | tail -1
 }
 
-train_and_eval_arm() {
-    # $1 = gym task id, $2 = experiment_name, $3 = run_name, $4... = extra eval_arm.py args
-    local task="$1" exp_name="$2" run_name="$3"; shift 3
-    run_step "Train: $run_name" \
-        python scripts/rsl_rl/train.py --task "$task" --headless \
-            --max_iterations "$ARM_ITERS" --run_name "$run_name"
-    local run_dir; run_dir=$(latest_run_dir "$exp_name")
-    local ckpt; ckpt=$(latest_checkpoint "$run_dir")
-    if [ -n "$ckpt" ]; then
-        run_step "Eval: $run_name" \
-            python validation/eval_arm.py --checkpoint "$ckpt" --headless "$@"
-    else
-        echo "[WARN] No checkpoint found under $run_dir for '$run_name' — skipping eval."
-    fi
-}
-
-echo "Overnight sweep starting $(date). Full log: $LOG_FILE"
+echo "Standing baseline follow-up (height reward) starting $(date). Full log: $LOG_FILE"
 
 # ---------------------------------------------------------------------------
-# Arm experiments (3 isolated changes vs. the G1-Arm-IK-Left-v0 baseline, each its own
-# gym task + experiment_name — see g1_arm_env.py / agents/rsl_rl_ppo_cfg.py). Full
-# 5000-iteration budget each (same as the confirmed baseline run, for a clean
-# apples-to-apples comparison) since there's time overnight.
+# 1. Height reward, on top of the dwell_phase_fix baseline
 # ---------------------------------------------------------------------------
-train_and_eval_arm "G1-Arm-IK-Left-RewardShape-v0" \
-    "arms/g1_arm_ik_left_reward_shape" "reward_shape"
+run_step "Train: standing height_reward ($STANDING_ITERS iters)" \
+    python scripts/rsl_rl/train.py --task G1-Locomotion-Standing-Flat-IKReach-Height-v0 --headless \
+        --max_iterations "$STANDING_ITERS" --run_name height_reward
+HEIGHT_RUN_DIR=$(latest_run_dir "standing/g1_locomotion_flat")
+HEIGHT_CKPT=$(latest_checkpoint "$HEIGHT_RUN_DIR")
 
-train_and_eval_arm "G1-Arm-IK-Left-GoalCurriculum-v0" \
-    "arms/g1_arm_ik_left_goal_curriculum" "goal_curriculum"
-
-# WideNet's checkpoint has a different actor/critic layer shape than the baseline
-# ([512,256,128] vs [256,128,64]) — eval_arm.py must be told this via --hidden_dims or
-# runner.load() fails on a shape mismatch (see eval_arm.py's --hidden_dims docstring).
-train_and_eval_arm "G1-Arm-IK-Left-WideNet-v0" \
-    "arms/g1_arm_ik_left_wide_net" "wide_net" \
-    --hidden_dims 512 256 128
-
-train_and_eval_arm "G1-Arm-IK-Left-Entropy-v0" \
-    "arms/g1_arm_ik_left_entropy" "entropy"
-
-# ---------------------------------------------------------------------------
-# Standing — full retrain with the new phase-5 (33 rad/s hardware-limit) curriculum
-# phase, added 2026-07-07 but never trained until now.
-#
-# Iteration count: StandingArmTrajectoryDisturbance's phase boundaries are in raw
-# env-steps; at num_steps_per_env=24, phase 5 begins at env-step 120,000 -> iteration
-# 5000. Phase 4 (the previous hardest phase) got 40,000 steps (~1667 iterations) of
-# training time before the curriculum moved on. 8000 total gives phase 5 roughly
-# 3000 iterations of exposure — comfortably more than phase 4 got, appropriate given
-# phase 5 is both the newest and the hardest (never visually or numerically validated
-# before this run, see known_issues.md).
-# ---------------------------------------------------------------------------
-run_step "Train: standing (6-phase curriculum, $STANDING_ITERS iters)" \
-    python scripts/rsl_rl/train.py --task G1-Locomotion-Standing-Flat-v0 --headless \
-        --max_iterations "$STANDING_ITERS" --run_name phase5_curriculum
-STANDING_RUN_DIR=$(latest_run_dir "standing/g1_locomotion_flat")
-STANDING_CKPT=$(latest_checkpoint "$STANDING_RUN_DIR")
-if [ -n "$STANDING_CKPT" ]; then
-    # No --phases override: eval_standing.py defaults to sweeping every phase the
-    # curriculum currently defines, which now includes the new phase 5 automatically.
-    run_step "Eval: standing (all phases incl. new phase 5)" \
-        python validation/eval_standing.py --checkpoint "$STANDING_CKPT" --headless
+if [ -n "$HEIGHT_CKPT" ]; then
+    run_step "Eval (native): standing height_reward" \
+        python validation/eval_standing_ikreach.py --checkpoint "$HEIGHT_CKPT" --env_cfg height --headless
+    run_step "Eval (integration): standing height_reward" \
+        python validation/integration_validation/eval_full_demo.py \
+            --standing_checkpoint "$HEIGHT_CKPT" --walking_checkpoint "$WALKING_CKPT" \
+            --arm_checkpoint "$ARM_CKPT" --num_envs 32 --headless
 else
-    echo "[WARN] No checkpoint found under $STANDING_RUN_DIR for standing — skipping eval."
+    echo "[WARN] No checkpoint found under $HEIGHT_RUN_DIR for height_reward — skipping both evals."
 fi
 
 echo ""
 echo "=============================================================="
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Overnight sweep complete."
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Standing baseline follow-up complete."
 echo "Full log: $LOG_FILE"
-echo "Arm eval summaries: logs/rsl_rl/arms/g1_arm_ik_left_{reward_shape,goal_curriculum,wide_net,entropy}/*/arm_eval/summary.md"
-echo "Standing eval summary: $STANDING_RUN_DIR/disturbance_eval/summary.md"
+echo "height_reward checkpoint: $HEIGHT_CKPT"
+echo "Native eval output:      validation/eval_standing_ikreach/<timestamp>/summary.csv"
+echo "Integration eval output: validation/integration_validation/<timestamp>/*/*_summary.csv"
 echo "=============================================================="

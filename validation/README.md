@@ -34,6 +34,18 @@ python validation/eval_arm.py --checkpoint chosen_checkpoints/arm_left_latest.pt
 
 Output: `<checkpoint_dir>/arm_eval/summary.md`.
 
+**Two flags added 2026-07-08, for comparing checkpoints fairly:**
+
+- `--hidden_dims 512 256 128` (or whatever the checkpoint's actual actor/critic shape
+  is) — required if the checkpoint wasn't trained with the default `[256,128,64]`
+  network (e.g. the wide-net variant), or `runner.load()` fails on a shape mismatch.
+- `--goal_x_range X_MIN X_MAX` — evaluates against a restricted x-range of the goal box
+  instead of the full thing, so two different checkpoints (or the same checkpoint before/
+  after a change) can be compared on exactly the same sub-region. Remember to clear the
+  checkpoint's existing `arm_eval/` folder first if re-running with a different range —
+  the CSV writer appends, so mixing full-box and restricted-range episodes into the same
+  file silently corrupts the comparison (this happened once — see `known_issues.md`).
+
 **Why this exists, concretely**: this eval would have caught a real regression the day it
 happened. A first attempt at restricting the arm's joint ranges (to stop it wandering into
 hardware-safe-but-unnatural poses) made a large chunk of the goal workspace physically
@@ -41,8 +53,8 @@ unreachable — but that only became visible after actually training 1500 iterat
 noticing the training CSV had plateaued. A fixed-seed eval against a *specific* checkpoint
 gives a fast, repeatable answer without needing to train first.
 
-**What "good" looks like** (no long-converged baseline yet — the first real 5000-iteration
-run should become the reference point):
+**What "good" looks like** (as of the 2026-07-08 reachability fix, ~85% success is the
+reference point — see `known_issues.md` / `phase_logs/phase_2.md` for how it got there):
 
 | Metric | Healthy | Watch out for |
 |---|---|---|
@@ -64,6 +76,32 @@ default pose that happen to land on nearby goals." No baseline yet; a joint sitt
 ~0% while others are well-exercised is the thing to look twice at, not a specific target
 percentage (a joint might genuinely not need much range for this particular goal
 workspace).
+
+## `check_arm_reachability.py` — is `_GOAL_BOUNDS` actually reachable? (no RL involved)
+
+Added 2026-07-08 after a real regression this would have caught immediately: `_GOAL_BOUNDS`
+had been hand-picked and never checked against the arm's actual kinematics, and only ~47%
+of it turned out to be reachable within the 2cm success threshold — a hard ceiling on
+success rate no amount of training could ever cross, mistaken for weeks for a policy-
+quality problem. See `known_issues.md` / `phase_logs/phase_2.md` for the full story.
+
+Samples a large number of random joint configurations within the real hardware limits
+(`self._arm_hw_limits` — the same limits training/eval already clamp actions to) and
+records where the palm ends up, building a point cloud of the arm's true reachable
+workspace. No RL policy or reward involved at all — pure kinematics via the physics sim.
+Then checks how much of `_GOAL_BOUNDS` is actually covered by that point cloud, at a few
+distance tolerances, plus a per-octant breakdown (which corner/region is hardest, if any).
+
+```bash
+conda activate isaac_g1_control
+python validation/check_arm_reachability.py --arm left --headless
+```
+
+Output: printed coverage table + `validation/arm_reachability/<arm>_summary.md`.
+
+**Run this before ever trusting a new `_GOAL_BOUNDS` definition again** — cheap (no
+training needed, a couple of minutes), and it's the only way to know whether a workspace
+change is actually solvable before spending a training run finding out the hard way.
 
 ## `eval_standing.py` — does it stay upright, and does it actually step when it needs to?
 

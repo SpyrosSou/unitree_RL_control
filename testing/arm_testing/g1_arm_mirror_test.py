@@ -33,9 +33,9 @@ Usage (from project root, conda activate isaac_g1_control):
         --targets 0.3 0.2 1.0
 
 Target coordinates are always in the physical robot frame:
-    x  forward     reachable 0.1 – 0.5 m
-    y  lateral     left arm: +0.05 – +0.45 m   right arm: -0.05 – -0.45 m
-    z  height      reachable 0.9 – 1.2 m  (ground = 0)
+    x  forward     reachable 0.20 – 0.42 m
+    y  lateral     left arm: +0.08 – +0.40 m   right arm: -0.40 – -0.08 m
+    z  height      reachable 0.9 – 1.15 m  (ground = 0)
 
 At each transition a prompt appears — type 'x y z' and Enter to jump to a new target,
 or press Enter alone to cycle through the initial --targets list.
