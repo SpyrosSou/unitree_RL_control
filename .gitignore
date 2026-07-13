@@ -46,6 +46,13 @@ docker/.container.cfg
 **/.neptune/*
 docker/artifacts/
 *.tmp
+nohup.out
+
+# Eval run outputs (timestamped dirs of generated CSVs — the eval *scripts* themselves,
+# which live as .py files directly in these same validation/ directories, are unaffected
+# by a trailing-slash/subdirectory-only pattern like this).
+validation/eval_standing_ikreach/*/
+validation/integration_validation/*/
 
 # Doc Outputs
 **/docs/_build/*
@@ -67,6 +74,12 @@ _build
 !chosen_checkpoints/
 !chosen_checkpoints/*.pt
 !chosen_checkpoints/*.md
+# Exported deployment artifacts (ONNX + the .pt it was exported from) — the .pt here would
+# otherwise still be caught by **/*.pt above; the blanket chosen_checkpoints exception only
+# covers files directly in that directory, not this subdirectory (2026-07-13, found while
+# checking why chosen_checkpoints/exported/ was showing as untracked-but-partially-ignored).
+!chosen_checkpoints/exported/
+!chosen_checkpoints/exported/*
 
 # Pre-Trained Checkpoints
 /.pretrained_checkpoints/
