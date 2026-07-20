@@ -4,10 +4,17 @@ Three scripts for answering "is this checkpoint actually good?" with a determini
 fixed-seed rollout — decoupled from the noisy training reward curve, and repeatable
 whenever you retrain. Run them before promoting a checkpoint to `chosen_checkpoints/`.
 
+> **Partially stale (2026-07-16)**: eval scripts now write to
+> `<checkpoint_dir>/<eval_name>/` with a `run_meta.yaml` each, `eval_standing_ikreach.py`
+> gained `--env_cfg/--freeze_arms/--no_push`, and the integration eval
+> (`integration_validation/eval_full_demo.py`) gained `--arm_driver/--active_arm_gain`.
+> Trust `definitive_next_steps.md` (repo root) and each script's own `--help`/docstring
+> over this file. CSV columns are documented in `metrics_wrappers.py` itself
+> (`logging_reference.md` was removed).
+
 All three reuse the same per-episode CSV wrappers training uses
 (`g1_locomotion.utils.metrics_wrappers`), so the numbers here are directly comparable to
-what you'd see in a run's own `*_detailed.csv` — see `logging_reference.md` for the full
-column reference. Nothing here trains anything; all three scripts only load a checkpoint
+what you'd see in a run's own `*_detailed.csv`. Nothing here trains anything; all three scripts only load a checkpoint
 and run inference.
 
 `eval_standing.py`/`eval_walking.py` build on Isaac Lab's `_PLAY` env configs, which

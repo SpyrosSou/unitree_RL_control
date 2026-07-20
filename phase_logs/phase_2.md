@@ -1,5 +1,7 @@
 # Phase 2 — Arm Policy Improvements
 
+> **Archival phase log** — frozen record. Current status lives in `definitive_next_steps.md` (repo root); what happened after this log (the integration debugging that resolved the fall problem) is `phase_logs/phase_3.md`. `quickrun_tests.md` was removed 2026-07-16.
+
 Plain-language summary of what happened, plus a handoff section for whoever picks up
 integration next (may be a fresh chat with no memory of this one). Full blow-by-blow
 technical detail, with exact numbers for every finding, lives in `known_issues.md`'s

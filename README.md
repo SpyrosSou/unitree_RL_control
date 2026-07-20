@@ -21,10 +21,16 @@ Main task families:
 Recent customizations include:
 
 - single walking policy with stronger transition exposure,
-- standing policy with a phased arm-motion-disturbance curriculum, teaching it to take a
-  corrective step rather than only balancing in place (no push/external-force disturbance —
-  that was tried and removed, see `training_regimes.md`),
+- standing policy trained under an arm-motion-disturbance curriculum (several variants
+  exist — the authoritative per-variant details are the config-class docstrings in
+  `g1_locomotion_env_cfg.py`; the chosen checkpoint is documented in
+  `chosen_checkpoints/README.md`),
 - arm action filtering and per-step delta limiting for smoother arm motion.
+
+> **Status note (2026-07-16):** the section below describes the ORIGINAL scripted
+> disturbance curriculum and its reward weights — later standing variants changed both.
+> For current status, chosen checkpoint, and next steps see `definitive_next_steps.md`
+> (repo root).
 
 Standing-policy details (current):
 
@@ -47,8 +53,8 @@ Standing logging details:
 
 - Standing training writes `standing_summary.csv` (convergence-at-a-glance) and
   `standing_detailed.csv` (everything, including a stepping-detection signal
-  `step_count`/`max_foot_air_time_s`) in each standing run directory — see
-  `logging_reference.md` for the full column reference and how to read them.
+  `step_count`/`max_foot_air_time_s`) in each standing run directory — columns are
+  documented in `g1_locomotion/utils/metrics_wrappers.py` itself.
 
 ## Environment
 
@@ -112,13 +118,14 @@ The integrated demo reads default checkpoint paths from:
   - `testing/walking_testing/` — locomotion demos and switch demos
   - `testing/arm_testing/` — arm evaluation and mirror tests
   - `testing/general_testing/` — combined demos
-  - `testing/quickrun_tests.md` — how to run the scripts above
-- `chosen_checkpoints/` — curated deployable checkpoints
-- `quickrun.md` — command reference (train/play/resume)
-- `training_regimes.md` — training setup summary
-- `algorithm_explanation.md` — PPO/network/observation-space reference
-- `logging_reference.md` — what gets logged during training, where, and what each metric means
-- `phase_logs/` — running change log per roadmap phase (see `training_regimes.md`)
+- `validation/` — batch eval scripts (fall rates, reach accuracy; each script's
+  `--help`/docstring is the usage reference)
+- `chosen_checkpoints/` — curated deployable checkpoints (see its README for provenance)
+- `definitive_next_steps.md` — **the maintained status / next-steps document** (docs
+  consolidated 2026-07-16; command references live in script docstrings and `--help`)
+- `personal_development/algorithm_explanation.md` — PPO/network/observation-space reference
+- `phase_logs/` — archival change log per roadmap phase (`phase_3.md` = the integration
+  debugging endgame)
 
 ## Notes On Ignored Files
 

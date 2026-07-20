@@ -10,6 +10,7 @@ Override any field here to tune or extend the base configs.
 """
 
 from isaaclab.managers import EventTermCfg as EventTerm
+from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils import configclass
@@ -20,6 +21,10 @@ from . import mdp
 # terms, so it isn't in the project's own `mdp` package above. Aliased to avoid shadowing
 # that import.
 import isaaclab_tasks.manager_based.locomotion.velocity.mdp as locomotion_mdp
+
+# symmetry.py is deliberately not part of the mdp package's star-import (see that file —
+# rsl_rl_ppo_cfg.py already imports compute_symmetric_states from it directly the same way).
+from .mdp.symmetry import leg_symmetry_l2
 
 from isaaclab_tasks.manager_based.locomotion.velocity.config.g1.flat_env_cfg import G1FlatEnvCfg
 from isaaclab_tasks.manager_based.locomotion.velocity.config.g1.rough_env_cfg import (
@@ -358,6 +363,256 @@ class G1LocomotionStandingFlatIKReachHeightEnvCfg(G1LocomotionStandingFlatIKReac
 
 @configclass
 class G1LocomotionStandingFlatIKReachHeightEnvCfg_PLAY(G1LocomotionStandingFlatIKReachHeightEnvCfg):
+    """Eval variant, same pattern as G1LocomotionStandingFlatIKReachEnvCfg_PLAY."""
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.observations.policy.enable_corruption = True
+        self.events.standing_arm_motion_disturbance.params["enable_step"] = 0
+        self.events.standing_arm_motion_disturbance.params["ramp_full_step"] = 0
+
+
+@configclass
+class G1LocomotionStandingFlatIKReachHeightSymmetryEnvCfg(G1LocomotionStandingFlatIKReachHeightEnvCfg):
+    """Same as G1LocomotionStandingFlatIKReachHeightEnvCfg (analytic-IK disturbance,
+    dwell-until-timeout goal cycling, base_height_l2 against the squat) plus one addition:
+    mdp.symmetry.leg_symmetry_l2, penalizing left-right leg asymmetry directly.
+
+    2026-07-14: added after visually confirming (g1_full_demo.py) that even the
+    height-reward checkpoint settles into a persistent, lopsided rest pose — tilted,
+    uneven legs — with zero arm disturbance active, so no legitimate disturbance response
+    could be causing it. See leg_symmetry_l2's own docstring for the full mechanism and
+    why it's scoped to legs only (never fights a legitimate one-armed reach — arms aren't
+    in its joint set at all — and can't touch torso, which has no left/right pair to
+    compare against and stays governed by joint_deviation_torso instead).
+
+    Isolated as its own gym id, single-variable step on top of the height-reward baseline
+    (not stacked with a torso change too — see leg_symmetry_l2's docstring: torso is
+    deliberately left alone here in case fixing leg asymmetry resolves the torso rotation
+    as a side effect, without needing a second, confounding lever added at the same time).
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.rewards.leg_symmetry_l2 = RewTerm(
+            func=leg_symmetry_l2,
+            weight=-2.0,
+            params={
+                "asset_cfg": SceneEntityCfg(
+                    "robot",
+                    joint_names=[
+                        "left_hip_pitch_joint",
+                        "left_hip_roll_joint",
+                        "left_hip_yaw_joint",
+                        "left_knee_joint",
+                        "left_ankle_pitch_joint",
+                        "left_ankle_roll_joint",
+                    ],
+                )
+            },
+        )
+
+
+@configclass
+class G1LocomotionStandingFlatIKReachHeightSymmetryEnvCfg_PLAY(G1LocomotionStandingFlatIKReachHeightSymmetryEnvCfg):
+    """Eval variant, same pattern as G1LocomotionStandingFlatIKReachEnvCfg_PLAY."""
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.observations.policy.enable_corruption = True
+        self.events.standing_arm_motion_disturbance.params["enable_step"] = 0
+        self.events.standing_arm_motion_disturbance.params["ramp_full_step"] = 0
+
+
+@configclass
+class G1LocomotionStandingFlatConsolidatedEnvCfg(G1LocomotionStandingFlatIKReachHeightEnvCfg):
+    """Phase 1 of the integration-recovery plan (see plan.md §4), 2026-07-14: ONE config
+    combining the three levers that were each validated individually but never together —
+    and whose combination is the actual deployment condition the integration eval tests.
+
+    1. StandingArmPolicyReachDisturbance — the real frozen arm-IK policy as the training
+       disturbance, jitter included (validated alone 2026-07-13: fixed standing_still 0%
+       and right-reach 9% falls, but produced a deep squat that broke reach geometry).
+    2. base_height_l2 (inherited from G1LocomotionStandingFlatIKReachHeightEnvCfg) — the
+       squat fix (validated alone 2026-07-13/14: height restored to 0.71-0.73m everywhere,
+       reach precision way up, but fall rate alone unchanged).
+    3. match_deployment_arm_gains — the one lever never tried anywhere: the actively
+       reaching arm trains at 200/20 (what deployment actually runs it at, and what the
+       arm checkpoint was trained under) instead of standing's 60/1.5. Standing has
+       literally never felt a 200/20-stiff arm before this config, and the 2026-07-14
+       fall-timing diagnostics (falls = slow lean build-up over 2.6-7.6s of sustained
+       reaching, not goal-switch shocks) point at exactly the larger-than-trained
+       reaction torques a stiff arm transmits.
+
+    Deliberately bundles all three (breaking the usual single-variable rule) because each
+    variable has already been tested alone — what has never existed is a standing policy
+    trained under the full deployment condition. If this config's integration eval still
+    fails, the next step is architecture (plan.md §5), not more reward tuning here.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.events.standing_arm_motion_disturbance = EventTerm(
+            func=mdp.StandingArmPolicyReachDisturbance,
+            mode="interval",
+            interval_range_s=(self.sim.dt * self.decimation, self.sim.dt * self.decimation),
+            params={
+                "asset_cfg": SceneEntityCfg("robot"),
+                "arm_checkpoint": "chosen_checkpoints/arm_left_latest.pt",
+                "match_deployment_arm_gains": True,
+            },
+            is_global_time=False,
+        )
+
+
+@configclass
+class G1LocomotionStandingFlatConsolidatedEnvCfg_PLAY(G1LocomotionStandingFlatConsolidatedEnvCfg):
+    """Eval variant, same pattern as G1LocomotionStandingFlatIKReachEnvCfg_PLAY."""
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.observations.policy.enable_corruption = True
+        self.events.standing_arm_motion_disturbance.params["enable_step"] = 0
+        self.events.standing_arm_motion_disturbance.params["ramp_full_step"] = 0
+
+
+@configclass
+class G1LocomotionStandingFlatConsolidatedIntentEnvCfg(G1LocomotionStandingFlatConsolidatedEnvCfg):
+    """Consolidated (see that class's docstring) + exactly one change: the arm-intent
+    observation (mdp.standing_arm_motion_targets — the arm's currently-commanded joint
+    targets as offsets from default, 10-D, appended at the END of the policy observation).
+
+    2026-07-15, plan.md §4.5 option 2: the consolidated checkpoint balances *reactively* —
+    it only ever feels the arm's motion after the fact, so its best strategy was one fixed
+    bracing posture (a persistently rotated torso) that costs most of the inner reach
+    workspace, and each policy-driven-trained run solves only one arm. Deployed humanoid
+    stacks put the upper-body command in the locomotion policy's observation for exactly
+    this reason: seeing where the arm is told to go next allows *per-target* anticipation
+    instead of one posture that must serve every reach. The buffer this term exposes
+    (env._standing_arm_motion_targets) already exists identically in training (the
+    disturbance classes write it) and in both deployment scripts (they write it too), so
+    train and deploy see the same signal by construction.
+
+    Observation dim grows 75 -> 85; the term appends at the end, so deployment feeds old
+    75-D policies by simply not appending (both deployment scripts auto-detect the
+    checkpoint's input width — see their _load_loco_policy). Standing's PPO runner cfg has
+    no symmetry augmentation (confirmed in agents/rsl_rl_ppo_cfg.py — only walking uses
+    it), so no mirror-transform changes are needed for the extra block.
+
+    Sibling experiment to G1LocomotionStandingFlatConsolidatedTorsoEnvCfg (posture *penalty*
+    vs posture *information*) — same baseline. The torso branch was run first and failed
+    catastrophically (2026-07-15: rotation persisted at ~48.5 deg natively AND the
+    checkpoint joined the collapse group — 100% integration falls even standing still),
+    so this branch is now the main line.
+
+    Second deliberate addition (2026-07-15, after the torso branch's collapse):
+    no_reach_prob=0.15 — 15% of episodes hold both arms at default with no reaching. The
+    --freeze_arms bisect proved "standing with motionless arms" is a lethal
+    training-distribution hole for checkpoints that never practice it (100% falls within
+    ~2.5s, natively, for symmetry/consolidated_torso-class checkpoints). Strict
+    single-variable discipline would omit this, but each training is a single seed anyway
+    and the failure mode is proven + cheap to cover — insurance beats attribution here.
+    It also composes naturally with the intent term: idle episodes give the policy an
+    explicit all-zeros intent signal to associate with "just stand".
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        # No noise: the commanded targets are internally known, not a sensor reading.
+        self.observations.policy.arm_motion_targets = ObsTerm(func=mdp.standing_arm_motion_targets)
+
+        # 15% idle episodes — see class docstring.
+        self.events.standing_arm_motion_disturbance.params["no_reach_prob"] = 0.15
+
+
+@configclass
+class G1LocomotionStandingFlatConsolidatedIntentEnvCfg_PLAY(G1LocomotionStandingFlatConsolidatedIntentEnvCfg):
+    """Eval variant, same pattern as G1LocomotionStandingFlatIKReachEnvCfg_PLAY."""
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.observations.policy.enable_corruption = True
+        self.events.standing_arm_motion_disturbance.params["enable_step"] = 0
+        self.events.standing_arm_motion_disturbance.params["ramp_full_step"] = 0
+
+
+@configclass
+class G1LocomotionStandingFlatConsolidatedNoReachEnvCfg(G1LocomotionStandingFlatConsolidatedEnvCfg):
+    """Consolidated + exactly one change: no_reach_prob=0.15 (15% of episodes hold both
+    arms at default, no reaching — see StandingArmIKReachDisturbance.no_reach_prob for the
+    static-arm distribution hole this closes).
+
+    2026-07-15: the CONTROL for the consolidated_intent run, which deliberately bundles
+    two changes (the arm-intent observation AND this same idle slice — see its docstring
+    for why insurance beat attribution there). This config isolates the idle slice alone:
+    whatever the intent run shows, comparing it against this run separates "the policy
+    learned from seeing the arm's intent" from "the policy just stopped being fragile
+    about motionless arms." Also the natural fallback baseline if the intent term itself
+    misbehaves.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.events.standing_arm_motion_disturbance.params["no_reach_prob"] = 0.15
+
+
+@configclass
+class G1LocomotionStandingFlatConsolidatedNoReachEnvCfg_PLAY(G1LocomotionStandingFlatConsolidatedNoReachEnvCfg):
+    """Eval variant, same pattern as G1LocomotionStandingFlatIKReachEnvCfg_PLAY."""
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.observations.policy.enable_corruption = True
+        self.events.standing_arm_motion_disturbance.params["enable_step"] = 0
+        self.events.standing_arm_motion_disturbance.params["ramp_full_step"] = 0
+
+
+@configclass
+class G1LocomotionStandingFlatConsolidatedTorsoEnvCfg(G1LocomotionStandingFlatConsolidatedEnvCfg):
+    """Consolidated (see that class's docstring) + exactly one change: joint_deviation_torso
+    partially re-tightened, 0.0 -> -0.05.
+
+    2026-07-15: the consolidated checkpoint fixed left-reach falls (78% -> 2.1%) but did it
+    by holding a *persistently rotated torso* from the moment it stands (visually confirmed
+    in g1_full_demo by the user) — a bracing posture that displaces the shoulder relative
+    to the pelvis-frame goal box and swallowed the near-inner reach workspace: goals the
+    height_reward checkpoint reaches at 1.8cm / 100% success (43-attempt sample, near-inner
+    corner x<0.27, y<0.18) timed out at 15-20cm under consolidated (concluded success
+    collapsed to ~16%). This config asks for the same fall robustness *without* the
+    permanent rotation, by making a sustained torso offset cost something while leaving it
+    cheap enough to still use transiently for genuine recoveries.
+
+    Note the history: the same -0.05 was tried before (G1LocomotionStandingFlatIKReachTorsoEnvCfg,
+    2026-07-13) and made integration *worse* — but that was on the pre-gain-match baseline,
+    where the policy plausibly needed every posture trick available just to survive at all.
+    With the gain match now carrying the load (2.1% falls with the torso free), re-testing
+    whether the rotation is actually load-bearing or just an unpenalized habit is a clean
+    single-variable question on the new baseline. Watch fall rate AND the new
+    max_abs_torso_deg / mean_abs_torso_deg columns (StandingMetricsCsvWrapper, added
+    2026-07-15 for exactly this experiment) plus arm success together: success = falls stay
+    ~2%, torso rotation drops, reach success recovers toward the height_reward run's ~96%
+    concluded. If falls come back instead, the rotation was load-bearing and the fix is
+    target-conditioned posture (arm-intent observation, plan.md §4.5 option 2), not a
+    posture penalty.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.rewards.joint_deviation_torso.weight = -0.05
+
+
+@configclass
+class G1LocomotionStandingFlatConsolidatedTorsoEnvCfg_PLAY(G1LocomotionStandingFlatConsolidatedTorsoEnvCfg):
     """Eval variant, same pattern as G1LocomotionStandingFlatIKReachEnvCfg_PLAY."""
 
     def __post_init__(self):

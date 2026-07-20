@@ -129,8 +129,8 @@ from g1_locomotion.tasks.manager_based.g1_locomotion.g1_locomotion_env_cfg impor
     G1LocomotionFlatEnvCfg_PLAY,
 )
 from g1_locomotion.tasks.manager_based.g1_locomotion.mdp import StandingArmBlendJointPositionAction
+from g1_locomotion.tasks.manager_based.g1_locomotion.mdp.observations import standing_arm_motion_targets
 from rsl_rl.modules import ActorCritic
-from rsl_rl.runners import OnPolicyRunner
 from tensordict import TensorDict
 
 from omni.kit.viewport.utility import get_viewport_from_window_name
@@ -172,6 +172,17 @@ ARM_MAX_JOINT_DELTA_PER_STEP = 0.06
 # validation/integration_validation/eval_full_demo.py's standing_arm_reach fall rate was
 # far worse than casual manual testing here suggested).
 ARM_ACTION_FILTER_ALPHA = 0.25
+# When a new target is set, the arm first *homes* back to its default pose through the
+# same clamped-delta path the IK targets use (≤ ARM_MAX_JOINT_DELTA_PER_STEP per step),
+# then hands over to the arm-IK policy. Replaces the previous write_joint_state_to_sim
+# teleport (2026-07-14): an instantaneous joint-state jump is a nonphysical CoM/momentum
+# shock the standing policy never sees in training (nothing in mdp/events.py ever writes
+# joint state mid-episode) and can't happen on real hardware — but the reason the reset
+# existed is still real (a previous out-of-range target can leave the arm in an extreme,
+# never-trained pose the policy shouldn't have to start a fresh reach from), so the
+# return-to-default is kept, just as a physical motion instead of a teleport. Homing ends
+# when every joint is within this tolerance of default.
+ARM_HOMING_TOL_RAD = 0.05
 
 # Per-mode arm PD gain (2026-07-12, replaces one static 200/20 applied for the whole
 # demo regardless of mode) — matches eval_full_demo.py's _STANDING_ARM_GAIN/_ARM_IK_GAIN/
@@ -293,6 +304,14 @@ class G1FullDemo:
         env_cfg.episode_length_s = 1_000_000
         env_cfg.curriculum = None
 
+        # Restore training-time observation noise — the _PLAY config disables it for clean
+        # visualization. Found 2026-07-14 that this script never restored it (unlike
+        # eval_full_demo.py's _build_env_cfg, which does, for the same reason): running a
+        # policy trained with observation noise against noise-free input isn't the usual
+        # direction of sim-to-real risk, but it's still a real train/deploy mismatch and an
+        # easy one to just not have.
+        env_cfg.observations.policy.enable_corruption = True
+
         # Use the same action term standing's own training env uses (2026-07-12) — see
         # validation/integration_validation/eval_full_demo.py's _build_env_cfg for the full
         # rationale. In short: overwriting loco_action's arm columns before handing it to
@@ -363,6 +382,9 @@ class G1FullDemo:
         # reset — a fresh target shouldn't start pre-biased by whatever the previous
         # target's filter had converged to.
         self._filtered_arm_delta = torch.zeros(1, 5 * n_arms, device=self.device)
+        # Per-arm homing flags — see ARM_HOMING_TOL_RAD's comment. Set by _set_arm_target,
+        # consumed (and cleared on arrival) by _update_arm_sim_targets each step.
+        self._arm_homing = torch.zeros(n_arms, dtype=torch.bool, device=self.device)
 
         if args_cli.target is not None:
             init_tgt = torch.tensor(args_cli.target, dtype=torch.float32, device=self.device)
@@ -406,6 +428,7 @@ class G1FullDemo:
             self.mirror_goal_pos_local = torch.zeros(3, device=self.device)
             self.mirror_target_active = False
             self._filtered_mirror_delta = torch.zeros(1, 5, device=self.device)
+            self._mirror_homing = False  # same homing mechanism as _arm_homing
             # Same "fixed offset from the torso, not from the world" treatment as the
             # primary target — see _mirror_goal_world()'s docstring.
 
@@ -441,9 +464,57 @@ class G1FullDemo:
         return torch.tensor(cols, dtype=torch.long, device=self.device)
 
     def _load_loco_policy(self, agent_cfg: RslRlOnPolicyRunnerCfg, ckpt: str):
-        runner = OnPolicyRunner(self.env, agent_cfg.to_dict(), log_dir=None, device=self.device)
-        runner.load(ckpt)
-        return runner.get_inference_policy(device=self.device)
+        """Input width inferred from the checkpoint, not the env (2026-07-15) — same
+        change/rationale as eval_full_demo.py's _load_loco_policy: the arm-intent standing
+        task appends a 10-D block to the policy obs (75 -> 85), this demo's env is the
+        75-D walking cfg shared by both policies, and OnPolicyRunner sizes from the env.
+        The closure auto-extends a too-narrow obs with mdp.standing_arm_motion_targets —
+        which reads env._standing_arm_motion_targets, the exact buffer this demo already
+        maintains every step (_update_arm_sim_targets while standing, cleared to None
+        while walking, where the function falls back to zeros = "arms at default")."""
+        state = torch.load(ckpt, map_location=self.device)["model_state_dict"]
+        in_dim = state["actor.0.weight"].shape[1]
+        num_actions = state[f"actor.{2 * len(agent_cfg.policy.actor_hidden_dims)}.weight"].shape[0]
+
+        # Locomotion runner cfgs never define obs_groups (dataclasses.MISSING) — same fix
+        # as eval_full_demo.py's _load_loco_policy, found 2026-07-15 when the first
+        # integration eval of the new loader crashed on exactly this.
+        obs_groups = agent_cfg.obs_groups
+        if not isinstance(obs_groups, dict):
+            obs_groups = {"policy": ["policy"], "critic": ["policy"]}
+
+        dummy_obs = TensorDict(
+            {"policy": torch.zeros((1, in_dim), dtype=torch.float32, device=self.device)},
+            batch_size=[1], device=self.device,
+        )
+        actor_critic = ActorCritic(
+            obs=dummy_obs,
+            obs_groups=obs_groups,
+            num_actions=num_actions,
+            actor_obs_normalization=agent_cfg.policy.actor_obs_normalization,
+            critic_obs_normalization=agent_cfg.policy.critic_obs_normalization,
+            actor_hidden_dims=agent_cfg.policy.actor_hidden_dims,
+            critic_hidden_dims=agent_cfg.policy.critic_hidden_dims,
+            activation=agent_cfg.policy.activation,
+            init_noise_std=agent_cfg.policy.init_noise_std,
+        ).to(self.device)
+        actor_critic.load_state_dict(state)
+        actor_critic.eval()
+
+        env_unwrapped = self.env.unwrapped
+
+        def policy(obs) -> torch.Tensor:
+            # RslRlVecEnvWrapper hands back a TensorDict — same normalization as
+            # eval_full_demo.py's _load_loco_policy, found 2026-07-15 (a TensorDict's
+            # .shape is its batch size, and torch.cat on [TensorDict, Tensor] crashes).
+            obs_tensor = obs["policy"] if isinstance(obs, TensorDict) else obs
+            if obs_tensor.shape[-1] < in_dim:
+                obs_tensor = torch.cat([obs_tensor, standing_arm_motion_targets(env_unwrapped)], dim=-1)
+            td = TensorDict({"policy": obs_tensor}, batch_size=[obs_tensor.shape[0]], device=self.device)
+            with torch.inference_mode():
+                return actor_critic.act_inference(td)
+
+        return policy
 
     def _load_arm_policy(self):
         """Load the arm IK policy and return (policy_fn, ee_body_ids, joint_ids)."""
@@ -672,10 +743,49 @@ class G1FullDemo:
         env._standing_arm_motion_joint_ids = self.all_arm_joint_ids_robot
         targets = self.robot.data.default_joint_pos[0:1, self.all_arm_joint_ids_robot].clone()
         if arm_active:
-            targets[:, self._active_arm_cols] = self._compute_arm_targets()
+            arm_targets = self._compute_arm_targets()
+            # Any arm slot still homing overrides its slice of the policy output with the
+            # scripted return-to-default step — see ARM_HOMING_TOL_RAD's comment.
+            n_per_arm = len(self.arm_joint_ids_robot) // self._arm_homing.numel()
+            for arm_idx in range(self._arm_homing.numel()):
+                if not bool(self._arm_homing[arm_idx]):
+                    continue
+                sl = slice(arm_idx * n_per_arm, (arm_idx + 1) * n_per_arm)
+                homing_target = self._homing_step(self.arm_joint_ids_robot[sl])
+                if homing_target is None:
+                    self._arm_homing[arm_idx] = False
+                    # The EMA filter accumulated policy output during homing that was never
+                    # applied — zero it so the policy engages fresh from the default pose,
+                    # same as training's per-episode filter reset.
+                    self._filtered_arm_delta[0, sl] = 0.0
+                    print("[FullDemo] Arm homed to default — arm-IK policy engaging.")
+                else:
+                    arm_targets[:, sl] = homing_target
+            targets[:, self._active_arm_cols] = arm_targets
         if mirror_active:
-            targets[:, self._mirror_arm_cols] = self._compute_mirror_targets()
+            if self._mirror_homing:
+                homing_target = self._homing_step(self._mirror_joint_ids_robot)
+                if homing_target is None:
+                    self._mirror_homing = False
+                    self._filtered_mirror_delta[:] = 0.0
+                    print("[FullDemo] Mirror arm homed to default — mirrored policy engaging.")
+                else:
+                    targets[:, self._mirror_arm_cols] = homing_target
+            if not self._mirror_homing:
+                targets[:, self._mirror_arm_cols] = self._compute_mirror_targets()
         env._standing_arm_motion_targets = targets
+
+    def _homing_step(self, joint_ids: torch.Tensor) -> torch.Tensor | None:
+        """One clamped-delta step of the scripted return-to-default move (see
+        ARM_HOMING_TOL_RAD). Returns the (1, n) joint target for this step, or None once
+        every joint is within tolerance of default (homing complete)."""
+        current = self.robot.data.joint_pos[0, joint_ids]
+        default = self.robot.data.default_joint_pos[0, joint_ids]
+        err = default - current
+        if bool((err.abs().max() <= ARM_HOMING_TOL_RAD).item()):
+            return None
+        delta = err.clamp(-ARM_MAX_JOINT_DELTA_PER_STEP, ARM_MAX_JOINT_DELTA_PER_STEP)
+        return (current + delta).unsqueeze(0)
 
     def _clear_arm_sim_targets(self):
         """Walking mode: let StandingArmBlendJointPositionAction fall through to stock
@@ -732,20 +842,12 @@ class G1FullDemo:
         self.mirror_goal_pos_local = target_local
         self.mirror_target_active = True
 
-        # Same reset-between-targets fix _set_arm_target uses (2026-07-07) — without it
-        # the right arm keeps going from wherever it physically ended up chasing the
-        # *previous* mirror target.
-        default_pos = self.robot.data.default_joint_pos[0:1, self._mirror_joint_ids_robot]
-        zero_vel = torch.zeros_like(default_pos)
+        # Same return-to-default-between-targets treatment as _set_arm_target — smooth
+        # homing move, not a teleport (see that method's comment, 2026-07-14).
         with torch.inference_mode():
-            self.robot.write_joint_state_to_sim(
-                default_pos, zero_vel,
-                joint_ids=self._mirror_joint_ids_robot, env_ids=torch.tensor([0], device=self.device),
-            )
-
-            # Reset the mirror path's EMA action filter too — same reasoning as the
-            # joint-state reset just above, and same "must stay inside inference_mode" fix
-            # as _set_arm_target's identical pattern (see that method's comment).
+            self._mirror_homing = True
+            # Reset the mirror path's EMA action filter too — same "must stay inside
+            # inference_mode" restriction as _set_arm_target's identical pattern.
             self._filtered_mirror_delta[:] = 0.0
 
         self._update_mirror_goal_marker()
@@ -806,6 +908,12 @@ class G1FullDemo:
         self._transition_to = "standing"
         self._transition_step = 0
         self.cmd_filtered.zero_()
+
+        # A respawn resets the arm joints to default via the env's own reset — nothing
+        # left to home back from.
+        self._arm_homing.zero_()
+        if self._mirror_enabled:
+            self._mirror_homing = False
 
         # No re-anchoring needed on respawn any more — targets are a fixed offset from
         # the torso, recomputed from the live pose every call (_goal_positions_world /
@@ -868,7 +976,29 @@ class G1FullDemo:
             alpha = min((self._transition_step + 1) / float(self._transition_total_steps), 1.0)
             from_pol = self.walking_policy if self._transition_from == "walking" else self.standing_policy
             to_pol   = self.walking_policy if self._transition_to   == "walking" else self.standing_policy
-            loco_action = (1.0 - alpha) * from_pol(obs) + alpha * to_pol(obs)
+            from_action = from_pol(obs)
+            to_action = to_pol(obs)
+            loco_action = (1.0 - alpha) * from_action + alpha * to_action
+
+            # Arm columns during a transition come from the WALKING side only, never from
+            # the blend (2026-07-15, the "arms flail wildly the moment walking starts"
+            # fix): the standing policy's raw arm-column output is meaningless — its
+            # training always overrides arm targets with the disturbance mechanism, so
+            # nothing ever shapes what the network itself emits there (see the long
+            # comment below). While standing_ish that garbage never reaches the sim (the
+            # blend action term overrides the simulated arm targets), but a transition
+            # *to walking* clears that override (standing_ish False), so for
+            # TRANSITION_STEPS_TO_WALK steps the arms were driven by a blend that is
+            # part unshaped garbage — visible as violent arm swings right at walk onset,
+            # a real observed fall source. Every transition in this demo has walking on
+            # exactly one side, so its arm output — the only trained arm signal in the
+            # blend — is used unblended. (Transitions *to standing* keep the override
+            # active, so this only changes what the sim sees in the to-walking case;
+            # last_action sees it in both, which is closer to each policy's training
+            # than blended garbage was.)
+            walking_action = from_action if self._transition_from == "walking" else to_action
+            loco_action = loco_action.clone()
+            loco_action[:, self.all_arm_joint_ids_robot] = walking_action[:, self.all_arm_joint_ids_robot]
 
             self._transition_step += 1
             if self._transition_step >= self._transition_total_steps:
@@ -920,42 +1050,26 @@ class G1FullDemo:
         self.goal_pos_local[arm_idx] = target_local
         self.arm_target_active[arm_idx] = True
 
-        # Reset just this arm's joints to their default pose before pursuing the new
-        # target. Nothing else here ever resets the arm between targets, so without
-        # this it just keeps going from wherever it physically ended up chasing the
-        # *previous* one. If that previous target was out of range or poorly reached,
-        # the arm could be sitting in an extreme, never-seen-in-training pose — and the
-        # policy would try to reach the *new* target starting from that bad state,
-        # producing motion that looks broken but has nothing to do with whether the new
-        # target itself is reasonable. Only resets the targeted arm (relevant for
+        # Return this arm to its default pose before pursuing the new target — via the
+        # smooth homing move (_homing_step / ARM_HOMING_TOL_RAD's comment), not the old
+        # write_joint_state_to_sim teleport (replaced 2026-07-14: an instantaneous
+        # joint-state jump is a nonphysical CoM shock the standing policy never trains
+        # against and real hardware can't do). The *reason* for resetting is unchanged:
+        # if the previous target was out of range or poorly reached, the arm could be
+        # sitting in an extreme, never-seen-in-training pose, and the policy would start
+        # the new reach from that bad state. Only homes the targeted arm (relevant for
         # arm_mode="both"), not the other one mid-reach.
         n_per_arm = len(self.arm_joint_ids_robot) // (2 if self.arm_mode == "both" else 1)
         start = arm_idx * n_per_arm if self.arm_mode == "both" else 0
-        joint_ids = self.arm_joint_ids_robot[start:start + n_per_arm]
-        default_pos = self.robot.data.default_joint_pos[0:1, joint_ids]
-        zero_vel = torch.zeros_like(default_pos)
-        # _set_arm_target is called from the T-key prompt path, which runs in main()'s
-        # loop *before* the `with torch.inference_mode():` block that wraps env.step() —
-        # but write_joint_state_to_sim does in-place writes into tensors that were
-        # already created under inference_mode by that same step loop, and PyTorch only
-        # allows in-place writes to an inference tensor from inside inference_mode
-        # (same restriction noted in validation/eval_standing.py). Scope it explicitly
-        # here rather than requiring every caller to remember to wrap it.
+        # In-place writes to inference tensors (the homing flag / EMA filter buffers get
+        # reassigned inside the main loop's inference_mode-wrapped step) are only allowed
+        # from inside inference_mode, and this runs in main()'s loop *before* that block —
+        # same restriction noted in validation/eval_standing.py (found 2026-07-12).
         with torch.inference_mode():
-            self.robot.write_joint_state_to_sim(
-                default_pos, zero_vel,
-                joint_ids=joint_ids, env_ids=torch.tensor([0], device=self.device),
-            )
-
-            # Reset this arm's slice of the EMA action filter too — same reasoning as the
-            # joint-state reset just above, applied to ARM_ACTION_FILTER_ALPHA's persisted
-            # state instead of the physical joints. Must stay inside this inference_mode
-            # block: _filtered_arm_delta gets reassigned inside the main loop's own
-            # inference_mode-wrapped step (_compute_arm_targets's EMA update), which makes
-            # it an inference tensor — an in-place write from outside inference_mode (this
-            # function runs in main()'s loop *before* that block) raises "Inplace update to
-            # inference tensor outside InferenceMode is not allowed" (found 2026-07-12,
-            # triggered by re-targeting the same arm a second time in one session).
+            self._arm_homing[arm_idx if self.arm_mode == "both" else 0] = True
+            # Reset this arm's slice of the EMA action filter, same as training resets it
+            # per-episode. (It's zeroed again when homing completes — this one covers the
+            # case where the arm is already at default and homing finishes instantly.)
             self._filtered_arm_delta[0, start:start + n_per_arm] = 0.0
 
         self._update_goal_markers()

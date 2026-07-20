@@ -271,6 +271,18 @@ class StandingArmIKReachDisturbance(ManagerTermBase):
     proven timescale, not a guess.
     """
 
+    # Deployment gain for an actively IK/policy-driven arm — matches g1_arm_env.py's
+    # training gain and the _ARM_IK_GAIN both deployment scripts apply to whichever arm
+    # is actively reaching (eval_full_demo.py's reach buckets, g1_full_demo.py's
+    # _update_arm_gains). Only used when match_deployment_arm_gains is enabled (see
+    # __init__): standing otherwise trains its whole arm group at the env cfg's own
+    # 60/1.5 — a gain that has never matched what deployment actually runs the reaching
+    # arm at, and (2026-07-14, verified against unitree_sdk2_python) the 60/1.5 value is
+    # the hardware-realistic one while 200/20 is a sim-only property of the current arm
+    # checkpoint. Until the arm policy works at soft gains, standing must train against
+    # the stiff arm it will actually face.
+    _DEPLOY_ACTIVE_ARM_GAIN = (200.0, 20.0)
+
     enable_step: int = 30_000
     ramp_full_step: int = 120_000
     # 0.15, not g1_arm_env.py's 0.4 — the 2026-07-11 training run's TensorBoard curve
@@ -282,6 +294,16 @@ class StandingArmIKReachDisturbance(ManagerTermBase):
     # foothold before the ramp carries it up to full strength by ramp_full_step regardless.
     start_fraction: float = 0.15
     both_arms_prob: float = 0.2
+    # Fraction of episodes with NO reaching at all — both arms held at their default pose
+    # for the whole episode (2026-07-15). Closes a proven, lethal training-distribution
+    # hole: the --freeze_arms bisect showed checkpoints trained with the disturbance
+    # always active post-enable fall 100% (within ~2.5s) when the arms are simply held
+    # still at default — the exact condition of integration's standing_still bucket and
+    # of any real deployment moment with no arm command. "Arms quietly at default" was
+    # something these policies had literally never practiced after the curriculum
+    # enabled. Default 0.0 so existing configs/checkpoints keep their historical
+    # behavior; opt in per config via params={"no_reach_prob": ...}.
+    no_reach_prob: float = 0.0
     goal_threshold_m: float = 0.03  # matches eval_full_demo.py's GOAL_THRESHOLD_M
     max_steps_per_goal: int = 750  # 15s @ 50Hz, matches eval_full_demo.py
     max_joint_delta_per_step: float = 0.06  # matches G1ArmIKEnvCfg.max_action_delta_per_step
@@ -298,6 +320,7 @@ class StandingArmIKReachDisturbance(ManagerTermBase):
         self.enable_step = cfg.params.get("enable_step", self.enable_step)
         self.ramp_full_step = cfg.params.get("ramp_full_step", self.ramp_full_step)
         self.start_fraction = cfg.params.get("start_fraction", self.start_fraction)
+        self.no_reach_prob = cfg.params.get("no_reach_prob", self.no_reach_prob)
 
         # Imported here, not at module level, so this file stays importable even if the
         # g1_arm package ever isn't (matches how eval_full_demo.py already reuses these
@@ -326,8 +349,14 @@ class StandingArmIKReachDisturbance(ManagerTermBase):
         # ordering _standing_arm_motion_joint_ids uses (set once, below), so writes into
         # _standing_arm_motion_targets land in the right columns.
         all_joint_ids, _ = self._asset.find_joints(_ARM_JOINT_NAMES)
-        self._env._standing_arm_motion_joint_ids = torch.tensor(all_joint_ids, dtype=torch.long, device=self.device)
-        self._targets = self._asset.data.default_joint_pos[:, self._env._standing_arm_motion_joint_ids].clone()
+        # Keep our own reference — __call__ re-asserts BOTH env attributes every step
+        # (2026-07-16): external code can null them between uses (eval_full_demo.py's
+        # walking bucket does exactly that, deliberately), and the blend action term
+        # falls through to stock behavior unless both are set — which silently hands the
+        # arm joints to the policy's unshaped raw output instead of this term's targets.
+        self._all_joint_ids = torch.tensor(all_joint_ids, dtype=torch.long, device=self.device)
+        self._env._standing_arm_motion_joint_ids = self._all_joint_ids
+        self._targets = self._asset.data.default_joint_pos[:, self._all_joint_ids].clone()
         self._default = self._targets.clone()
         self._env._standing_arm_motion_targets = self._targets
 
@@ -364,6 +393,27 @@ class StandingArmIKReachDisturbance(ManagerTermBase):
         # Which side(s) this episode reaches with — resampled per env on reset.
         self._active = {s: torch.zeros(self.num_envs, dtype=torch.bool, device=self.device) for s in self._sides}
 
+        # Deployment gain matching (2026-07-14, Phase 1 of the integration-recovery plan):
+        # when enabled, every episode reset writes each env's *actively reaching* arm(s) to
+        # _DEPLOY_ACTIVE_ARM_GAIN and its held arm(s) back to the env cfg's own trained
+        # gain, mirroring the per-arm split both deployment scripts apply. Off by default —
+        # existing configs/checkpoints keep their historical behavior unchanged. Held-arm
+        # values are captured from the live sim here (i.e. whatever the actuator cfg set,
+        # 60/1.5 for the standing configs) rather than hardcoded, so a future cfg gain
+        # change propagates automatically. Known small approximation: before enable_step
+        # the "active" arm is only holding default but already carries the stiff gain until
+        # its next reset — deployment-idle runs both arms soft. Accepted: the reaching
+        # regime is the one being trained for, and pre-enable covers only the first 30k
+        # env-steps of a run.
+        self._match_deployment_arm_gains = bool(cfg.params.get("match_deployment_arm_gains", False))
+        if self._match_deployment_arm_gains:
+            self._held_arm_stiffness = {
+                s: self._asset.data.joint_stiffness[:, self._joint_ids[s]].clone() for s in self._sides
+            }
+            self._held_arm_damping = {
+                s: self._asset.data.joint_damping[:, self._joint_ids[s]].clone() for s in self._sides
+            }
+
     @property
     def num_envs(self) -> int:
         return self._asset.num_instances
@@ -390,17 +440,50 @@ class StandingArmIKReachDisturbance(ManagerTermBase):
         self._targets[env_ids] = self._default[env_ids]
         self._env._standing_arm_motion_targets = self._targets
 
-        # left-only / right-only / both, per env — see both_arms_prob.
+        # none / both / left-only / right-only, per env — see no_reach_prob/both_arms_prob.
+        # "none" leaves both actives False: _step_side then holds both arms at default the
+        # whole episode (torch.where(active, ...) falls through to the default pose), and
+        # _apply_deployment_arm_gains gives both arms the cfg's own held gain — exactly
+        # deployment's idle condition.
         roll = torch.rand(len(env_ids), device=self.device)
-        both = roll < self.both_arms_prob
-        left_only = (roll >= self.both_arms_prob) & (roll < self.both_arms_prob + 0.5 * (1.0 - self.both_arms_prob))
-        right_only = ~both & ~left_only
+        none = roll < self.no_reach_prob
+        both = ~none & (roll < self.no_reach_prob + self.both_arms_prob)
+        reach_prob = 1.0 - self.no_reach_prob - self.both_arms_prob
+        left_only = ~none & ~both & (roll < self.no_reach_prob + self.both_arms_prob + 0.5 * reach_prob)
+        right_only = ~none & ~both & ~left_only
         self._active["left"][env_ids] = both | left_only
         self._active["right"][env_ids] = both | right_only
+
+        if self._match_deployment_arm_gains:
+            self._apply_deployment_arm_gains(env_ids)
 
         fraction = self._ramp_fraction(self._env.common_step_counter)
         for side in self._sides:
             self._resample_goal(side, env_ids, fraction)
+
+    def _apply_deployment_arm_gains(self, env_ids: torch.Tensor):
+        """Per-env, per-arm gain write on reset — active arm(s) at _DEPLOY_ACTIVE_ARM_GAIN,
+        held arm(s) restored to the env cfg's own trained gain. See the
+        match_deployment_arm_gains comment in __init__."""
+        for side in self._sides:
+            active = self._active[side][env_ids]
+            active_ids = env_ids[active]
+            held_ids = env_ids[~active]
+            joint_ids = self._joint_ids[side]
+            if active_ids.numel() > 0:
+                self._asset.write_joint_stiffness_to_sim(
+                    self._DEPLOY_ACTIVE_ARM_GAIN[0], joint_ids=joint_ids, env_ids=active_ids
+                )
+                self._asset.write_joint_damping_to_sim(
+                    self._DEPLOY_ACTIVE_ARM_GAIN[1], joint_ids=joint_ids, env_ids=active_ids
+                )
+            if held_ids.numel() > 0:
+                self._asset.write_joint_stiffness_to_sim(
+                    self._held_arm_stiffness[side][held_ids], joint_ids=joint_ids, env_ids=held_ids
+                )
+                self._asset.write_joint_damping_to_sim(
+                    self._held_arm_damping[side][held_ids], joint_ids=joint_ids, env_ids=held_ids
+                )
 
     def _resample_goal(self, side: str, env_ids: torch.Tensor, fraction: float):
         bounds = self._goal_bounds[side]
@@ -491,14 +574,18 @@ class StandingArmIKReachDisturbance(ManagerTermBase):
         enable_step: int | None = None,
         ramp_full_step: int | None = None,
         start_fraction: float | None = None,
+        match_deployment_arm_gains: bool | None = None,
+        no_reach_prob: float | None = None,
     ):
-        # asset_cfg and the three ramp overrides are all consumed once in __init__ (see
-        # there) — EventManager re-passes the full params dict as kwargs on every single
-        # call though (same reason StandingArmTrajectoryDisturbance's own
+        # asset_cfg and the construction-time params are all consumed once in
+        # __init__ (see there) — EventManager re-passes the full params dict as kwargs on
+        # every single call though (same reason StandingArmTrajectoryDisturbance's own
         # phase_step_boundaries/phase_step_offset params are accepted here and ignored,
         # not just at construction), so these need to be accepted here too or a PLAY-style
         # cfg override crashes every step instead of just working.
-        del asset_cfg, enable_step, ramp_full_step, start_fraction
+        del asset_cfg, enable_step, ramp_full_step, start_fraction, match_deployment_arm_gains, no_reach_prob
+        # Re-assert both attrs every call — see the __init__ comment (2026-07-16).
+        self._env._standing_arm_motion_joint_ids = self._all_joint_ids
         fraction = self._ramp_fraction(env.common_step_counter)
         if fraction <= 0.0:
             self._targets[:] = self._default
@@ -608,13 +695,18 @@ class StandingArmPolicyReachDisturbance(StandingArmIKReachDisturbance):
         enable_step: int | None = None,
         ramp_full_step: int | None = None,
         start_fraction: float | None = None,
+        match_deployment_arm_gains: bool | None = None,
+        no_reach_prob: float | None = None,
         arm_checkpoint: str | None = None,
         arm_action_filter_alpha: float | None = None,
     ):
         # arm_checkpoint/arm_action_filter_alpha consumed once in __init__ — same
         # re-passed-every-call reasoning as the base class's own ramp params.
         del arm_checkpoint, arm_action_filter_alpha
-        return super().__call__(env, env_ids, asset_cfg, enable_step, ramp_full_step, start_fraction)
+        return super().__call__(
+            env, env_ids, asset_cfg, enable_step, ramp_full_step, start_fraction,
+            match_deployment_arm_gains, no_reach_prob,
+        )
 
     def _step_side(self, side: str, env: ManagerBasedEnv, fraction: float):
         from isaaclab.utils.math import subtract_frame_transforms

@@ -101,6 +101,35 @@ parser.add_argument(
     help="Override arm actor/critic hidden dims (e.g. 512 256 128 for a wide-net checkpoint). "
     "Default: baseline [256, 128, 64].",
 )
+parser.add_argument(
+    "--arm_driver", type=str, default="policy", choices=["policy", "ik", "event"],
+    help="What drives the actively-reaching arm in the standing_arm_*_reach buckets (2026-07-16). "
+    "'policy' = the trained RL arm checkpoint (the historical behavior). 'ik' = the same "
+    "isaaclab DifferentialIKController + clamped-delta scheme StandingArmIKReachDisturbance "
+    "already uses inside standing's training — i.e. for an IK-trained standing checkpoint "
+    "(height_reward etc.), deployment then matches training *exactly*. Also the "
+    "industry-standard humanoid architecture (RL legs + IK arms at hardware gains), removes "
+    "the RL arm's near-goal jitter/branch problems by construction, and drives the right arm "
+    "natively instead of via the mirror transform. 'event' (DIAGNOSTIC, 2026-07-16) = attach "
+    "standing training's OWN StandingArmIKReachDisturbance event term to this env and let it "
+    "drive the arms exactly as it does in training/the native eval — no reimplementation in "
+    "the loop at all. Completes the native-vs-integration 2x2: if falls persist even under the "
+    "literal training disturbance code, the base-env difference is the culprit; if they "
+    "vanish, this script's own arm-driving path is. In event mode the four side/edge reach "
+    "buckets collapse into one 'standing_arm_event_reach' bucket (the term picks sides "
+    "per-episode itself, goals are its own, so there's no per-attempt arm CSV — the standing "
+    "fall rate is the measurement), and the walking bucket runs with arms pinned at default "
+    "(the term's buffer overrides them) — ignore its arm realism in this mode.",
+)
+parser.add_argument(
+    "--active_arm_gain", type=float, nargs=2, default=[200.0, 20.0], metavar=("KP", "KD"),
+    help="PD gain written to the actively-reaching arm's joints in the reach buckets "
+    "(default 200 20 = the RL arm checkpoint's training gain, the historical behavior). "
+    "Pass '60 1.5' for the hardware-realistic gain (unitree_sdk2_python's own arm examples) "
+    "— which is also exactly the gain every standing checkpoint's training drives its "
+    "disturbance arm at, so combined with --arm_driver ik the standing policy faces "
+    "literally its own training-time disturbance.",
+)
 parser.add_argument("--num_envs", type=int, default=32, help="Parallel envs per bucket.")
 parser.add_argument(
     "--steps_standing_still", type=int, default=3000, help="Control steps (50 Hz) for the standing_still bucket."
@@ -145,6 +174,9 @@ simulation_app = app_launcher.app
 import csv
 import datetime
 import os
+import subprocess
+
+import yaml
 
 import g1_locomotion.tasks  # noqa: F401 — registers gym envs
 import torch
@@ -159,13 +191,18 @@ from g1_locomotion.tasks.manager_based.g1_arm.g1_arm_env import (
 from g1_locomotion.tasks.manager_based.g1_arm.mdp.symmetry import mirror_arm_actions, mirror_arm_obs
 from g1_locomotion.tasks.manager_based.g1_locomotion.agents.rsl_rl_ppo_cfg import G1LocomotionFlatPPORunnerCfg
 from g1_locomotion.tasks.manager_based.g1_locomotion.g1_locomotion_env_cfg import G1LocomotionFlatEnvCfg_PLAY
-from g1_locomotion.tasks.manager_based.g1_locomotion.mdp import StandingArmBlendJointPositionAction
+from g1_locomotion.tasks.manager_based.g1_locomotion.mdp import (
+    StandingArmBlendJointPositionAction,
+    StandingArmIKReachDisturbance,
+)
+from g1_locomotion.tasks.manager_based.g1_locomotion.mdp.observations import standing_arm_motion_targets
 from g1_locomotion.utils.metrics_wrappers import StandingMetricsCsvWrapper, WalkingMetricsCsvWrapper, _DualCsvWriter
 from rsl_rl.modules import ActorCritic
-from rsl_rl.runners import OnPolicyRunner
 from tensordict import TensorDict
 
 from isaaclab.envs import ManagerBasedRLEnv
+from isaaclab.managers import EventTermCfg as EventTerm
+from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils.math import quat_apply, quat_apply_inverse
 
 from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
@@ -230,7 +267,33 @@ def _build_env_cfg() -> G1LocomotionFlatEnvCfg_PLAY:
     # _set_arm_gains() right before it steps (see that function). Leaves this cfg at the
     # stock Isaac Lab default (40/10) at spawn time, immediately overwritten before any
     # bucket actually runs.
+
+    # --arm_driver event (diagnostic, 2026-07-16): attach standing training's own
+    # disturbance term to this (walking) env so the reach condition is produced by the
+    # literal training code, not any reimplementation in this script — see the flag's
+    # help text for the 2x2 this completes. Constructed enabled; _set_event_disturbance
+    # toggles it per bucket (only the event-reach bucket wants it active).
+    if args_cli.arm_driver == "event":
+        cfg.events.standing_arm_motion_disturbance = EventTerm(
+            func=StandingArmIKReachDisturbance,
+            mode="interval",
+            interval_range_s=(cfg.sim.dt * cfg.decimation, cfg.sim.dt * cfg.decimation),
+            params={"asset_cfg": SceneEntityCfg("robot"), "enable_step": 0, "ramp_full_step": 0},
+            is_global_time=False,
+        )
     return cfg
+
+
+def _set_event_disturbance(base_env, enabled: bool):
+    """--arm_driver event only: toggle the attached training-disturbance term between
+    buckets by pushing enable_step out of reach (the same gating knob the term's own
+    curriculum uses). No-op in the other driver modes (the term doesn't exist there)."""
+    if args_cli.arm_driver != "event":
+        return
+    term = base_env.event_manager.get_term_cfg("standing_arm_motion_disturbance").func
+    step_val = 0 if enabled else 10**12
+    term.enable_step = step_val
+    term.ramp_full_step = step_val
 
 
 # Kp/Kd each bucket actually trained under — see _set_arm_gains(). Not one shared value:
@@ -243,22 +306,83 @@ _ARM_IK_GAIN = (200.0, 20.0)  # matches g1_arm_env.py's arm-IK training gain
 _WALKING_ARM_GAIN = (40.0, 10.0)  # stock Isaac Lab default — walking never overrides "arms"
 
 
-def _set_arm_gains(base_env, stiffness: float, damping: float, device):
-    """Live-update the arm joints' PD gains via the PhysX view directly — the actuator
+def _set_arm_gains(base_env, stiffness: float, damping: float, device, joint_names=None):
+    """Live-update arm joints' PD gains via the PhysX view directly — the actuator
     cfg's stiffness/damping are fixed at spawn time, but write_joint_stiffness_to_sim/
     write_joint_damping_to_sim let this reused-across-buckets simulation switch gains
-    between buckets instead of being stuck with whatever _build_env_cfg() set once."""
+    between buckets instead of being stuck with whatever _build_env_cfg() set once.
+
+    joint_names: which joints to write (default: all arm joints, both sides). Passing one
+    side's joints lets the reach buckets split gains per arm — see _run_standing_arm_reach."""
     robot = base_env.scene["robot"]
-    arm_joint_ids, _ = robot.find_joints(_LEFT_ARM_JOINTS + _RIGHT_ARM_JOINTS)
+    arm_joint_ids, _ = robot.find_joints(
+        joint_names if joint_names is not None else _LEFT_ARM_JOINTS + _RIGHT_ARM_JOINTS
+    )
     arm_joint_ids_t = torch.tensor(arm_joint_ids, dtype=torch.long, device=device)
     robot.write_joint_stiffness_to_sim(stiffness, joint_ids=arm_joint_ids_t)
     robot.write_joint_damping_to_sim(damping, joint_ids=arm_joint_ids_t)
 
 
-def _load_loco_policy(env, agent_cfg, checkpoint: str, device):
-    runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=device)
-    runner.load(checkpoint)
-    return runner.get_inference_policy(device=device)
+def _load_loco_policy(base_env, agent_cfg, checkpoint: str, device):
+    """Load a locomotion (standing/walking) policy with its input width inferred from the
+    checkpoint itself, not from the env (2026-07-15, replaces the OnPolicyRunner path).
+
+    Why: the arm-intent standing task (G1-Locomotion-Standing-Flat-Consolidated-Intent-v0)
+    appends a 10-D arm-targets block to the END of the policy observation (75 -> 85), but
+    this eval's env is the plain walking cfg (75-D obs) shared by BOTH policies —
+    OnPolicyRunner sizes the network from the env, so it could only ever load 75-D
+    checkpoints. Building the ActorCritic directly (same pattern _load_arm_policy has
+    always used) from the checkpoint's own first-layer width handles every combination:
+    old 75-D standing checkpoints, new 85-D intent ones, and walking (always 75-D) —
+    no flags needed.
+
+    The returned policy closure auto-extends: if the checkpoint expects more dims than the
+    obs it's handed, it appends mdp.standing_arm_motion_targets(base_env) — the exact
+    function the intent task trains with, reading the same env buffer every bucket in this
+    script already maintains — so train and deploy compute the extra block identically."""
+    state = torch.load(checkpoint, map_location=device)["model_state_dict"]
+    in_dim = state["actor.0.weight"].shape[1]
+    num_actions = state[f"actor.{2 * len(agent_cfg.policy.actor_hidden_dims)}.weight"].shape[0]
+
+    # The locomotion runner cfgs never define obs_groups (dataclasses.MISSING — found
+    # 2026-07-15 when this crashed the first overnight integration eval of the new loader);
+    # only the arm task's cfg sets it explicitly. Fall back to the standard single-group
+    # mapping, which is exactly what that cfg uses and what these policies trained under.
+    obs_groups = agent_cfg.obs_groups
+    if not isinstance(obs_groups, dict):
+        obs_groups = {"policy": ["policy"], "critic": ["policy"]}
+
+    dummy_obs = TensorDict(
+        {"policy": torch.zeros((1, in_dim), dtype=torch.float32, device=device)},
+        batch_size=[1], device=device,
+    )
+    actor_critic = ActorCritic(
+        obs=dummy_obs,
+        obs_groups=obs_groups,
+        num_actions=num_actions,
+        actor_obs_normalization=agent_cfg.policy.actor_obs_normalization,
+        critic_obs_normalization=agent_cfg.policy.critic_obs_normalization,
+        actor_hidden_dims=agent_cfg.policy.actor_hidden_dims,
+        critic_hidden_dims=agent_cfg.policy.critic_hidden_dims,
+        activation=agent_cfg.policy.activation,
+        init_noise_std=agent_cfg.policy.init_noise_std,
+    ).to(device)
+    actor_critic.load_state_dict(state)
+    actor_critic.eval()
+
+    def policy(obs) -> torch.Tensor:
+        # RslRlVecEnvWrapper.reset()/step() hand back a TensorDict ({"policy": tensor},
+        # batch dims only) — a TensorDict's .shape is its BATCH size and torch.cat on a
+        # mixed [TensorDict, Tensor] list crashes, so normalize to the policy-group tensor
+        # first (found 2026-07-15, first real run of this loader).
+        obs_tensor = obs["policy"] if isinstance(obs, TensorDict) else obs
+        if obs_tensor.shape[-1] < in_dim:
+            obs_tensor = torch.cat([obs_tensor, standing_arm_motion_targets(base_env)], dim=-1)
+        td = TensorDict({"policy": obs_tensor}, batch_size=[obs_tensor.shape[0]], device=device)
+        with torch.inference_mode():
+            return actor_critic.act_inference(td)
+
+    return policy
 
 
 def _load_arm_policy(device):
@@ -363,6 +487,63 @@ def _build_arm_obs(
     )
 
 
+class _IKArmDriver:
+    """Analytic-IK arm driver for the reach buckets (--arm_driver ik) — a lean, per-bucket
+    copy of the exact frame/Jacobian/clamp math StandingArmIKReachDisturbance._step_side
+    uses inside standing's training (see that class — validated there over multiple
+    training runs), just fed by the eval tracker's goals instead of its own cycling.
+    Gravity droop at soft gains self-corrects: the delta is recomputed from the *measured*
+    joint position every step, so persistent lag keeps advancing the commanded target
+    until the end-effector converges — an implicit integral action."""
+
+    def __init__(self, base_env, robot, joint_ids: torch.Tensor, ee_body_id: int, device):
+        from isaaclab.controllers import DifferentialIKController, DifferentialIKControllerCfg
+
+        ik_cfg = DifferentialIKControllerCfg(command_type="position", use_relative_mode=False, ik_method="dls")
+        self._ik = DifferentialIKController(cfg=ik_cfg, num_envs=base_env.num_envs, device=device)
+        self._base_env = base_env
+        self._robot = robot
+        self._joint_ids = joint_ids
+        self._ee_body_id = ee_body_id
+        # Jacobian indexing convention for floating vs fixed base — same as
+        # StandingArmIKReachDisturbance.__init__ (this env's robot is floating-base).
+        if robot.is_fixed_base:
+            self._jacobi_body_idx = ee_body_id - 1
+            self._jacobi_joint_ids = joint_ids
+        else:
+            self._jacobi_body_idx = ee_body_id
+            self._jacobi_joint_ids = joint_ids + 6
+
+    def compute_targets(self, goal_local: torch.Tensor) -> torch.Tensor:
+        """Absolute joint targets (num_envs, 5) for this step. goal_local is the tracker's
+        root-frame goal (x/y root-relative, z ground-referenced — converted to root-frame z
+        from the robot's current height, same as training)."""
+        from isaaclab.utils.math import matrix_from_quat, quat_inv, subtract_frame_transforms
+
+        robot = self._robot
+        ee_pos_w = robot.data.body_pos_w[:, self._ee_body_id]
+        ee_quat_w = robot.data.body_quat_w[:, self._ee_body_id]
+        ee_pos_b, ee_quat_b = subtract_frame_transforms(
+            robot.data.root_pos_w, robot.data.root_quat_w, ee_pos_w, ee_quat_w
+        )
+        root_height_above_ground = robot.data.root_pos_w[:, 2] - self._base_env.scene.env_origins[:, 2]
+        target_b = goal_local.clone()
+        target_b[:, 2] = target_b[:, 2] - root_height_above_ground
+
+        self._ik.set_command(target_b, ee_quat=ee_quat_b)
+        jacobian_w = robot.root_physx_view.get_jacobians()[:, self._jacobi_body_idx, :, self._jacobi_joint_ids]
+        base_rot_matrix = matrix_from_quat(quat_inv(robot.data.root_quat_w))
+        jacobian_b = jacobian_w.clone()
+        jacobian_b[:, :3, :] = torch.bmm(base_rot_matrix, jacobian_w[:, :3, :])
+        jacobian_b[:, 3:, :] = torch.bmm(base_rot_matrix, jacobian_w[:, 3:, :])
+
+        joint_pos = robot.data.joint_pos[:, self._joint_ids]
+        joint_pos_des = self._ik.compute(ee_pos_b, ee_quat_b, jacobian_b, joint_pos)
+        delta = (joint_pos_des - joint_pos).clamp(-ARM_MAX_JOINT_DELTA_PER_STEP, ARM_MAX_JOINT_DELTA_PER_STEP)
+        limits = robot.data.soft_joint_pos_limits[:, self._joint_ids]
+        return (joint_pos + delta).clamp(limits[:, :, 0], limits[:, :, 1])
+
+
 def _compute_arm_delta(
     side: str, arm_policy, robot, arm_joint_ids: torch.Tensor, ee_body_id: int, goal_world: torch.Tensor
 ) -> torch.Tensor:
@@ -389,7 +570,7 @@ def _compute_arm_delta(
 
 class _ArmAttemptTracker:
     _SUMMARY_FIELDS = [
-        "episode_index", "env_id", "env_step", "attempt_steps", "outcome", "success",
+        "episode_index", "env_id", "env_step", "attempt_steps", "steps_to_reach", "outcome", "success",
         "min_dist_to_goal_cm",
     ]
     _DETAILED_FIELDS = _SUMMARY_FIELDS + ["goal_x_m", "goal_y_m", "goal_z_m"]
@@ -419,6 +600,10 @@ class _ArmAttemptTracker:
         self.goal_local = torch.zeros((self.n, 3), device=device)
         self.attempt_steps = torch.zeros(self.n, dtype=torch.long, device=device)
         self.min_dist = torch.full((self.n,), float("inf"), device=device)
+        # Control step (within the attempt) at which min_dist first crossed the success
+        # threshold; -1 = not reached. Needed since the dwell fix below decouples "when it
+        # reached" from "when the attempt ends" (always the 15s timeout now).
+        self.reach_step = torch.full((self.n,), -1, dtype=torch.long, device=device)
         # EMA action-filter state (see ARM_ACTION_FILTER_ALPHA) — one 5-D filtered-action
         # vector per env, matching g1_arm_env.py's own self.filtered_actions. Reset to 0
         # per-env at the start of each new attempt, same as training resets it per-env on
@@ -465,10 +650,20 @@ class _ArmAttemptTracker:
         self.filtered_action[env_ids] = 0.0
         self.attempt_steps[env_ids] = 0
         self.min_dist[env_ids] = float("inf")
+        self.reach_step[env_ids] = -1
 
-        default_pos = self.robot.data.default_joint_pos[env_ids][:, self.arm_joint_ids]
-        zero_vel = torch.zeros_like(default_pos)
-        self.robot.write_joint_state_to_sim(default_pos, zero_vel, joint_ids=self.arm_joint_ids, env_ids=env_ids)
+        # No per-goal arm reset any more (2026-07-14): this used to teleport the arm to its
+        # default pose via write_joint_state_to_sim on every new goal — an instantaneous,
+        # nonphysical CoM/momentum jump the standing policy never experiences in training
+        # (nothing in mdp/events.py's disturbance classes ever writes joint *state*; goals
+        # resample and the arm moves continuously from wherever it is) and that can't happen
+        # on real hardware either. Starting each attempt from the arm's current pose is
+        # exactly what standing trained against, so the fall metric stays faithful; the arm
+        # policy reaching goal-to-goal (instead of always from default, as its own training
+        # does) is the same condition StandingArmPolicyReachDisturbance exposes standing to.
+        # Envs that just *fell* still restart from default implicitly — the env reset that
+        # follows a termination resets joint states itself, which is a legitimate episode
+        # boundary, not a mid-episode teleport.
 
     def step(self, standing_reset_this_step: torch.Tensor):
         ee_pos = self.robot.data.body_pos_w[:, self.ee_body_id, :]
@@ -477,12 +672,27 @@ class _ArmAttemptTracker:
         self.attempt_steps += 1
 
         success = self.min_dist < GOAL_THRESHOLD_M
+        newly_reached = success & (self.reach_step < 0)
+        self.reach_step = torch.where(newly_reached, self.attempt_steps, self.reach_step)
+
+        # Dwell until timeout (2026-07-16): an attempt now concludes ONLY at
+        # max_steps_per_goal, never the instant the hand first crosses the success
+        # threshold. The old behavior resampled a fresh goal immediately on first
+        # crossing — presenting the standing policy with relentless back-to-back reach
+        # motion that training explicitly does NOT contain: the disturbance's own
+        # 2026-07-12 dwell fix holds every goal for the full 15s precisely because
+        # instant re-cycling was unrealistic, and this tracker was never updated to
+        # match. Found 2026-07-16 via the controlled height_reward comparison — same
+        # checkpoint, same IK driver, same 60/1.5 gains: 1.2% falls native vs ~75% here,
+        # a gap only a code-level train/deploy mismatch can explain. Reach *timing* is
+        # preserved in steps_to_reach; success still means "got within threshold at any
+        # point during the attempt".
         timeout = self.attempt_steps >= args_cli.max_steps_per_goal
-        finished_naturally = (success | timeout) & ~standing_reset_this_step
+        finished_naturally = timeout & ~standing_reset_this_step
 
         self._flush(finished_naturally, success)
         if bool(standing_reset_this_step.any().item()):
-            self._flush(standing_reset_this_step, torch.zeros(self.n, dtype=torch.bool, device=self.device))
+            self._flush(standing_reset_this_step, success & standing_reset_this_step)
 
     def _flush(self, mask: torch.Tensor, success: torch.Tensor):
         env_ids = mask.nonzero(as_tuple=False).squeeze(-1)
@@ -492,7 +702,12 @@ class _ArmAttemptTracker:
         for env_id in env_ids.tolist():
             steps = max(int(self.attempt_steps[env_id].item()), 1)
             was_success = bool(success[env_id].item())
+            reach_step = int(self.reach_step[env_id].item())
             timed_out = self.attempt_steps[env_id].item() >= args_cli.max_steps_per_goal
+            # A reached-then-interrupted attempt keeps outcome "success" — the old
+            # (pre-dwell) tracker would have concluded it as a success at first crossing,
+            # so this preserves success-rate comparability; the fall itself is still
+            # counted in the standing CSV.
             outcome = "success" if was_success else ("timeout" if timed_out else "interrupted")
             goal_local = self.goal_local[env_id].tolist()
             row = {
@@ -500,6 +715,7 @@ class _ArmAttemptTracker:
                 "env_id": env_id,
                 "env_step": env_step,
                 "attempt_steps": steps,
+                "steps_to_reach": reach_step if reach_step >= 0 else "",
                 "outcome": outcome,
                 "success": int(was_success),
                 "min_dist_to_goal_cm": float(self.min_dist[env_id].item()) * 100.0,
@@ -539,6 +755,7 @@ def _run_standing_still(base_env, bucket_dir, standing_policy, device):
     os.makedirs(bucket_dir, exist_ok=True)
     _force_command(base_env, 0.0, 0.0, 0.0)
     _set_arm_gains(base_env, *_STANDING_ARM_GAIN, device)
+    _set_event_disturbance(base_env, False)
     torch.manual_seed(args_cli.seed)
 
     # Hold the arms at default via the *simulated target only*, the same mechanism
@@ -578,6 +795,7 @@ def _run_walking_straight(base_env, bucket_dir, walking_policy, device):
     os.makedirs(bucket_dir, exist_ok=True)
     _force_command(base_env, args_cli.forward_speed, 0.0, 0.0)
     _set_arm_gains(base_env, *_WALKING_ARM_GAIN, device)
+    _set_event_disturbance(base_env, False)
     # Buckets share one base_env and run sequentially — standing_still (which runs right
     # before this one) sets env._standing_arm_motion_targets to hold arms at default via
     # StandingArmBlendJointPositionAction (see _build_env_cfg). Clear it here or that stale
@@ -597,6 +815,82 @@ def _run_walking_straight(base_env, bucket_dir, walking_policy, device):
     metrics_env._csv.close()
     print(f"[Eval] walking_straight done — {metrics_env.csv_path}")
     return metrics_env.csv_path
+
+
+def _run_standing_arm_event_reach(base_env, bucket_dir, standing_policy, device):
+    """--arm_driver event: the reach condition produced by standing training's OWN
+    disturbance term (attached in _build_env_cfg), zero arm-driving code in this loop.
+    The term samples its own goals and sides per episode, so there's no per-attempt arm
+    CSV — the standing fall rate is the measurement (vs. the same checkpoint's native
+    eval under the identical term). Both arms at standing's training gain, exactly as in
+    training (the term itself never touches gains unless match_deployment_arm_gains)."""
+    print("\n[Eval] --- Bucket 'standing_arm_event_reach' (training's own disturbance term) ---")
+    os.makedirs(bucket_dir, exist_ok=True)
+    _force_command(base_env, 0.0, 0.0, 0.0)
+    _set_arm_gains(base_env, *_STANDING_ARM_GAIN, device)
+    _set_event_disturbance(base_env, True)
+    torch.manual_seed(args_cli.seed)
+
+    # Reach-accuracy logging (2026-07-16): the disturbance term tracks its distance to
+    # every goal internally (_min_dist, per side) but nothing anywhere ever logged it —
+    # neither in training nor in the native eval — so "does the IK-driven arm actually
+    # reach its goals" has never been measured. Snapshot the term's per-side state each
+    # step; a drop in _attempt_steps marks a goal ending (timeout resample or episode
+    # reset), at which point the previous snapshot holds that goal's final min distance.
+    term = base_env.event_manager.get_term_cfg("standing_arm_motion_disturbance").func
+    sides = ("left", "right")
+    goal_rows: list[dict] = []
+
+    def _snapshot():
+        return (
+            {s: term._attempt_steps[s].clone() for s in sides},
+            {s: term._min_dist[s].clone() for s in sides},
+            {s: term._active[s].clone() for s in sides},
+        )
+
+    with torch.inference_mode():
+        metrics_env = StandingMetricsCsvWrapper(base_env, bucket_dir, write_summary=False)
+        wrapped_env = RslRlVecEnvWrapper(metrics_env)
+        obs, _ = wrapped_env.reset()
+        prev_steps, prev_min, prev_active = _snapshot()
+        for _ in range(args_cli.steps_arm_reach):
+            action = standing_policy(obs)
+            obs, _, dones, _ = wrapped_env.step(action)
+            for s in sides:
+                ended = term._attempt_steps[s] < prev_steps[s]
+                if bool(ended.any().item()):
+                    for env_id in ended.nonzero(as_tuple=False).squeeze(-1).tolist():
+                        if bool(prev_active[s][env_id].item()):
+                            goal_rows.append({
+                                "env_id": env_id,
+                                "side": s,
+                                "min_dist_cm": float(prev_min[s][env_id].item()) * 100.0,
+                                "goal_steps": int(prev_steps[s][env_id].item()),
+                            })
+            prev_steps, prev_min, prev_active = _snapshot()
+    metrics_env._csv.close()
+    _set_event_disturbance(base_env, False)
+
+    goals_csv = os.path.join(bucket_dir, "event_arm_goals.csv")
+    with open(goals_csv, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["env_id", "side", "min_dist_cm", "goal_steps"])
+        writer.writeheader()
+        writer.writerows(goal_rows)
+    for s in sides:
+        dists = sorted(r["min_dist_cm"] for r in goal_rows if r["side"] == s)
+        if not dists:
+            print(f"[Eval] event reach accuracy ({s}): no completed goals")
+            continue
+        mean = sum(dists) / len(dists)
+        p50 = dists[len(dists) // 2]
+        p90 = dists[int(len(dists) * 0.9)]
+        under3 = sum(1 for d in dists if d < 3.0) / len(dists)
+        print(
+            f"[Eval] event reach accuracy ({s}): goals={len(dists)} mean={mean:.1f}cm "
+            f"p50={p50:.1f}cm p90={p90:.1f}cm  <3cm: {under3:.1%}"
+        )
+    print(f"[Eval] standing_arm_event_reach done — {metrics_env.csv_path} / {goals_csv}")
+    return metrics_env.csv_path, None
 
 
 def _run_standing_arm_reach(base_env, bucket_dir, standing_policy, arm_policy, device, side: str, edge: bool):
@@ -628,13 +922,30 @@ def _run_standing_arm_reach(base_env, bucket_dir, standing_policy, arm_policy, d
         return _sample_goals(side, num, dev, edge=edge, edge_margin_m=args_cli.edge_margin_m)
 
     _force_command(base_env, 0.0, 0.0, 0.0)
-    _set_arm_gains(base_env, *_ARM_IK_GAIN, device)
+    # Per-arm gain split (2026-07-14), matching g1_full_demo.py's _update_arm_gains
+    # convention instead of the previous "both arms at 200/20": only the actively IK-driven
+    # arm gets the arm checkpoint's own training gain; the held arm keeps standing's trained
+    # gain. Hardware note (verified against ~/Elm/Code/unitree_sdk2_python): Unitree's own
+    # g1_arm5/g1_arm7 SDK examples command the arms at kp=60/kd=1.5 — i.e. _STANDING_ARM_GAIN
+    # *is* the hardware-realistic arm gain, and _ARM_IK_GAIN (200/20) is a sim-only crutch
+    # the current arm checkpoint requires (its reach success regressed 86%->30% when
+    # retrained at 60/1.5). Getting the arm policy to work at ~60/1.5 is a real sim2real
+    # prerequisite, tracked separately — until then, deployment matches each policy's own
+    # training gain, split per arm.
+    # Active-arm gain now CLI-controlled (--active_arm_gain, default = the RL arm
+    # checkpoint's 200/20); held arm keeps standing's trained gain either way.
+    _set_arm_gains(base_env, *args_cli.active_arm_gain, device, joint_names=list(_ARM_JOINTS[side]))
+    _set_arm_gains(base_env, *_STANDING_ARM_GAIN, device, joint_names=list(_ARM_JOINTS[other_side]))
     torch.manual_seed(args_cli.seed)
     with torch.inference_mode():
         metrics_env = StandingMetricsCsvWrapper(base_env, bucket_dir, write_summary=False)
         wrapped_env = RslRlVecEnvWrapper(metrics_env)
 
         tracker = _ArmAttemptTracker(base_env, robot, arm_joint_ids_robot, ee_body_id, bucket_dir, device, sample_fn)
+        ik_driver = (
+            _IKArmDriver(base_env, robot, arm_joint_ids_robot, ee_body_id, device)
+            if args_cli.arm_driver == "ik" else None
+        )
 
         obs, _ = wrapped_env.reset()
         tracker.start_new_attempts(torch.arange(base_env.num_envs, device=device))
@@ -649,14 +960,21 @@ def _run_standing_arm_reach(base_env, bucket_dir, standing_policy, arm_policy, d
         for _ in range(args_cli.steps_arm_reach):
             action = standing_policy(obs)
 
-            raw_delta = _compute_arm_delta(
-                side, arm_policy, robot, arm_joint_ids_robot, ee_body_id, tracker.goal_world()
-            )
-            delta = tracker.filter_action(raw_delta)
-            current = robot.data.joint_pos[:, arm_joint_ids_robot]
-            limits = robot.data.soft_joint_pos_limits[:, arm_joint_ids_robot]
-            step_delta = (delta * ARM_ACTION_SCALE).clamp(-ARM_MAX_JOINT_DELTA_PER_STEP, ARM_MAX_JOINT_DELTA_PER_STEP)
-            new_targets = (current + step_delta).clamp(limits[:, :, 0], limits[:, :, 1])
+            if ik_driver is not None:
+                # Analytic IK: absolute targets straight from the tracker's root-frame
+                # goal — no EMA filter/action scale (those replicate the RL arm's own
+                # training conventions; the IK path replicates training's disturbance
+                # conventions instead, which have their own clamp inside the driver).
+                new_targets = ik_driver.compute_targets(tracker.goal_local)
+            else:
+                raw_delta = _compute_arm_delta(
+                    side, arm_policy, robot, arm_joint_ids_robot, ee_body_id, tracker.goal_world()
+                )
+                delta = tracker.filter_action(raw_delta)
+                current = robot.data.joint_pos[:, arm_joint_ids_robot]
+                limits = robot.data.soft_joint_pos_limits[:, arm_joint_ids_robot]
+                step_delta = (delta * ARM_ACTION_SCALE).clamp(-ARM_MAX_JOINT_DELTA_PER_STEP, ARM_MAX_JOINT_DELTA_PER_STEP)
+                new_targets = (current + step_delta).clamp(limits[:, :, 0], limits[:, :, 1])
             base_env._standing_arm_motion_targets[:, :n_active] = new_targets
 
             obs, _, dones, _ = wrapped_env.step(action)
@@ -755,7 +1073,7 @@ def _write_bucket_summary(detailed_csv_path: str, fields: list[str], row: dict) 
 _STANDING_STABILITY_FIELDS = [
     "episodes", "fall_rate", "mean_episode_steps", "mean_max_tilt_deg",
     "mean_min_base_height_m", "mean_max_lin_speed_m_s", "mean_max_ang_speed_rad_s",
-    "mean_step_count", "mean_max_foot_air_time_s",
+    "mean_step_count", "mean_max_foot_air_time_s", "mean_max_abs_torso_deg",
 ]
 
 
@@ -769,6 +1087,9 @@ def _standing_stability_summary_row(rows: list[dict]) -> dict | None:
     if not rows:
         return None
     fall_rate = sum(int(r["fell"]) for r in rows) / len(rows)
+    # Torso rotation column only exists in CSVs written after 2026-07-15 (see
+    # StandingMetricsCsvWrapper) — guard so re-summarizing an older detailed CSV still works.
+    mean_max_torso = _mean(rows, "max_abs_torso_deg")
     return {
         "episodes": len(rows),
         "fall_rate": f"{fall_rate:.4f}",
@@ -779,6 +1100,7 @@ def _standing_stability_summary_row(rows: list[dict]) -> dict | None:
         "mean_max_ang_speed_rad_s": f"{_mean(rows, 'max_ang_speed_rad_s'):.3f}",
         "mean_step_count": f"{_mean(rows, 'step_count'):.2f}",
         "mean_max_foot_air_time_s": f"{_mean(rows, 'max_foot_air_time_s'):.3f}",
+        "mean_max_abs_torso_deg": f"{mean_max_torso:.2f}" if mean_max_torso is not None else "",
     }
 
 
@@ -841,7 +1163,13 @@ def _arm_attempt_summary_row(attempt_rows: list[dict]) -> dict | None:
         row["concluded_attempts"] = len(concluded)
         succ = [r for r in concluded if int(r["success"]) == 1]
         if succ:
-            row["mean_steps_to_success"] = f"{_mean(succ, 'attempt_steps'):.1f}"
+            # steps_to_reach = first threshold crossing (dwell-era CSVs, 2026-07-16+);
+            # older CSVs concluded attempts at first crossing, so attempt_steps meant the
+            # same thing there — fall back to it when the new column is absent/empty.
+            steps_to_success = _mean(succ, "steps_to_reach")
+            if steps_to_success is None:
+                steps_to_success = _mean(succ, "attempt_steps")
+            row["mean_steps_to_success"] = f"{steps_to_success:.1f}"
     return row
 
 
@@ -906,11 +1234,62 @@ def _write_bucket_summaries(
 # Main
 # ---------------------------------------------------------------------------
 
+def _write_run_meta(run_dir: str):
+    """run_meta.yaml — makes every output directory self-describing (2026-07-14: until
+    now, mapping a `<timestamp>/` folder back to which checkpoints produced it required
+    digging through whichever overnight log happened to invoke this script — the run
+    folders themselves recorded nothing)."""
+    try:
+        git_commit = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            capture_output=True, text=True, timeout=10,
+        ).stdout.strip() or None
+    except OSError:
+        git_commit = None
+
+    meta = {
+        "script": os.path.abspath(__file__),
+        "git_commit": git_commit,
+        "started_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "checkpoints": {
+            "standing": args_cli.standing_checkpoint,
+            "walking": args_cli.walking_checkpoint,
+            "arm": args_cli.arm_checkpoint,
+        },
+        "arm_hidden_dims": args_cli.arm_hidden_dims,
+        "num_envs": args_cli.num_envs,
+        "seed": args_cli.seed,
+        "steps": {
+            "standing_still": args_cli.steps_standing_still,
+            "walking_straight": args_cli.steps_walking_straight,
+            "arm_reach_per_bucket": args_cli.steps_arm_reach,
+        },
+        "max_steps_per_goal": args_cli.max_steps_per_goal,
+        "edge_margin_m": args_cli.edge_margin_m,
+        "skip_edge_bucket": args_cli.skip_edge_bucket,
+        "forward_speed": args_cli.forward_speed,
+        "arm_driver": args_cli.arm_driver,
+        "arm_gains": {
+            "standing_held_arm": list(_STANDING_ARM_GAIN),
+            "active_arm": list(args_cli.active_arm_gain),
+            "walking": list(_WALKING_ARM_GAIN),
+        },
+        "per_goal_arm_teleport": False,  # removed 2026-07-14 — see _ArmAttemptTracker.start_new_attempts
+        "goal_dwell_until_timeout": True,  # 2026-07-16 — see _ArmAttemptTracker.step; pre-fix runs resampled on first success
+    }
+    meta_path = os.path.join(run_dir, "run_meta.yaml")
+    with open(meta_path, "w") as f:
+        yaml.safe_dump(meta, f, sort_keys=False)
+    print(f"[Eval] Run metadata: {meta_path}")
+
+
 def main():
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     output_root = args_cli.output_root or os.path.join(os.path.dirname(os.path.abspath(__file__)))
     run_dir = os.path.join(output_root, timestamp)
     os.makedirs(run_dir, exist_ok=True)
+    _write_run_meta(run_dir)
 
     print(f"[Eval] Standing checkpoint : {args_cli.standing_checkpoint}")
     print(f"[Eval] Walking checkpoint  : {args_cli.walking_checkpoint}")
@@ -924,9 +1303,8 @@ def main():
 
     print("[Eval] Loading policies...")
     agent_cfg = G1LocomotionFlatPPORunnerCfg()
-    dummy_wrapped = RslRlVecEnvWrapper(base_env)
-    standing_policy = _load_loco_policy(dummy_wrapped, agent_cfg, args_cli.standing_checkpoint, device)
-    walking_policy = _load_loco_policy(dummy_wrapped, agent_cfg, args_cli.walking_checkpoint, device)
+    standing_policy = _load_loco_policy(base_env, agent_cfg, args_cli.standing_checkpoint, device)
+    walking_policy = _load_loco_policy(base_env, agent_cfg, args_cli.walking_checkpoint, device)
     arm_policy = _load_arm_policy(device)
 
     standing_still_csv = _run_standing_still(
@@ -936,17 +1314,24 @@ def main():
         base_env, os.path.join(run_dir, "walking_straight"), walking_policy, device
     )
 
-    arm_reach_specs = [(side, False) for side in ("left", "right")]
-    if not args_cli.skip_edge_bucket:
-        arm_reach_specs += [(side, True) for side in ("left", "right")]
-
-    arm_reach_results = []
-    for side, edge in arm_reach_specs:
-        bucket_name = f"standing_arm_{side}_reach" + ("_edge" if edge else "")
-        standing_csv, attempt_csv = _run_standing_arm_reach(
-            base_env, os.path.join(run_dir, bucket_name), standing_policy, arm_policy, device, side, edge
+    if args_cli.arm_driver == "event":
+        bucket_name = "standing_arm_event_reach"
+        standing_csv, attempt_csv = _run_standing_arm_event_reach(
+            base_env, os.path.join(run_dir, bucket_name), standing_policy, device
         )
-        arm_reach_results.append((bucket_name, standing_csv, attempt_csv))
+        arm_reach_results = [(bucket_name, standing_csv, attempt_csv)]
+    else:
+        arm_reach_specs = [(side, False) for side in ("left", "right")]
+        if not args_cli.skip_edge_bucket:
+            arm_reach_specs += [(side, True) for side in ("left", "right")]
+
+        arm_reach_results = []
+        for side, edge in arm_reach_specs:
+            bucket_name = f"standing_arm_{side}_reach" + ("_edge" if edge else "")
+            standing_csv, attempt_csv = _run_standing_arm_reach(
+                base_env, os.path.join(run_dir, bucket_name), standing_policy, arm_policy, device, side, edge
+            )
+            arm_reach_results.append((bucket_name, standing_csv, attempt_csv))
 
     base_env.close()
 

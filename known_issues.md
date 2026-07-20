@@ -1,10 +1,96 @@
 # Known Issues / Backlog
 
+> **HISTORICAL ARCHIVE (2026-07-16).** This file is kept because many code comments
+> reference it, but it is NOT maintained as of 2026-07-16 and several "open" entries
+> below are resolved or superseded. The authoritative current state and next steps live
+> in `definitive_next_steps.md` (repo root). Do not act on this file without checking
+> there first.
+
 Running list of things discovered during actual work that were deliberately deferred
 rather than fixed immediately — so they don't get lost or silently re-discovered later.
 Not a duplicate of the roadmap plan; this is specifically things found *while doing* the
 work, with enough context to act on them later. Update this file directly when an item
 gets resolved (move it to the bottom under "Resolved", don't just delete it).
+
+## Standing/integration saga — everything tried so far (running list, last updated 2026-07-14)
+
+Quick-reference index for the standing + arm-integration debugging effort (2026-07-12
+onward) — full narrative detail for each is in this file's other sections / conversation
+history, this is just "what have we already tried, so we don't re-propose it blind."
+
+**Training strategies** (changes to the disturbance mechanism, curriculum, reset
+distribution, or reward shaping — i.e. what the policy is being asked to solve):
+
+- Scripted joint-space arm disturbance (`StandingArmTrajectoryDisturbance`, 5-phase
+  curriculum) — the original mechanism standing was first trained under. Superseded, not
+  actively used for new training now.
+- Real per-arm differential-IK disturbance (`StandingArmIKReachDisturbance`) — replaced
+  the scripted trajectory with an actual x/y/z reach target, solved with analytic IK.
+  Adopted, current baseline mechanism.
+- Curriculum ramp (linear fraction 0.15→1.0 between `enable_step`/`ramp_full_step`) on top
+  of the IK disturbance — avoids abrupt disturbance onset. Adopted.
+- Dwell-until-timeout goal cycling — goals now held until `max_steps_per_goal` instead of
+  resampled the instant they're reached, so "reach and hold" actually gets trained.
+  Adopted (2026-07-12).
+- Torso deviation reward re-tightened (`joint_deviation_torso.weight` 0.0 → -0.05) —
+  **tried, measurably didn't help** (integration fall rate flat-to-worse). Dropped.
+- Real arm-IK *policy* driving the disturbance instead of analytic IK — **tried, fixed
+  `standing_still` outright (94%→0% fail) but broke `standing_arm_left_reach` badly
+  (73%→96.5% fail)**, traced to an emergent deep squat. Not currently in the active line.
+- Direct base-height reward (`base_height_l2`, target 0.75m) — **tried, fixed the squat
+  (confirmed via height metrics) but did not improve arm-reach fall rate** (flat-to-
+  slightly-worse). Kept as the current baseline (real, correct fix for a real problem —
+  just not the dominant one).
+- Left-right leg symmetry reward (`leg_symmetry_l2`, legs/hips only, not arms/torso) —
+  **just launched (2026-07-14), results pending.**
+- Widened arm-training root-wobble curriculum (roll/pitch 5.7°→20°, added yaw-rate/
+  lin-vel axes) — real-motion (`fix_root_link=False`) attempt failed during play-testing
+  (robot fell face-first, no active balance controller) and was reverted to
+  synthetic-observation-only wobble; the wider synthetic-wobble + wide-net retrain was
+  shelved (integration got worse, not better).
+- Real-hardware PD gain standardization (60/1.5 stiffness/damping across the whole
+  pipeline) — **tried, reverted**: helped standing (best native tilt result) but crashed
+  arm-IK reach success 86%→30% and broke walking, confirmed root cause was Isaac Lab's PD
+  actuator having no gravity-compensation feedforward (real SDK's low gains assume one
+  exists in the real robot's own controller).
+- Per-bucket/per-mode live gain switching (deployment-side, not training) — replaced the
+  single global gain override with `write_joint_stiffness_to_sim` calls matched to
+  whichever policy is actually in control at that moment. Adopted.
+- Null-space regularization for the arm policy (uniform, then 3x-weighted on
+  `elbow_pitch`) — real, measurable precision improvement (mean/p90 distance down) but
+  **did not fix** the underlying redundancy/branch-selection issue either way. Kept
+  (real positive effect), redundancy issue still open.
+- Exponential proximity reward bonus for the arm policy — **tried, reverted**: caused a
+  large regression (55%→11-14% success), a "good enough short of the goal" local optimum.
+- Goal-curriculum (40%→100% workspace) for the arm policy — **tried, dropped**: worse
+  success rate than no curriculum at all.
+- Reachability-driven `_GOAL_BOUNDS` reshaping (pulled in the far corner, pushed the
+  near-torso corner out past the collision margin) — **adopted**, confirmed the dominant
+  fix for the arm policy's original ~55% plateau (74.7%/76.8% immediately, 85.6%/84.6%
+  after a second refinement).
+- Per-joint/per-bound joint-limit margin relaxation (`elbow_pitch` lower bound only) —
+  **tried, no effect** on success rate or on the near-limit-branch mechanism it targeted.
+
+**Policy strategies** (changes to network architecture or the PPO algorithm itself, same
+task definition):
+
+- Wide actor/critic network ([512,256,128] vs. [256,128,64]) for the arm policy — **the
+  one clearly reproducible win** across two separate baselines (best p90/tail both times).
+  Adopted into the consolidated arm policy.
+- Entropy coefficient increase (0.0 → 0.01/0.005) for the arm policy — mixed: a real
+  success-rate win at 0.01 (consistent across two buckets), but a large regression when
+  bundled with the exponential reward bonus at 0.005 (see above — the two were never
+  cleanly isolated in that run). Not adopted into the final consolidated policy.
+- PPO hyperparameter tuning (`num_learning_epochs` 5→8) — **tried, no clear effect**,
+  lowest-confidence of the arm-policy sweep experiments. Not adopted.
+- Mirror-symmetric PPO data augmentation (`RslRlSymmetryCfg`, `compute_symmetric_states`)
+  — **adopted for walking**, fixed an observed asymmetric-gait failure mode. **Never
+  ported to standing** — deliberately, since the arm-disturbance curriculum is
+  intentionally asymmetric sometimes (left/right-only reach) and a naive reuse would need
+  to correctly re-map which arm is "active" under the mirror transform. Directly related
+  to why `leg_symmetry_l2` above is a reward-term approach instead of data augmentation.
+- Wider network + widened wobble curriculum together for the arm policy (see above) —
+  shelved as a bundle, not individually attributable within that run.
 
 ## Arm policy — current state, for discussion (last updated 2026-07-08)
 

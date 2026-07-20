@@ -100,6 +100,7 @@ from g1_locomotion.tasks.manager_based.g1_arm.g1_arm_env import G1ArmIKEnv, G1Ar
 
 # Reuse the exact same per-episode metrics wrapper training runs use — keeps the eval's
 # numbers directly comparable to what you'd see in a run's arm_detailed.csv.
+from g1_locomotion.utils.eval_meta import write_eval_meta
 from g1_locomotion.utils.metrics_wrappers import ArmMetricsCsvWrapper
 from rsl_rl.runners import OnPolicyRunner
 
@@ -214,6 +215,7 @@ def main():
     checkpoint_dir = os.path.dirname(os.path.abspath(args_cli.checkpoint))
     eval_root = os.path.join(checkpoint_dir, "arm_eval")
     os.makedirs(eval_root, exist_ok=True)
+    write_eval_meta(eval_root, args_cli, __file__)
 
     print(f"[Eval] Checkpoint : {args_cli.checkpoint}")
     print(f"[Eval] Buckets    : {args_cli.buckets}")

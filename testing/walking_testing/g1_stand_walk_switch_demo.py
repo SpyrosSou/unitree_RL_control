@@ -70,6 +70,25 @@ SWITCH_TO_STAND_SPEED_THRESHOLD = 0.22
 TRANSITION_STEPS_TO_WALK = 10
 TRANSITION_STEPS_TO_STAND = 22
 
+# Arm joints to hold at their default pose. Both checkpoints emit actions for these
+# (the "joint_pos" action term covers every joint, [".*"]), but the standing policy's
+# arm-channel outputs were never trained for direct control — during standing training
+# (G1LocomotionStandingFlatEnvCfg) arm targets came from a separate curriculum event,
+# not the policy's own output — so running them raw here is why arms flail. Zeroing
+# these action columns holds arms at the default pose instead.
+ARM_JOINT_NAMES = [
+    "left_shoulder_pitch_joint",
+    "left_shoulder_roll_joint",
+    "left_shoulder_yaw_joint",
+    "left_elbow_pitch_joint",
+    "left_elbow_roll_joint",
+    "right_shoulder_pitch_joint",
+    "right_shoulder_roll_joint",
+    "right_shoulder_yaw_joint",
+    "right_elbow_pitch_joint",
+    "right_elbow_roll_joint",
+]
+
 parser = argparse.ArgumentParser(description="Interactive G1 stand/walk policy switch demo.")
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
@@ -160,6 +179,7 @@ class G1StandWalkSwitchDemo:
 
         self.standing_policy = self._load_policy(agent_cfg, self.standing_checkpoint)
         self.walking_policy = self._load_policy(agent_cfg, self.walking_checkpoint)
+        self._arm_action_ids = self._resolve_arm_action_indices()
 
         self.mode = "standing"
         self.mode_steps = 0
@@ -178,6 +198,13 @@ class G1StandWalkSwitchDemo:
         runner = OnPolicyRunner(self.env, agent_cfg.to_dict(), log_dir=None, device=self.device)
         runner.load(checkpoint)
         return runner.get_inference_policy(device=self.device)
+
+    def _resolve_arm_action_indices(self) -> torch.Tensor:
+        """Action-vector columns (in "joint_pos" term order) that drive arm joints."""
+        action_term = self.env.unwrapped.action_manager.get_term("joint_pos")
+        term_joint_names = list(action_term._joint_names)
+        arm_ids = [term_joint_names.index(name) for name in ARM_JOINT_NAMES if name in term_joint_names]
+        return torch.tensor(arm_ids, device=self.device, dtype=torch.long)
 
     def _create_camera(self):
         stage = get_current_stage()
@@ -277,7 +304,9 @@ class G1StandWalkSwitchDemo:
     def select_action(self, obs: torch.Tensor) -> torch.Tensor:
         if not self._in_transition:
             policy = self.walking_policy if self.mode == "walking" else self.standing_policy
-            return policy(obs)
+            action = policy(obs)
+            action[:, self._arm_action_ids] = 0.0
+            return action
 
         alpha = min((self._transition_step + 1) / float(self._transition_total_steps), 1.0)
         from_policy = (
@@ -288,6 +317,7 @@ class G1StandWalkSwitchDemo:
         from_action = from_policy(obs)
         to_action = to_policy(obs)
         action = (1.0 - alpha) * from_action + alpha * to_action
+        action[:, self._arm_action_ids] = 0.0
 
         self._transition_step += 1
         if self._transition_step >= self._transition_total_steps:

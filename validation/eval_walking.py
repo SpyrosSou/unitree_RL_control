@@ -104,6 +104,7 @@ from g1_locomotion.tasks.manager_based.g1_locomotion.g1_locomotion_env_cfg impor
 )
 # Reuse the exact same per-episode metrics wrapper training runs use — keeps the eval's
 # numbers directly comparable to what you'd see in a run's walking_detailed.csv.
+from g1_locomotion.utils.eval_meta import write_eval_meta
 from g1_locomotion.utils.metrics_wrappers import WalkingMetricsCsvWrapper
 
 
@@ -221,6 +222,7 @@ def main():
     checkpoint_dir = os.path.dirname(os.path.abspath(args_cli.checkpoint))
     eval_root = os.path.join(checkpoint_dir, "command_eval")
     os.makedirs(eval_root, exist_ok=True)
+    write_eval_meta(eval_root, args_cli, __file__)
 
     print(f"[Eval] Checkpoint : {args_cli.checkpoint}")
     print(f"[Eval] Buckets    : {args_cli.buckets}")

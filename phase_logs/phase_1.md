@@ -1,5 +1,7 @@
 # Phase 1 — Standing + Walking Baseline
 
+> **Archival phase log** — frozen record. Current status lives in `definitive_next_steps.md` (repo root); the integration/debugging endgame is `phase_logs/phase_3.md`. `logging_reference.md` was removed 2026-07-16 — CSV columns are documented in `metrics_wrappers.py` itself.
+
 Plain-language summary of what happened, plus a quick reference for every metric we
 collect. Full technical detail on the metrics lives in `logging_reference.md` — this
 is the condensed version. Date: 6–7 July 2026.

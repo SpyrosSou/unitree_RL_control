@@ -1,5 +1,7 @@
 # Phase 0 — Infrastructure & Cleanup
 
+> **Archival phase log** — frozen record. Current status lives in `definitive_next_steps.md` (repo root); the integration/debugging endgame is `phase_logs/phase_3.md`.
+
 Plain-language summary of what changed and why. Date: 6 July 2026.
 
 ## Repo cleanup

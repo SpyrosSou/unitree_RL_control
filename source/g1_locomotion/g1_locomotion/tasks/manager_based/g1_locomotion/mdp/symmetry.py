@@ -29,10 +29,12 @@ from typing import TYPE_CHECKING
 import torch
 from tensordict import TensorDict
 
+from isaaclab.managers import SceneEntityCfg
+
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
-__all__ = ["compute_symmetric_states"]
+__all__ = ["compute_symmetric_states", "leg_symmetry_l2"]
 
 # Fixed-size observation prefix, in declaration order (see the base velocity ObservationsCfg.PolicyCfg):
 # base_lin_vel(3), base_ang_vel(3), projected_gravity(3), velocity_commands(3) — then joint_pos(N),
@@ -176,3 +178,67 @@ def compute_symmetric_states(
         actions_aug = None
 
     return obs_aug, actions_aug
+
+
+def leg_symmetry_l2(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """Penalize left-right asymmetry in the leg joints (2026-07-14).
+
+    Compares each of ``asset_cfg``'s joints against its mirror partner's sign-corrected value
+    (``_mirror_partner_name``/``_mirror_sign``, the same convention already validated for PPO's
+    own symmetry-augmented training above), and penalizes the squared difference. Pass
+    ``asset_cfg`` with ``joint_names`` covering exactly one side's leg joints (e.g. the six
+    ``left_*`` hip/knee/ankle joints) — every pair only needs checking once, since a left-vs-
+    mirrored-right comparison and its right-vs-mirrored-left counterpart are numerically
+    identical (summing both would just double-count the same asymmetry).
+
+    Deliberately scoped to legs only, not the whole body:
+    - Arms are excluded — a real arm-reach disturbance is *legitimately* asymmetric (e.g. a
+      left-only reach), and this term must never fight that. Since it only sums over whichever
+      joint_ids the caller passes in, simply never including arm joints keeps this structurally
+      incapable of penalizing a real one-armed reach, rather than relying on a small weight to
+      make that penalty negligible.
+    - Torso is excluded — a single, unpaired joint (no left/right mirror partner to compare
+      against) and deliberately left as a free balance-compensation DOF elsewhere
+      (``joint_deviation_torso.weight``) — see that term's own comment for why.
+
+    Gated on double stance (both feet in contact): a corrective step is *necessarily*
+    asymmetric mid-swing (one leg lifted, one planted), and corrective stepping is already
+    this policy's documented weakest skill (see known_issues.md) — an ungated instantaneous
+    penalty would charge ~0.3-0.7 per step for exactly the recovery behavior training is
+    trying to encourage. Walking's mirror-augmentation fix never had this problem because it
+    enforces symmetry *in distribution* (the mirrored trajectory is trained on too), not
+    per-instant. Gating on both feet down targets precisely the observed failure — a
+    persistent lopsided *rest* pose — while a step in progress (either foot airborne) costs
+    nothing. Uses the same ``contact_forces`` sensor / ``current_contact_time > 0``
+    convention the feet_air_time rewards and StandingMetricsCsvWrapper already rely on; if
+    the sensor is missing (it never is in the velocity envs), falls back to ungated.
+
+    Added after visually confirming (g1_full_demo.py, 2026-07-13/14) that a standing checkpoint
+    settles into a persistent, asymmetric rest pose — tilted, uneven legs — with *zero* arm
+    disturbance active, i.e. not something any legitimate disturbance response could justify.
+    Nothing in the existing reward stack constrains this: ``joint_deviation_hip`` only covers
+    hip_yaw/hip_roll deviation from *default*, not left-vs-right agreement with each other, and
+    the walking task's own fix for the identical problem (mirror-augmented PPO training, see
+    ``compute_symmetric_states`` above) was deliberately never ported to standing, since a naive
+    reuse would need to correctly re-map which arm is "active" under the mirror transform too —
+    a real design problem, not just an oversight. This reward-term version sidesteps that
+    entirely: it's independent of PPO's augmentation machinery and only ever looks at legs, so
+    it needs no awareness of which arm (if any) is currently reaching.
+    """
+    asset = env.scene[asset_cfg.name]
+    swap_index, sign = _get_or_build_joint_mirror_maps(asset)
+    joint_pos = asset.data.joint_pos
+    mirrored = _switch_g1_joints_left_right(joint_pos, swap_index, sign)
+    diff = (joint_pos - mirrored)[:, asset_cfg.joint_ids]
+    penalty = torch.sum(torch.square(diff), dim=1)
+
+    contact_sensor = env.scene.sensors.get("contact_forces")
+    if contact_sensor is not None and contact_sensor.data.current_contact_time is not None:
+        foot_ids = getattr(env, "_leg_symmetry_foot_body_ids", None)
+        if foot_ids is None:
+            foot_ids, _ = contact_sensor.find_bodies(".*_ankle_roll_link")
+            env._leg_symmetry_foot_body_ids = foot_ids
+        both_feet_down = (contact_sensor.data.current_contact_time[:, foot_ids] > 0.0).all(dim=-1)
+        penalty = penalty * both_feet_down.float()
+
+    return penalty

@@ -164,6 +164,15 @@ class StandingMetricsCsvWrapper(gym.Wrapper):
         self._episode_max_action_delta_abs = torch.zeros(self._num_envs, dtype=torch.float32, device=self._device)
         self._episode_step_count = torch.zeros(self._num_envs, dtype=torch.long, device=self._device)
         self._episode_max_foot_air_time = torch.zeros(self._num_envs, dtype=torch.float32, device=self._device)
+        # Torso-joint rotation (2026-07-15): added after visually confirming the Phase 1
+        # consolidated checkpoint holds a rotated torso from the start as its bracing
+        # strategy — which displaces the shoulder relative to the pelvis-frame goal box
+        # and swallowed the near-inner reach workspace (goals 100% reachable at 1.8cm
+        # under a nominal posture timed out at 15-20cm under the rotated one). These
+        # columns quantify what until now was only a visual impression in g1_full_demo.
+        self._episode_max_abs_torso = torch.zeros(self._num_envs, dtype=torch.float32, device=self._device)
+        self._episode_sum_abs_torso = torch.zeros(self._num_envs, dtype=torch.float32, device=self._device)
+        self._torso_joint_id: int | None = None
         self._prev_actions: torch.Tensor | None = None
         self._foot_body_ids: list[int] | None = None
 
@@ -188,6 +197,8 @@ class StandingMetricsCsvWrapper(gym.Wrapper):
             "max_action_delta_abs",
             "step_count",
             "max_foot_air_time_s",
+            "max_abs_torso_deg",
+            "mean_abs_torso_deg",
             "arm_disturbance_phase",
             "recovery_tilt_threshold_deg",
         ]
@@ -231,6 +242,8 @@ class StandingMetricsCsvWrapper(gym.Wrapper):
         self._episode_max_action_delta_abs[env_ids] = 0.0
         self._episode_step_count[env_ids] = 0
         self._episode_max_foot_air_time[env_ids] = 0.0
+        self._episode_max_abs_torso[env_ids] = 0.0
+        self._episode_sum_abs_torso[env_ids] = 0.0
         if self._prev_actions is not None:
             self._prev_actions[env_ids] = 0.0
 
@@ -295,6 +308,12 @@ class StandingMetricsCsvWrapper(gym.Wrapper):
         self._episode_max_action_delta_abs = torch.maximum(
             self._episode_max_action_delta_abs, action_delta.detach().float()
         )
+        if self._torso_joint_id is None:
+            torso_ids, _ = robot.find_joints("torso_joint")
+            self._torso_joint_id = torso_ids[0]
+        abs_torso = robot.data.joint_pos[:, self._torso_joint_id].abs().detach().float()
+        self._episode_max_abs_torso = torch.maximum(self._episode_max_abs_torso, abs_torso)
+        self._episode_sum_abs_torso += abs_torso
         self._update_stepping_metrics(env)
         self._prev_actions = action_tensor.detach().clone()
 
@@ -328,6 +347,14 @@ class StandingMetricsCsvWrapper(gym.Wrapper):
                 "max_action_delta_abs": float(self._episode_max_action_delta_abs[env_id].item()),
                 "step_count": int(self._episode_step_count[env_id].item()),
                 "max_foot_air_time_s": float(self._episode_max_foot_air_time[env_id].item()),
+                "max_abs_torso_deg": float(
+                    torch.rad2deg(self._episode_max_abs_torso[env_id]).item()
+                ),
+                "mean_abs_torso_deg": float(
+                    torch.rad2deg(
+                        self._episode_sum_abs_torso[env_id] / max(int(self._episode_steps[env_id].item()), 1)
+                    ).item()
+                ),
                 "arm_disturbance_phase": phase,
                 "recovery_tilt_threshold_deg": self._RECOVERY_TILT_DEG,
             }
