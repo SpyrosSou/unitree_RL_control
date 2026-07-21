@@ -51,7 +51,9 @@ parser.add_argument(
     "--env_cfg", type=str, default="ikreach",
     choices=[
         "ikreach", "torso", "policyreach", "height", "symmetry", "consolidated",
-        "consolidatedtorso", "intent", "noreach",
+        "consolidatedtorso", "intent", "noreach", "ikreachintent", "ikreachintentgainmatch",
+        "ikreachintentgainmatchtorsoclip", "ikreachintentgainmatchtorsolock",
+        "ikreachintentgainmatchtorsocliporienthip", "ikreachintentgainmatchtorsoclipbadorientation",
     ],
     help="Which *_PLAY env cfg to evaluate against — must match what the checkpoint was actually "
     "trained under (2026-07-13, added once a second and third training variant existed): "
@@ -68,9 +70,38 @@ parser.add_argument(
     "physics the checkpoint trained under, so using the wrong cfg here matters even more than for "
     "the reward-only variants), 'consolidatedtorso' = G1LocomotionStandingFlatConsolidatedTorsoEnvCfg_PLAY "
     "(consolidated plus joint_deviation_torso at -0.05) — rewards don't affect inference, kept distinct for the same "
-    "bookkeeping reason as 'torso'. Evaluating a checkpoint against the wrong one of these would "
-    "silently test it against a different disturbance than it trained on, exactly the eval/train "
-    "mismatch this whole script exists to avoid.",
+    "bookkeeping reason as 'torso'. 'ikreachintent' = G1LocomotionStandingFlatIKReachHeightIntentEnvCfg_PLAY "
+    "(2026-07-20 Step 2 first attempt: height's analytic-IK disturbance, joint-ordering bug fixed, plus the "
+    "arm-intent observation AND no_reach_prob=0.15 — 85-D obs; this variant never trained against a stiff active "
+    "arm and collapses under --arm_driver policy, kept only as a documented data point, do not deploy). "
+    "'ikreachintentgainmatch' = G1LocomotionStandingFlatIKReachHeightIntentGainMatchEnvCfg_PLAY (same as "
+    "'ikreachintent' plus match_deployment_arm_gains=True — the fix, matching checkpoints trained on "
+    "G1-Locomotion-Standing-Flat-IKReach-Height-Intent-GainMatch-v0). "
+    "'ikreachintentgainmatchtorsoclip' = G1LocomotionStandingFlatIKReachHeightIntentGainMatchTorsoClipEnvCfg_PLAY "
+    "(2026-07-20: GainMatch plus a hard +/-30deg clip on torso_joint's action range — matching checkpoints "
+    "trained on G1-Locomotion-Standing-Flat-IKReach-Height-Intent-GainMatch-TorsoClip-v0). "
+    "'ikreachintentgainmatchtorsolock' = G1LocomotionStandingFlatIKReachHeightIntentGainMatchTorsoLockEnvCfg_PLAY "
+    "(sibling to torsoclip: a full 0-width lock on torso_joint instead of +/-30deg — matching checkpoints "
+    "trained on G1-Locomotion-Standing-Flat-IKReach-Height-Intent-GainMatch-TorsoLock-v0). Neither action-space "
+    "clip changes the obs/reward shape, only what torso_joint can be commanded to, so these are safe to confuse "
+    "with 'ikreachintentgainmatch' in terms of loading, but NOT in terms of what the checkpoint was actually "
+    "trained to expect from that joint. Evaluating a checkpoint against the wrong "
+    "one of these would silently test it against a different disturbance than it trained on, exactly the "
+    "eval/train mismatch this whole script exists to avoid. "
+    "'ikreachintentgainmatchtorsocliporienthip' = "
+    "G1LocomotionStandingFlatIKReachHeightIntentGainMatchTorsoClipOrientHipEnvCfg_PLAY (2026-07-21: TorsoClip "
+    "plus flat_orientation_l2 -1.0->-3.0 and joint_deviation_hip -0.1->-0.5, both inherited unchanged from the "
+    "walking-tuned G1RoughEnvCfg until now — matching checkpoints trained on "
+    "G1-Locomotion-Standing-Flat-IKReach-Height-Intent-GainMatch-TorsoClip-OrientHip-v0). This DOES change reward "
+    "shape but reward doesn't affect a frozen policy's inference — kept distinct from 'ikreachintentgainmatchtorsoclip' "
+    "for the same action-space-match reason as the other torso variants (same +/-30deg clip). "
+    "'ikreachintentgainmatchtorsoclipbadorientation' = "
+    "G1LocomotionStandingFlatIKReachHeightIntentGainMatchTorsoClipBadOrientationEnvCfg_PLAY (2026-07-21: TorsoClip "
+    "plus a hard bad_orientation termination at limit_angle=0.8 — Unitree's own value, see that class's docstring. "
+    "Terminations DON'T affect a frozen policy's inference either (only training), but kept distinct for the same "
+    "bookkeeping reason as every other sibling here — evaluating against the wrong _PLAY cfg means testing the "
+    "wrong torso action-space clip, independent of whether the reward/termination difference itself matters "
+    "post-training).",
 )
 parser.add_argument(
     "--freeze_arms", action="store_true",
@@ -120,6 +151,12 @@ from g1_locomotion.tasks.manager_based.g1_locomotion.g1_locomotion_env_cfg impor
     G1LocomotionStandingFlatConsolidatedTorsoEnvCfg_PLAY,
     G1LocomotionStandingFlatIKReachEnvCfg_PLAY,
     G1LocomotionStandingFlatIKReachHeightEnvCfg_PLAY,
+    G1LocomotionStandingFlatIKReachHeightIntentEnvCfg_PLAY,
+    G1LocomotionStandingFlatIKReachHeightIntentGainMatchEnvCfg_PLAY,
+    G1LocomotionStandingFlatIKReachHeightIntentGainMatchTorsoClipBadOrientationEnvCfg_PLAY,
+    G1LocomotionStandingFlatIKReachHeightIntentGainMatchTorsoClipEnvCfg_PLAY,
+    G1LocomotionStandingFlatIKReachHeightIntentGainMatchTorsoClipOrientHipEnvCfg_PLAY,
+    G1LocomotionStandingFlatIKReachHeightIntentGainMatchTorsoLockEnvCfg_PLAY,
     G1LocomotionStandingFlatIKReachHeightSymmetryEnvCfg_PLAY,
     G1LocomotionStandingFlatIKReachTorsoEnvCfg_PLAY,
     G1LocomotionStandingFlatPolicyReachEnvCfg_PLAY,
@@ -150,6 +187,12 @@ _ENV_CFG_CLASSES = {
     # matching only checkpoints trained on G1-Locomotion-Standing-Flat-Consolidated-Intent-v0.
     "intent": G1LocomotionStandingFlatConsolidatedIntentEnvCfg_PLAY,
     "noreach": G1LocomotionStandingFlatConsolidatedNoReachEnvCfg_PLAY,
+    "ikreachintent": G1LocomotionStandingFlatIKReachHeightIntentEnvCfg_PLAY,
+    "ikreachintentgainmatch": G1LocomotionStandingFlatIKReachHeightIntentGainMatchEnvCfg_PLAY,
+    "ikreachintentgainmatchtorsoclip": G1LocomotionStandingFlatIKReachHeightIntentGainMatchTorsoClipEnvCfg_PLAY,
+    "ikreachintentgainmatchtorsolock": G1LocomotionStandingFlatIKReachHeightIntentGainMatchTorsoLockEnvCfg_PLAY,
+    "ikreachintentgainmatchtorsocliporienthip": G1LocomotionStandingFlatIKReachHeightIntentGainMatchTorsoClipOrientHipEnvCfg_PLAY,
+    "ikreachintentgainmatchtorsoclipbadorientation": G1LocomotionStandingFlatIKReachHeightIntentGainMatchTorsoClipBadOrientationEnvCfg_PLAY,
 }
 
 
@@ -202,6 +245,7 @@ def main():
             obs, _, _, _ = wrapped_env.step(action)
 
     metrics_env._csv.close()
+    metrics_env._write_joint_diagnostics()
     detailed_path = metrics_env.csv_path
     base_env.close()
 

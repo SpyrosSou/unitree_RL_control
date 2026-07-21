@@ -220,6 +220,16 @@ def main():
     steps_per_goal = int(round(args_cli.seconds_per_goal * _CONTROL_HZ))
     term.max_steps_per_goal = steps_per_goal
 
+    # Ground truth for the joint-ordering question (2026-07-20): find_joints returns
+    # asset order, and the term's per-side column mapping must pair with it — print the
+    # resolved order so every run documents whether the asset interleaves left/right.
+    resolved_names = [robot.joint_names[i] for i in term._all_joint_ids.tolist()]
+    print(f"[IKAccuracy] _all_joint_ids resolved order: {resolved_names}")
+    for side in ("left", "right"):
+        cols = term._col_idx[side].tolist()
+        print(f"[IKAccuracy] {side} col_idx -> columns {cols} "
+              f"({[resolved_names[c] for c in cols]})")
+
     is_floating = args_cli.base == "floating"
     print(f"[IKAccuracy] base={args_cli.base} track={args_cli.track} arm_gain={tuple(args_cli.arm_gain)} "
           f"num_envs={args_cli.num_envs} goals/env={args_cli.num_goals} steps/goal={steps_per_goal} "
@@ -267,7 +277,7 @@ def main():
                         errs[side].append(err.clone())
                         # Still slewing at the rate limit at goal end = never converged
                         # (vs. converged-but-wrong, which sits still at the miss).
-                        side_slew = target_slew[:, term._col_slice[side]].amax(dim=-1)
+                        side_slew = target_slew[:, term._col_idx[side]].amax(dim=-1)
                         slews[side].append((side_slew >= 0.9 * term.max_joint_delta_per_step).clone())
 
                 prev_targets.copy_(term._targets)

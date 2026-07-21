@@ -9,10 +9,13 @@ These classes inherit from Isaac Lab's pre-built G1 velocity-tracking environmen
 Override any field here to tune or extend the base configs.
 """
 
+import math
+
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
+from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.utils import configclass
 
 from . import mdp
@@ -363,6 +366,375 @@ class G1LocomotionStandingFlatIKReachHeightEnvCfg(G1LocomotionStandingFlatIKReac
 
 @configclass
 class G1LocomotionStandingFlatIKReachHeightEnvCfg_PLAY(G1LocomotionStandingFlatIKReachHeightEnvCfg):
+    """Eval variant, same pattern as G1LocomotionStandingFlatIKReachEnvCfg_PLAY."""
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.observations.policy.enable_corruption = True
+        self.events.standing_arm_motion_disturbance.params["enable_step"] = 0
+        self.events.standing_arm_motion_disturbance.params["ramp_full_step"] = 0
+
+
+@configclass
+class G1LocomotionStandingFlatIKReachHeightIntentEnvCfg(G1LocomotionStandingFlatIKReachHeightEnvCfg):
+    """Step 2 of the 2026-07-20 IK-fix recovery (definitive_next_steps.md): height_reward's
+    own recipe (analytic-IK disturbance + base_height_l2, this class's parent) plus the two
+    add-ons already proven independently on the Consolidated (policy-driven-arm) lineage —
+    the arm-intent observation and the no_reach_prob idle slice — carried over to the
+    analytic-IK lineage instead, now that `StandingArmIKReachDisturbance`'s joint-ordering
+    bug is fixed (see events.py's `_col_idx` comment and the doc's 2026-07-20 section).
+
+    Why re-derive from IKReachHeight rather than just re-running Consolidated/
+    ConsolidatedIntent: every checkpoint on disk, height_reward included, was trained
+    against the SAME broken disturbance class (`StandingArmIKReachDisturbance` is also
+    what `StandingArmPolicyReachDisturbance`, i.e. the Consolidated lineage, subclasses
+    and calls `super()._step_side()` /overrides `_step_side` from) — the column-index bug
+    lived in code both lineages exercise. height_reward is the strongest known baseline
+    (0% falls in the 2026-07-16 sweep) and was never combined with either add-on; this is
+    the natural next single retrain rather than re-deriving from a weaker/differently-
+    confounded line.
+
+    Two adds, matching G1LocomotionStandingFlatConsolidatedIntentEnvCfg's own reasoning
+    exactly (see that class's docstring for the full mechanism of each):
+    - `no_reach_prob=0.15` — 15% idle episodes, closes the static-arm distribution hole.
+    - the arm-intent observation (`mdp.standing_arm_motion_targets`, 10-D, appended to
+      the policy obs, 75 -> 85) — lets standing anticipate per-target instead of settling
+      on one fixed bracing posture; produced the best posture ever measured (~8° torso)
+      on the Consolidated line, and directly serves the user's no-rotation requirement.
+
+    Both are now trained against an IK disturbance that actually reaches its goals
+    (p50 miss 0.0cm, ~80-90% within 3-5cm, verified via check_ik_accuracy.py) instead of
+    the ~40-54cm-off version every other checkpoint saw — expect this to be a materially
+    harder disturbance to stay upright against than anything in the 2026-07-16 sweep, per
+    rule 3 in the doc (2 seeds, no single-run conclusions).
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        # No noise: the commanded targets are internally known, not a sensor reading —
+        # same as ConsolidatedIntentEnvCfg's identical line.
+        self.observations.policy.arm_motion_targets = ObsTerm(func=mdp.standing_arm_motion_targets)
+
+        # 15% idle episodes — see class docstring.
+        self.events.standing_arm_motion_disturbance.params["no_reach_prob"] = 0.15
+
+
+@configclass
+class G1LocomotionStandingFlatIKReachHeightIntentEnvCfg_PLAY(G1LocomotionStandingFlatIKReachHeightIntentEnvCfg):
+    """Eval variant, same pattern as G1LocomotionStandingFlatIKReachEnvCfg_PLAY."""
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.observations.policy.enable_corruption = True
+        self.events.standing_arm_motion_disturbance.params["enable_step"] = 0
+        self.events.standing_arm_motion_disturbance.params["ramp_full_step"] = 0
+
+
+@configclass
+class G1LocomotionStandingFlatIKReachHeightIntentGainMatchEnvCfg(G1LocomotionStandingFlatIKReachHeightIntentEnvCfg):
+    """IKReachHeightIntent (parent) plus exactly one addition: `match_deployment_arm_gains`
+    on the arm-reach disturbance term.
+
+    2026-07-20, same day as the parent's own first training run: that run (checkpoint
+    `2026-07-20_11-32-18_ikreach_height_intent`, kept on disk as a documented data point,
+    NOT deleted) passed its gate (0% falls, static-arm hole closed) and held up reasonably
+    under its own training disturbance (event-mode integration: 55% falls) — but collapsed
+    to 99-100% falls specifically in `--arm_driver policy` integration buckets, the actual
+    deployment condition. Root cause, confirmed by cross-referencing which buckets change
+    which variable: `eval_full_demo.py`'s policy-mode reach buckets
+    (`_run_standing_arm_reach`) set the actively-reaching arm to `--active_arm_gain`
+    (default 200/20, matching the arm-IK policy's own training gain) while the held arm
+    and everything else stays at 60/1.5 — event mode never touches gains at all (always
+    60/1.5, `_run_standing_arm_event_reach`), which is exactly why event mode looked fine
+    while policy mode collapsed. The parent config never enabled
+    `match_deployment_arm_gains`, so it never once trained against a 200/20-stiff arm's
+    reaction torques before meeting one for the first time at eval — the identical failure
+    mode the project's 2026-07-14 notes already diagnosed and that motivated adding this
+    exact flag to `StandingArmIKReachDisturbance` in the first place (previously exercised
+    only by the separate Consolidated/policy-driven-disturbance lineage, never carried
+    over to the analytic-IK lineage until now).
+
+    Deliberately the ONLY change from the parent (single-variable discipline) — do NOT
+    also add a torso-specific lever in the same run (e.g. a new posture term): the parent
+    config already carries the one proven-safe torso lever (the arm-intent observation),
+    torso-deviation reward penalties are a confirmed dead end (tried twice, see the
+    experiment verdicts table — do not retry a third time), and this run already gives a
+    free read on whether intent+height+now-correct-gains resolves the torso lift/tilt the
+    user flagged 2026-07-20 (`mean_max_abs_torso_deg`, plus a visual check) — no need to
+    add anything new to get that signal, and adding one now would confound whether it was
+    the gain fix or the new lever that changed the outcome.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.events.standing_arm_motion_disturbance.params["match_deployment_arm_gains"] = True
+
+
+@configclass
+class G1LocomotionStandingFlatIKReachHeightIntentGainMatchEnvCfg_PLAY(
+    G1LocomotionStandingFlatIKReachHeightIntentGainMatchEnvCfg
+):
+    """Eval variant, same pattern as G1LocomotionStandingFlatIKReachEnvCfg_PLAY."""
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.observations.policy.enable_corruption = True
+        self.events.standing_arm_motion_disturbance.params["enable_step"] = 0
+        self.events.standing_arm_motion_disturbance.params["ramp_full_step"] = 0
+
+
+@configclass
+class G1LocomotionStandingFlatIKReachHeightIntentGainMatchTorsoClipEnvCfg(
+    G1LocomotionStandingFlatIKReachHeightIntentGainMatchEnvCfg
+):
+    """GainMatch (parent, fixes the arm-gain-mismatch fall collapse) plus exactly one more
+    change: a hard clip on `torso_joint`'s commanded action range, +/-30 degrees.
+
+    2026-07-20, found via the new per-joint diagnostics (metrics_wrappers.py's
+    joint_diagnostics.csv) plus a live g1_full_demo.py check the user did by eye:
+    `torso_joint` sits at 60-70deg even completely at rest (freeze_arms gate, 0% falls),
+    climbing to ~120deg under active reaching — well past what any legitimate standing/
+    reaching posture needs, and visually confirmed as "clearly wrong," not just a number.
+    Root cause (traced via max_action_abs, which peaked at ~45 in that same checkpoint —
+    wildly outside a normal PPO actor's range): the stock G1FlatEnvCfg's ActionsCfg.joint_pos
+    (`JointPositionActionCfg(joint_names=[".*"], scale=0.5)`) sets NO clip at all on any
+    joint, so nothing stops the policy from requesting an arbitrarily large target for any
+    one DOF — torso_joint just happened to be the one PPO found and exploited as a free,
+    unpenalized (no reward term prices in torso deviation at all in this recipe) way to
+    sit somewhere. It isn't reward-tunable the way the two prior torso experiments assumed
+    (torso_retighten/consolidated_torso, both dead ends — see the experiment verdicts
+    table): those added a deviation PENALTY, which the policy must learn to respect and
+    which fights any legitimate corrective use of the joint; this is a hard, deterministic
+    ACTION-SPACE constraint instead, applied only to this one joint, every other joint
+    (including the rest of `.*`) completely untouched.
+
+    `clip` on `JointPositionActionCfg` is applied to the FINAL commanded target (i.e.
+    already scale+offset'd, in real joint-angle radians) — see
+    isaaclab/envs/mdp/actions/joint_actions.py's `process_actions`: `processed = raw*scale
+    + offset`, THEN clamped to `clip`. So bounding torso_joint directly to +/-30deg here
+    is exact, not an indirect scale/raw-action guess. +/-30deg (not a full lock/exclusion
+    from the action space) is a deliberate choice: `torso_joint` is a waist YAW joint,
+    real recovery-authority for counteracting reach-induced angular momentum — removing it
+    entirely risks quietly hurting disturbance recovery in a way that wouldn't show up
+    until later. +/-30deg keeps meaningful authority while making the observed exploit
+    (60-120deg) physically impossible.
+
+    MUST be retrained, not just clipped post-hoc on an already-trained checkpoint: this
+    changes what the environment lets the policy do, i.e. the dynamics it's optimized
+    against, not a filter bolted onto a frozen network — deploying the existing GainMatch
+    checkpoint under a newly-clipped action space it never trained within would be exactly
+    the kind of train/deploy mismatch this whole day has been about eliminating (see the
+    2026-07-20 gain-mismatch section above).
+
+    Sibling experiment to G1LocomotionStandingFlatIKReachHeightIntentGainMatchTorsoLockEnvCfg
+    (+/-30deg here vs. a full 0-width lock there) — 2026-07-20, explicit user call: run ONE
+    seed of EACH clip width rather than two seeds of this one, to directly answer whether
+    the "keep some recovery authority" concern above is real before spending a second seed
+    confirming just this width. A single seed of each is a real, if smaller, signal than
+    zero seeds of the comparison; revisit with a second seed per width once one direction
+    looks like the right one.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.actions.joint_pos.clip = {"torso_joint": (-math.radians(30.0), math.radians(30.0))}
+
+
+@configclass
+class G1LocomotionStandingFlatIKReachHeightIntentGainMatchTorsoClipEnvCfg_PLAY(
+    G1LocomotionStandingFlatIKReachHeightIntentGainMatchTorsoClipEnvCfg
+):
+    """Eval variant, same pattern as G1LocomotionStandingFlatIKReachEnvCfg_PLAY."""
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.observations.policy.enable_corruption = True
+        self.events.standing_arm_motion_disturbance.params["enable_step"] = 0
+        self.events.standing_arm_motion_disturbance.params["ramp_full_step"] = 0
+
+
+@configclass
+class G1LocomotionStandingFlatIKReachHeightIntentGainMatchTorsoClipOrientHipEnvCfg(
+    G1LocomotionStandingFlatIKReachHeightIntentGainMatchTorsoClipEnvCfg
+):
+    """TorsoClip (parent, +/-30deg hard action-space cap on torso_joint) plus strengthening
+    two reward terms that were already active this whole time but never retuned for
+    standing: `flat_orientation_l2` (tilt penalty, inherited at -1.0) and
+    `joint_deviation_hip` (hip_yaw/hip_roll deviation penalty, inherited at -0.1) — both
+    come unchanged from G1RoughEnvCfg, tuned for a WALKING gait that legitimately needs
+    some sway and hip motion, never revisited for standing specifically.
+
+    2026-07-21: after retraining Clip/Lock, gate-eval (idle, arms frozen, 0% falls in
+    every one of these checkpoints) tilt got WORSE once torso was capped, not better —
+    GainMatch 8.42deg -> Clip 37.19deg -> Lock 25.80deg — even though torso itself is now
+    correctly bounded (60.3deg -> 32.2deg -> 0.7deg). Cross-checked against
+    joint_diagnostics.csv's frac_of_soft_limit_used on hip_roll (native eval): GainMatch
+    left/right 10.9%/27.1% -> Clip 60.7%/10.9% -> Lock 55.2%/30.9% — a dramatic jump on
+    whichever hip is doing the compensating. Live g1_full_demo.py check (user, by eye)
+    confirmed both Clip and Lock stand with legs spread far wider than GainMatch and a
+    visually obvious, unacceptable amount of tilt.
+
+    Conclusion: GainMatch's comparatively normal-looking idle pose was never actually the
+    product of these two reward terms working — it was torso rotation acting as a free,
+    unpenalized escape hatch that happened to look tolerable. Capping that hatch (correctly
+    — the 60-120deg twist was real and had to go, see TorsoClip's own docstring) didn't
+    remove the underlying balance-compensation need, it just forced it onto the next-
+    cheapest lever: hip abduction. -1.0/-0.1 apparently aren't strong enough to price that
+    trade-off correctly once the cheaper option is gone — they were only ever "good enough"
+    while masked by the free DOF.
+
+    -3.0 / -0.5 below are starting points, not tuned values (same spirit as
+    base_height_l2's own -10.0 starting point) — check standing's reward curves after
+    training and adjust if either term isn't discouraging the compensation enough or is
+    fighting legitimate disturbance-recovery motion too hard to let it absorb anything.
+    Deliberately built on TorsoClip, not TorsoLock: Lock is dropped as a direction as of
+    today (numerically worse on every axis in the policy-mode integration eval AND
+    visually worse live — see the 2026-07-21 write-up in definitive_next_steps.md) —
+    keeping SOME torso authority while ALSO pricing in tilt/hip-deviation properly is the
+    live hypothesis being tested here, not a fallback to reconsider Lock later.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.rewards.flat_orientation_l2.weight = -3.0
+        self.rewards.joint_deviation_hip.weight = -0.5
+
+
+@configclass
+class G1LocomotionStandingFlatIKReachHeightIntentGainMatchTorsoClipOrientHipEnvCfg_PLAY(
+    G1LocomotionStandingFlatIKReachHeightIntentGainMatchTorsoClipOrientHipEnvCfg
+):
+    """Eval variant, same pattern as G1LocomotionStandingFlatIKReachEnvCfg_PLAY."""
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.observations.policy.enable_corruption = True
+        self.events.standing_arm_motion_disturbance.params["enable_step"] = 0
+        self.events.standing_arm_motion_disturbance.params["ramp_full_step"] = 0
+
+
+@configclass
+class G1LocomotionStandingFlatIKReachHeightIntentGainMatchTorsoClipBadOrientationEnvCfg(
+    G1LocomotionStandingFlatIKReachHeightIntentGainMatchTorsoClipEnvCfg
+):
+    """TorsoClip (parent, +/-30deg hard action-space cap on torso_joint) plus one addition:
+    a hard TERMINATION on excessive whole-body tilt, `isaaclab.envs.mdp.bad_orientation`
+    (checks the angle between the projected-gravity vector and the z-axis, i.e. whole-body
+    tilt from vertical — the SAME quantity this project's own eval scripts already log as
+    `mean_max_tilt_deg`, just applied live during training instead of only measured after).
+
+    2026-07-21: found while comparing our reward stack against Unitree's own G1 velocity-
+    task recipe (~/Elm/Code/unitree_rl_lab, source/unitree_rl_lab/unitree_rl_lab/tasks/
+    locomotion/robots/g1/29dof/velocity_env_cfg.py — real, hardware-deployed). Their
+    TerminationsCfg has `bad_orientation = DoneTerm(func=mdp.bad_orientation,
+    params={"limit_angle": 0.8})` in addition to a time_out and a height-floor
+    termination; ours (inherited from G1FlatEnvCfg/G1RoughEnvCfg) only ever terminates on
+    time_out and base_contact (actually touching the ground) — orientation itself has
+    never been anything but a soft reward cost here, at any point in this project's
+    history.
+
+    Why this is a structurally different fix from every other lever pulled so far
+    (torso_retighten, consolidated_torso, leg_symmetry_l2, the torso action clip, tonight's
+    OrientHip reward-reweight sibling): every one of those prices in ONE specific joint or
+    joint group. PPO can always trade a soft per-joint cost against the disturbance-
+    recovery benefit of using that joint, and when one joint gets constrained (torso,
+    2026-07-20) the exact same trade just re-forms around whichever joint is now cheapest
+    (hip_roll, discovered the same day). A hard termination on the OUTCOME (excessive
+    tilt) instead of the cause (which joint produced it) can't be dodged that way — it
+    doesn't matter which DOF the policy uses to tilt too far, crossing the line always
+    costs the same (the rest of the episode's reward), so there's no "cheaper joint" to
+    discover and move the exploit to next.
+
+    limit_angle=0.8 (~45.8deg) is Unitree's own literal value, not re-derived — used as a
+    starting point specifically BECAUSE it's a real number from a working, hardware-
+    deployed system, not an arbitrary guess. Flagged risk going in: our own checkpoints
+    already show mean_max_tilt_deg at or above this threshold under active reach recovery
+    (TorsoClip's own native eval: 48.94deg mean-of-episode-max, meaning a real fraction of
+    individual peaks already exceed 45.8deg) — so this will very likely terminate a
+    meaningful share of episodes early, especially before the policy has adapted to it.
+    That pressure is the intended mechanism (it should push the emergent policy toward
+    keeping tilt down across the board, not just on this one checkpoint's current
+    strategy), but it's also the thing to check first if training looks unstable or
+    collapses: if termination fires so often/early that the policy can't discover
+    successful recovery before running out of episode, loosen limit_angle (try 60-70deg)
+    or consider ramping it in via curriculum rather than applying it from step 0.
+
+    Deliberately built on TorsoClip directly, NOT stacked on top of the same day's
+    TorsoClip-OrientHip sibling (reward reweight): single-variable discipline — this tests
+    "does a hard tilt termination alone fix the wide-stance/tilt regression" as an
+    independent data point from "does reweighting flat_orientation_l2/joint_deviation_hip
+    alone fix it." Only combine the two once each has its own result.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.terminations.bad_orientation = DoneTerm(
+            func=mdp.bad_orientation,
+            params={"limit_angle": 0.8},
+        )
+
+
+@configclass
+class G1LocomotionStandingFlatIKReachHeightIntentGainMatchTorsoClipBadOrientationEnvCfg_PLAY(
+    G1LocomotionStandingFlatIKReachHeightIntentGainMatchTorsoClipBadOrientationEnvCfg
+):
+    """Eval variant, same pattern as G1LocomotionStandingFlatIKReachEnvCfg_PLAY."""
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.observations.policy.enable_corruption = True
+        self.events.standing_arm_motion_disturbance.params["enable_step"] = 0
+        self.events.standing_arm_motion_disturbance.params["ramp_full_step"] = 0
+
+
+@configclass
+class G1LocomotionStandingFlatIKReachHeightIntentGainMatchTorsoLockEnvCfg(
+    G1LocomotionStandingFlatIKReachHeightIntentGainMatchEnvCfg
+):
+    """Same as G1LocomotionStandingFlatIKReachHeightIntentGainMatchTorsoClipEnvCfg (see
+    that class's docstring for the full root-cause writeup — identical here) except the
+    clip is a full 0-width lock instead of +/-30deg: `torso_joint`'s commanded target is
+    pinned to exactly its default offset every step, functionally equivalent to excluding
+    the joint from the action space entirely (the "legs" actuator's own 200/5 PD gain
+    holds it there — the same "held rigid" pattern g1_arm_env.py already uses for its own
+    non-RL-actuated joints, just reached via a zero-width clip instead of a smaller
+    action_space, so it's the same mechanism/class as the +/-30deg sibling rather than a
+    structurally different one).
+
+    2026-07-20, explicit user call: run this alongside the +/-30deg version (one seed
+    each) rather than only the softer clip, specifically to test whether keeping SOME
+    torso authority for reach-disturbance recovery actually matters, or whether it was
+    never doing real work and can just be removed outright. Real risk flagged going in:
+    `torso_joint` is a waist YAW joint with plausible legitimate use for counteracting
+    reach-induced angular momentum — a full lock forces the standing policy to solve
+    disturbance recovery entirely through legs/ankles/hips instead. Watch the ACTIVE-reach
+    fall-rate buckets specifically (native + policy-mode integration) for any regression
+    vs. the +/-30deg sibling and vs. GainMatch's own numbers — that's the sentinel for
+    "locking it fully cost real recovery capability," not just whether torso itself reads
+    near 0deg (it will, by construction).
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.actions.joint_pos.clip = {"torso_joint": (0.0, 0.0)}
+
+
+@configclass
+class G1LocomotionStandingFlatIKReachHeightIntentGainMatchTorsoLockEnvCfg_PLAY(
+    G1LocomotionStandingFlatIKReachHeightIntentGainMatchTorsoLockEnvCfg
+):
     """Eval variant, same pattern as G1LocomotionStandingFlatIKReachEnvCfg_PLAY."""
 
     def __post_init__(self):

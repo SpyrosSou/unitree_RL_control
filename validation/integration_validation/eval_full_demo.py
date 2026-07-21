@@ -130,6 +130,22 @@ parser.add_argument(
     "disturbance arm at, so combined with --arm_driver ik the standing policy faces "
     "literally its own training-time disturbance.",
 )
+parser.add_argument(
+    "--torso_clip_deg", type=float, default=None,
+    help="Match the standing checkpoint's OWN torso_joint action clip, in +/-degrees (2026-07-20). "
+    "This env is deliberately built on the walking cfg (G1LocomotionFlatEnvCfg_PLAY, see "
+    "_build_env_cfg's docstring), which has no relationship to the standing lineage's own cfg "
+    "chain — so a clip set on a standing training config (e.g. "
+    "G1LocomotionStandingFlatIKReachHeightIntentGainMatchTorsoClipEnvCfg's +/-30) is NEVER "
+    "carried into this eval unless passed here explicitly. Omitting this for a torso-clip-trained "
+    "checkpoint reproduces the exact pre-fix unclipped exploit (torso pinned at its ~150deg hard "
+    "limit, cascading into falls) — not because the checkpoint regressed, but because it's being "
+    "evaluated under an action space it was never trained within, the same category of "
+    "train/deploy mismatch this whole project has repeatedly hunted down elsewhere. Pass the "
+    "SAME value the checkpoint's own training config used (30 for TorsoClip, 0 for TorsoLock); "
+    "omit entirely (default None = no clip applied) for any checkpoint trained WITHOUT a torso "
+    "clip (GainMatch, height_reward, everything before 2026-07-20 night).",
+)
 parser.add_argument("--num_envs", type=int, default=32, help="Parallel envs per bucket.")
 parser.add_argument(
     "--steps_standing_still", type=int, default=3000, help="Control steps (50 Hz) for the standing_still bucket."
@@ -173,6 +189,7 @@ simulation_app = app_launcher.app
 # ---------------------------------------------------------------------------
 import csv
 import datetime
+import math
 import os
 import subprocess
 
@@ -261,6 +278,16 @@ def _build_env_cfg() -> G1LocomotionFlatEnvCfg_PLAY:
     # behavior to the previous stock JointPositionAction when those two env attributes
     # aren't set (e.g. for walking_straight, which never touches them).
     cfg.actions.joint_pos.class_type = StandingArmBlendJointPositionAction
+
+    # Carry over the standing checkpoint's OWN torso_joint action clip, if any — see
+    # --torso_clip_deg's help text for why this doesn't happen automatically (this env is
+    # built from the walking cfg lineage, unrelated to the standing cfg chain a clip lives
+    # on). Must match whatever the checkpoint was actually trained with, or this eval
+    # silently tests a different action space than the one that produced it.
+    if args_cli.torso_clip_deg is not None:
+        cfg.actions.joint_pos.clip = {
+            "torso_joint": (-math.radians(args_cli.torso_clip_deg), math.radians(args_cli.torso_clip_deg))
+        }
 
     # No arm-gain override here any more (2026-07-12) — no single value serves every
     # policy's own training. Each bucket runner sets the correct gain live via
@@ -786,6 +813,7 @@ def _run_standing_still(base_env, bucket_dir, standing_policy, device):
             action = standing_policy(obs)
             obs, _, _, _ = wrapped_env.step(action)
     metrics_env._csv.close()
+    metrics_env._write_joint_diagnostics()
     print(f"[Eval] standing_still done — {metrics_env.csv_path}")
     return metrics_env.csv_path
 
@@ -869,6 +897,7 @@ def _run_standing_arm_event_reach(base_env, bucket_dir, standing_policy, device)
                             })
             prev_steps, prev_min, prev_active = _snapshot()
     metrics_env._csv.close()
+    metrics_env._write_joint_diagnostics()
     _set_event_disturbance(base_env, False)
 
     goals_csv = os.path.join(bucket_dir, "event_arm_goals.csv")
@@ -981,6 +1010,7 @@ def _run_standing_arm_reach(base_env, bucket_dir, standing_policy, arm_policy, d
             tracker.step(torch.as_tensor(dones, device=device, dtype=torch.bool))
 
     metrics_env._csv.close()
+    metrics_env._write_joint_diagnostics()
     tracker.close()
     print(f"[Eval] {bucket_name} done — {metrics_env.csv_path} / {tracker.csv_path}")
     return metrics_env.csv_path, tracker.csv_path

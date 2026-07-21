@@ -345,9 +345,21 @@ class StandingArmIKReachDisturbance(ManagerTermBase):
         self._arm_joint_names = {"left": _LEFT_ARM_JOINTS, "right": _RIGHT_ARM_JOINTS}
         self._ee_body_name = {"left": _LEFT_EE_BODY, "right": _RIGHT_EE_BODY}
 
-        # Matches _ARM_JOINT_NAMES's ordering (left 5, then right 5) — this is the same
-        # ordering _standing_arm_motion_joint_ids uses (set once, below), so writes into
-        # _standing_arm_motion_targets land in the right columns.
+        # NOTE (2026-07-20): find_joints returns ids in ASSET order (preserve_order
+        # defaults to False), and the G1 articulation orders joints breadth-first, which
+        # INTERLEAVES left/right (L_shoulder_pitch, R_shoulder_pitch, L_shoulder_roll, ...)
+        # — NOT _ARM_JOINT_NAMES's left-block-then-right-block layout. A previous version
+        # assumed block layout here (per-side column slices 0:5 / 5:10 into _targets),
+        # silently scrambling every IK write across both arms: e.g. in a right-only reach
+        # the right shoulder pitch/roll were pinned at default while the left elbow
+        # received the right arm's commands. This was THE dominant reach-accuracy bug
+        # (FK-verified via validation/check_ik_accuracy.py: p50 miss 14cm left / 30cm
+        # right with perfect tracking, ~0% within 3cm on the right). The buffer's column
+        # convention (asset order, matching these ids) is kept — every consumer
+        # (actions.py's blend term, observations.py's intent term, the deployment
+        # scripts) pairs columns to _standing_arm_motion_joint_ids dynamically — and the
+        # per-side column mapping below is now derived from the ids themselves
+        # (_col_idx), never assumed.
         all_joint_ids, _ = self._asset.find_joints(_ARM_JOINT_NAMES)
         # Keep our own reference — __call__ re-asserts BOTH env attributes every step
         # (2026-07-16): external code can null them between uses (eval_full_demo.py's
@@ -364,15 +376,21 @@ class StandingArmIKReachDisturbance(ManagerTermBase):
         self._jacobi_joint_ids: dict[str, torch.Tensor] = {}
         self._ee_body_idx: dict[str, int] = {}
         self._jacobi_body_idx: dict[str, int] = {}
-        self._col_slice: dict[str, slice] = {}
+        self._col_idx: dict[str, torch.Tensor] = {}
         self._ik: dict[str, DifferentialIKController] = {}
+
+        # Column of each asset joint id within _all_joint_ids — the ordering-robust
+        # replacement for the old per-side block slices (see the interleaving note above).
+        id_to_col = {int(j): c for c, j in enumerate(self._all_joint_ids.tolist())}
 
         is_fixed_base = self._asset.is_fixed_base
         ik_cfg = DifferentialIKControllerCfg(command_type="position", use_relative_mode=False, ik_method=self.ik_method)
-        for i, side in enumerate(self._sides):
+        for side in self._sides:
             joint_ids, _ = self._asset.find_joints(self._arm_joint_names[side])
             self._joint_ids[side] = torch.tensor(joint_ids, dtype=torch.long, device=self.device)
-            self._col_slice[side] = slice(i * 5, i * 5 + 5)
+            self._col_idx[side] = torch.tensor(
+                [id_to_col[int(j)] for j in joint_ids], dtype=torch.long, device=self.device
+            )
 
             body_ids, _ = self._asset.find_bodies(self._ee_body_name[side])
             self._ee_body_idx[side] = body_ids[0]
@@ -541,7 +559,7 @@ class StandingArmIKReachDisturbance(ManagerTermBase):
         limits = robot.data.soft_joint_pos_limits[:, joint_ids]
         new_targets = (joint_pos + delta).clamp(limits[:, :, 0], limits[:, :, 1])
 
-        col = self._col_slice[side]
+        col = self._col_idx[side]
         self._targets[:, col] = torch.where(active.unsqueeze(-1), new_targets, self._default[:, col])
 
         dist = torch.linalg.vector_norm(ee_pos_b - target_b, dim=-1)
@@ -775,7 +793,7 @@ class StandingArmPolicyReachDisturbance(StandingArmIKReachDisturbance):
         limits = robot.data.soft_joint_pos_limits[:, joint_ids]
         new_targets = (joint_pos + delta).clamp(limits[:, :, 0], limits[:, :, 1])
 
-        col = self._col_slice[side]
+        col = self._col_idx[side]
         self._targets[:, col] = torch.where(active.unsqueeze(-1), new_targets, self._default[:, col])
 
         dist = torch.linalg.vector_norm(error_b, dim=-1)

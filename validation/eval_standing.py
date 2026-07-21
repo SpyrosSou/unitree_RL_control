@@ -200,6 +200,7 @@ def _run_phase(base_env: ManagerBasedRLEnv, phase: int, eval_root: str) -> dict:
     # Close only this phase's CSV file handles — not wrapped_env.close(), which would
     # cascade down and tear down base_env, breaking the next phase.
     env._csv.close()
+    env._write_joint_diagnostics()
     return _summarize(env.csv_path)
 
 

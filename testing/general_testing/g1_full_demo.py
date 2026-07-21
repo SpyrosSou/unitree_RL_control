@@ -31,15 +31,24 @@ date if that box is reshaped again, always trust the live prompt output over thi
     y  lateral     left arm: 0.08 – 0.40 m   right arm: -0.40 – -0.08 m
     z  height      reachable 0.9 – 1.15 m  (ground = 0)
 
+--wait_arm_rest (2026-07-20): by default, a walk command clears the active arm target and
+starts homing it back to default, but the standing->walking mode switch itself doesn't
+wait for that homing move to finish — usually fine (homing is fast relative to
+MIN_MODE_STEPS) but can still show a brief instability (e.g. a big first step) if the arm
+was far from default when walk was commanded. Pass this flag to hold off the actual mode
+switch until the arm has fully homed, at the cost of walk feeling less immediately
+responsive. Off by default — opt in to compare the two behaviors, not a strict
+improvement to force on always.
+
 Usage:
     conda activate isaac_g1_control
     cd ~/Elm/Code/g1_locomotion
 
     # Auto-load from testing/general_testing/checkpoints.yaml
-    ~/Elm/Code/IsaacLab/isaaclab.sh -p testing/general_testing/g1_full_demo.py
+    python3 testing/general_testing/g1_full_demo.py
 
     # Explicit checkpoints + initial arm target
-    ~/Elm/Code/IsaacLab/isaaclab.sh -p testing/general_testing/g1_full_demo.py \\
+    python3 testing/general_testing/g1_full_demo.py \\
         --standing_checkpoint logs/rsl_rl/standing/.../model_1499.pt \\
         --walking_checkpoint  logs/rsl_rl/legs/.../model_3149.pt \\
         --arm_checkpoint      logs/rsl_rl/arms/g1_arm_ik_left/.../model_4200.pt \\
@@ -47,9 +56,13 @@ Usage:
         --target 0.3 0.2 1.0
 
     # Both arms
-    ~/Elm/Code/IsaacLab/isaaclab.sh -p testing/general_testing/g1_full_demo.py \\
+    python3 testing/general_testing/g1_full_demo.py \\
         --arm both \\
         --target 0.3 0.2 1.0
+
+    # Wait for the arm to finish homing before a walk command actually engages
+    python3 testing/general_testing/g1_full_demo.py \\
+        --arm left --target 0.3 0.2 1.0 --wait_arm_rest
 """
 
 # ---------------------------------------------------------------------------
@@ -57,6 +70,7 @@ Usage:
 # ---------------------------------------------------------------------------
 import argparse
 import importlib.util as _ilu
+import math
 import os
 
 import yaml
@@ -99,6 +113,28 @@ parser.add_argument("--arm", type=str, default=None, choices=["left", "right", "
 parser.add_argument("--target", type=float, nargs=3, default=None,
                     metavar=("X", "Y", "Z"),
                     help="Initial arm target in robot-local frame (x y z).")
+parser.add_argument(
+    "--torso_clip_deg", type=float, default=None,
+    help="Match the standing checkpoint's OWN torso_joint action clip, in +/-degrees "
+    "(2026-07-21). This script builds its env from G1LocomotionFlatEnvCfg_PLAY (walking "
+    "lineage), same as validation/integration_validation/eval_full_demo.py's "
+    "_build_env_cfg — which never inherits the standing lineage's torso clip either. "
+    "Omitting this for a torso-clip/torso-lock-trained checkpoint visualizes it under an "
+    "UNCLIPPED action space it was never trained on (the exact bug eval_full_demo.py had "
+    "until this same fix was added there). Pass the SAME value the checkpoint's own "
+    "training config used (30 for TorsoClip, 0 for TorsoLock); omit for any checkpoint "
+    "trained without a torso clip.",
+)
+parser.add_argument(
+    "--wait_arm_rest", action="store_true",
+    help="Delay the actual standing->walking mode switch until the arm(s) have finished "
+    "homing back to their default pose, instead of only starting the homing move and "
+    "switching to walking regardless of whether it's finished (2026-07-20). Off by "
+    "default: the un-delayed switch is very often fine (homing is fast relative to "
+    "MIN_MODE_STEPS) and this flag makes every walk command feel less responsive, so it's "
+    "opt-in for comparing the two behaviors, not a strict improvement to force on always. "
+    "Pass the bare flag to enable (no value) — e.g. --wait_arm_rest, not --wait_arm_rest True.",
+)
 args_cli = parser.parse_args()
 
 app_launcher = AppLauncher(args_cli)
@@ -327,6 +363,11 @@ class G1FullDemo:
         # attributes are unset (walking mode — see _update_arm_sim_targets).
         env_cfg.actions.joint_pos.class_type = StandingArmBlendJointPositionAction
 
+        if args_cli.torso_clip_deg is not None:
+            env_cfg.actions.joint_pos.clip = {
+                "torso_joint": (-math.radians(args_cli.torso_clip_deg), math.radians(args_cli.torso_clip_deg))
+            }
+
         loco_env = ManagerBasedRLEnv(cfg=env_cfg)
         self.env = RslRlVecEnvWrapper(loco_env)
         self.device = loco_env.device
@@ -369,6 +410,7 @@ class G1FullDemo:
         self._transition_to   = "standing"
         self._transition_step = 0
         self._transition_total_steps = TRANSITION_STEPS_TO_STAND
+        self._walk_wait_notified = False  # --wait_arm_rest console-spam guard, see _maybe_switch_mode
 
         # ------ arm target state ------
         # No arm target is active by default. The arm policy only engages after
@@ -418,6 +460,12 @@ class G1FullDemo:
         # arm_mode="left" — arm_mode="right"/"both" already have their own native
         # control path for the right arm (once a real checkpoint exists for them). ------
         self._mirror_enabled = self.arm_mode == "left"
+        # Read unconditionally by _update_arm_sim_targets/_arm_ready_for_walk regardless of
+        # arm_mode (mirror_active is already gated on _mirror_enabled there, but `mirror_active
+        # or self._mirror_homing` still evaluates the attribute even when mirror_active is
+        # False) — must exist even when mirroring itself is inactive, not just initialized
+        # inside the _mirror_enabled block below.
+        self._mirror_homing = False
         if self._mirror_enabled:
             r_joints, _ = self.robot.find_joints(_RIGHT_ARM_JOINTS)
             r_bodies, _ = self.robot.find_bodies(_RIGHT_EE_BODY)
@@ -428,7 +476,6 @@ class G1FullDemo:
             self.mirror_goal_pos_local = torch.zeros(3, device=self.device)
             self.mirror_target_active = False
             self._filtered_mirror_delta = torch.zeros(1, 5, device=self.device)
-            self._mirror_homing = False  # same homing mechanism as _arm_homing
             # Same "fixed offset from the torso, not from the world" treatment as the
             # primary target — see _mirror_goal_world()'s docstring.
 
@@ -742,8 +789,21 @@ class G1FullDemo:
         env = self.env.unwrapped
         env._standing_arm_motion_joint_ids = self.all_arm_joint_ids_robot
         targets = self.robot.data.default_joint_pos[0:1, self.all_arm_joint_ids_robot].clone()
-        if arm_active:
-            arm_targets = self._compute_arm_targets()
+
+        # Gated on "arm_active OR still homing" (2026-07-20), not just arm_active — a walk
+        # command clears arm_target_active immediately (see _maybe_switch_mode) well
+        # before the mode itself flips to "walking", but _arm_homing/_mirror_homing can
+        # still be set from that same clear (_clear_arm_targets/_clear_mirror_target).
+        # Gating purely on arm_active/mirror_active here would skip this whole block the
+        # step after a clear — including the homing loop below it — letting targets fall
+        # straight through to plain default_joint_pos with no rate limit at all. See
+        # _clear_arm_targets's docstring for the full story.
+        if arm_active or bool(self._arm_homing.any().item()):
+            # Only run the arm-IK policy while there's an actual target to chase — a
+            # homing-only pass (arm_active False) starts from the already-default slice
+            # `targets` was initialized to, letting the loop below fill in the rate-
+            # limited step instead of a fresh (and here, meaningless) policy inference.
+            arm_targets = self._compute_arm_targets() if arm_active else targets[:, self._active_arm_cols].clone()
             # Any arm slot still homing overrides its slice of the policy output with the
             # scripted return-to-default step — see ARM_HOMING_TOL_RAD's comment.
             n_per_arm = len(self.arm_joint_ids_robot) // self._arm_homing.numel()
@@ -762,7 +822,7 @@ class G1FullDemo:
                 else:
                     arm_targets[:, sl] = homing_target
             targets[:, self._active_arm_cols] = arm_targets
-        if mirror_active:
+        if mirror_active or self._mirror_homing:
             if self._mirror_homing:
                 homing_target = self._homing_step(self._mirror_joint_ids_robot)
                 if homing_target is None:
@@ -771,7 +831,7 @@ class G1FullDemo:
                     print("[FullDemo] Mirror arm homed to default — mirrored policy engaging.")
                 else:
                     targets[:, self._mirror_arm_cols] = homing_target
-            if not self._mirror_homing:
+            if mirror_active and not self._mirror_homing:
                 targets[:, self._mirror_arm_cols] = self._compute_mirror_targets()
         env._standing_arm_motion_targets = targets
 
@@ -856,9 +916,13 @@ class G1FullDemo:
     def _clear_mirror_target(self):
         if not self.mirror_target_active:
             return
+        # Same fix and rationale as _clear_arm_targets: mark for homing instead of just
+        # dropping the target, or the mirror arm's simulated position target jumps
+        # straight to default with no rate limit on the next _update_arm_sim_targets call.
+        self._mirror_homing = True
         self.mirror_target_active = False
         self._update_mirror_goal_marker()
-        print("[FullDemo] Cleared mirror target.")
+        print("[FullDemo] Cleared mirror target — homing to default before walk.")
 
     def _has_active_arm_target(self) -> bool:
         if self.arm_mode == "both":
@@ -866,13 +930,30 @@ class G1FullDemo:
         return bool(self.arm_target_active[0].item())
 
     def _clear_arm_targets(self):
+        """Clears any active reach target(s) — called right as a walk command is first
+        detected (see _maybe_switch_mode), well before the mode actually flips to
+        "walking". Marks whichever arm(s) were active for the SAME rate-limited homing
+        move _set_arm_target already uses between reach targets (see ARM_HOMING_TOL_RAD),
+        rather than just dropping the target — 2026-07-20, found via live testing: without
+        this, arm_target_active going straight to all-False makes _update_arm_sim_targets
+        skip its "arm_active" branch (and with it the homing loop) entirely on the very
+        next step, so the simulated arm TARGET jumps straight from wherever the arm
+        currently is to default_joint_pos with no rate limit at all — not a physical
+        teleport (the 60/1.5 PD gain still has to physically catch up), but exactly the
+        kind of abrupt, unclamped target change this project has repeatedly found
+        destabilizing elsewhere (the same class of bug the "no teleports" homing move was
+        originally built to avoid, just at a different call site). Observed as
+        "walking becomes slightly unstable if the arm isn't already home" when a walk
+        command interrupts an active reach.
+        """
         if self._mirror_enabled:
             self._clear_mirror_target()
         if not bool(torch.any(self.arm_target_active).item()):
             return
+        self._arm_homing |= self.arm_target_active
         self.arm_target_active.zero_()
         self._update_goal_markers()
-        print("[FullDemo] Cleared arm target(s).")
+        print("[FullDemo] Cleared arm target(s) — homing to default before walk.")
 
     def _goal_positions_world(self) -> torch.Tensor:
         """Transform robot-local arm targets into world coordinates, using the robot's
@@ -908,6 +989,7 @@ class G1FullDemo:
         self._transition_to = "standing"
         self._transition_step = 0
         self.cmd_filtered.zero_()
+        self._walk_wait_notified = False
 
         # A respawn resets the arm joints to default via the env's own reset — nothing
         # left to home back from.
@@ -940,6 +1022,14 @@ class G1FullDemo:
         vel = self.env.unwrapped.scene["robot"].data.root_lin_vel_w[0, :2]
         return torch.linalg.vector_norm(vel).item()
 
+    def _arm_ready_for_walk(self) -> bool:
+        """True once no arm is still mid-homing. Only consulted when --wait_arm_rest is
+        set (2026-07-20) — gates the actual standing->walking mode switch so walking
+        never begins while an arm is still partway through its return-to-default move,
+        the residual instability the un-delayed switch can still show for a large
+        excursion within a short MIN_MODE_STEPS window (see _clear_arm_targets)."""
+        return not bool(self._arm_homing.any().item()) and not self._mirror_homing
+
     def _maybe_switch_mode(self, cmd_mag: float):
         speed = self._robot_planar_speed()
 
@@ -948,13 +1038,21 @@ class G1FullDemo:
         if self.mode == "standing" and self._has_active_arm_target() and cmd_mag >= 0.02:
             self._clear_arm_targets()
 
+        can_start_walk = (not args_cli.wait_arm_rest) or self._arm_ready_for_walk()
+        if not can_start_walk:
+            if not self._walk_wait_notified:
+                self._walk_wait_notified = True
+                print("[FullDemo] Walk requested — waiting for arm(s) to finish homing before starting (--wait_arm_rest).")
+        else:
+            self._walk_wait_notified = False
+
         if self._in_transition:
-            if self._transition_to == "standing" and cmd_mag >= SWITCH_TO_WALK_THRESHOLD:
+            if self._transition_to == "standing" and cmd_mag >= SWITCH_TO_WALK_THRESHOLD and can_start_walk:
                 self._start_transition("walking", force_from="standing", reason="interrupt")
             return
 
         if self.mode == "standing":
-            if self.mode_steps >= MIN_MODE_STEPS and cmd_mag >= SWITCH_TO_WALK_THRESHOLD:
+            if self.mode_steps >= MIN_MODE_STEPS and cmd_mag >= SWITCH_TO_WALK_THRESHOLD and can_start_walk:
                 self._start_transition("walking", reason="threshold")
         else:
             if (

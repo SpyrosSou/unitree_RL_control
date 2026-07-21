@@ -21,6 +21,7 @@ Each wrapper writes two files per run: a "detailed" CSV with every column, and a
 """
 
 import csv
+import math
 import os
 
 import gymnasium as gym
@@ -176,6 +177,23 @@ class StandingMetricsCsvWrapper(gym.Wrapper):
         self._prev_actions: torch.Tensor | None = None
         self._foot_body_ids: list[int] | None = None
 
+        # Per-joint diagnostics (2026-07-20): run-wide (NOT per-episode-reset) max |joint
+        # position| across every joint, written to a separate joint_diagnostics.csv on
+        # close() — added after a checkpoint was found pinning torso_joint at its exact
+        # hardware limit (150 deg) for entire episodes, discovered only because that one
+        # joint already had its own dedicated column; this generalizes the check to every
+        # joint instead of relying on having hand-picked the right one to look at. Reads
+        # straight from robot.data.joint_pos/joint_names/soft_joint_pos_limits, which are
+        # guaranteed mutually consistent (same asset, same indexing) by construction —
+        # deliberately NOT correlated against the raw action tensor's own column order,
+        # which comes from a separate resolve (the action term's own find_joints call) and
+        # is not guaranteed to match robot.data's ordering (see events.py's _col_idx fix
+        # earlier the same day: assuming two independently-resolved joint orderings agree
+        # was exactly the bug there). Position alone answers "which joint is pinned,"
+        # without needing two orderings to agree.
+        self._joint_names: list[str] | None = None
+        self._episode_max_abs_pos_per_joint: torch.Tensor | None = None
+
     @staticmethod
     def _fieldnames() -> list[str]:
         return [
@@ -211,6 +229,7 @@ class StandingMetricsCsvWrapper(gym.Wrapper):
 
     def close(self):
         try:
+            self._write_joint_diagnostics()
             if hasattr(self, "_csv"):
                 self._csv.close()
         finally:
@@ -314,8 +333,55 @@ class StandingMetricsCsvWrapper(gym.Wrapper):
         abs_torso = robot.data.joint_pos[:, self._torso_joint_id].abs().detach().float()
         self._episode_max_abs_torso = torch.maximum(self._episode_max_abs_torso, abs_torso)
         self._episode_sum_abs_torso += abs_torso
+
+        if self._joint_names is None:
+            self._joint_names = list(robot.data.joint_names)
+            self._episode_max_abs_pos_per_joint = torch.zeros(
+                (self._num_envs, len(self._joint_names)), dtype=torch.float32, device=self._device
+            )
+        self._episode_max_abs_pos_per_joint = torch.maximum(
+            self._episode_max_abs_pos_per_joint, robot.data.joint_pos.abs().detach().float()
+        )
+
         self._update_stepping_metrics(env)
         self._prev_actions = action_tensor.detach().clone()
+
+    def _write_joint_diagnostics(self):
+        """One row per joint, run-wide max |position| across every env/episode this
+        wrapper has seen, vs. that joint's own soft/hard limits — see the __init__
+        comment on _episode_max_abs_pos_per_joint for why this exists and why it's
+        position-based rather than correlated against the action tensor."""
+        if self._joint_names is None:
+            return
+        robot = self.unwrapped.scene["robot"]
+        joint_ids = list(range(len(self._joint_names)))
+        soft_limits = robot.data.soft_joint_pos_limits[0, joint_ids]  # (N, 2), same for every env
+        hard_limits = robot.data.joint_pos_limits[0, joint_ids]
+        run_max_abs_pos = self._episode_max_abs_pos_per_joint.amax(dim=0)  # worst env per joint
+
+        path = os.path.join(self.log_dir, "joint_diagnostics.csv")
+        os.makedirs(self.log_dir, exist_ok=True)
+        with open(path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "joint_id", "joint_name", "max_abs_pos_rad", "max_abs_pos_deg",
+                "soft_limit_lower_deg", "soft_limit_upper_deg",
+                "hard_limit_lower_deg", "hard_limit_upper_deg",
+                "frac_of_soft_limit_used",
+            ])
+            for i, name in enumerate(self._joint_names):
+                max_pos = float(run_max_abs_pos[i].item())
+                soft_lo, soft_hi = float(soft_limits[i, 0].item()), float(soft_limits[i, 1].item())
+                hard_lo, hard_hi = float(hard_limits[i, 0].item()), float(hard_limits[i, 1].item())
+                soft_extent = max(abs(soft_lo), abs(soft_hi), 1e-6)
+                writer.writerow([
+                    i, name,
+                    f"{max_pos:.4f}", f"{math.degrees(max_pos):.2f}",
+                    f"{math.degrees(soft_lo):.2f}", f"{math.degrees(soft_hi):.2f}",
+                    f"{math.degrees(hard_lo):.2f}", f"{math.degrees(hard_hi):.2f}",
+                    f"{max_pos / soft_extent:.3f}",
+                ])
+        print(f"[Metrics] Per-joint diagnostics: {path}")
 
     def _flush_finished_episodes(self, done_mask: torch.Tensor, terminated: torch.Tensor, truncated: torch.Tensor):
         env_ids = done_mask.nonzero(as_tuple=False).squeeze(-1)

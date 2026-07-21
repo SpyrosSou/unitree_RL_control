@@ -1,45 +1,51 @@
 #!/usr/bin/env bash
-# Two-branch posture experiment + transfer-collapse bisect (2026-07-15 evening, replaces
-# the single consolidated_torso queue drafted earlier today):
+# Step 2c of the 2026-07-20/21 recovery (definitive_next_steps.md) — TorsoClip +
+# strengthened orientation/hip rewards, ONE seed, ONE variant (2026-07-21).
 #
-#   1. consolidated_torso  — consolidated + joint_deviation_torso -0.05: posture *penalty*.
-#      "Is the rotated-torso bracing posture load-bearing or an unpenalized habit?"
-#   2. consolidated_intent — consolidated + the 10-D arm-intent observation: posture
-#      *information*. The standing policy sees the arm's commanded targets and can brace
-#      per-target instead of committing to one fixed twist.
-#      Both are single-variable branches off the same consolidated baseline (left reach
-#      falls 78% -> 2.1%, but torso rotation cost most of the inner reach workspace and
-#      the right side still falls ~55% — plan.md §3).
-#   3. Transfer-collapse bisect (cheap, ~2min each): the leg_symmetry checkpoint scores 0%
-#      falls natively but 100% in the integration env even standing still (same collapse
-#      as dwell/torso before it). The two confirmed env differences are (a) arms actively
-#      reaching natively vs statically held in integration, (b) push_robot on natively vs
-#      off in integration. --freeze_arms / --no_push toggle these inside the native env,
-#      one at a time, with the consolidated checkpoint as the does-transfer control.
+# Context: TorsoClip (+/-30deg) and TorsoLock (0deg) both retrained and evaluated
+# 2026-07-20/21. Clip clearly beat Lock (policy-mode integration fall rate much lower,
+# and — decisively — a live g1_full_demo.py visual check of Lock showed a wide, unstable
+# stance with obvious tilt even standing still). Lock is DROPPED as a direction as of
+# today. But Clip's own idle pose isn't good either: gate-eval (arms frozen, 0% falls)
+# tilt went 8.4deg (GainMatch, unclipped) -> 37.2deg (Clip) even though torso itself is
+# now correctly bounded (60.3deg -> 32.2deg). joint_diagnostics.csv shows why: hip_roll
+# frac_of_soft_limit_used jumped 10.9%/27.1% -> 60.7%/10.9% (GainMatch -> Clip,
+# left/right) — a live visual check confirmed legs spread far wider than GainMatch's
+# already-reasonable pose. Root cause: two reward terms that ARE already active
+# (flat_orientation_l2 -1.0, joint_deviation_hip -0.1) are inherited unchanged from the
+# WALKING-tuned G1RoughEnvCfg and were never retuned for standing — they were only ever
+# "good enough" while torso rotation acted as a free, unpenalized escape hatch. Capping
+# that hatch (correctly) didn't remove the underlying compensation need, it just moved it
+# onto the next-cheapest lever (hip abduction). See
+# G1LocomotionStandingFlatIKReachHeightIntentGainMatchTorsoClipOrientHipEnvCfg's docstring
+# in g1_locomotion_env_cfg.py for the full writeup.
 #
-# Reading the results:
-#   - torso branch:  falls stay ~2% AND mean_max_abs_torso_deg (new column) drops AND left
-#     reach success recovers toward ~90%+ concluded => rotation was a habit, penalty wins.
-#     Falls return => rotation was load-bearing; intent branch (or nothing) is the answer.
-#   - intent branch: same success criteria, plus watch the right-side buckets — intent is
-#     the lever expected to fix the one-sided-solution pattern, so right reach falls
-#     dropping below ~20% would be its distinctive signature.
-#   - bisect: symmetry ckpt SURVIVES native+freeze_arms => static arms aren't the killer,
-#     suspect shifts to the env base / command internals. Symmetry ckpt COLLAPSES with
-#     freeze_arms (while consolidated control survives) => these checkpoints genuinely
-#     cannot stand still without arm motion — a training-distribution hole, fixable.
+# Fix tested here: strengthen both terms for standing specifically —
+# flat_orientation_l2 -1.0 -> -3.0, joint_deviation_hip -0.1 -> -0.5. Starting points, not
+# tuned values (same spirit as base_height_l2's own -10.0 starting point) — check reward
+# curves after training. Built on TorsoClip (not Lock) — keeping some torso authority
+# while ALSO pricing in tilt/hip-deviation properly is the hypothesis under test.
 #
-# Deliberately does NOT use `set -e`: one failed step shouldn't silently kill the rest of
-# an unattended queue. Each step's pass/fail is logged instead; check the log for FAILED
-# lines afterward.
+# ONE seed, ONE variant this time (not a multi-config sweep like the Clip-vs-Lock night):
+# a single, well-motivated next step the user explicitly asked to run right now, not a
+# comparison requiring several arms. Revisit with a second seed once this direction looks
+# right, per the project's proven seed-variance history (2.1% vs 100% fall rate on an
+# identical config, different seed).
 #
-# Deliberately no shutdown/poweroff command anywhere in this script — leave the machine
-# running when it's done.
+# Train -> GATE (native, arms frozen; pass = fall_rate ~0) -> native eval (own
+# disturbance) -> TWO integration evals, BOTH passing --torso_clip_deg 30 (the
+# eval_full_demo.py fix added 2026-07-21 — that script builds its env from the walking
+# lineage and never inherits the standing lineage's torso clip on its own; omitting the
+# flag would silently test this checkpoint under an unclipped action space it was never
+# trained on, exactly the bug that made last night's first integration numbers useless).
+#
+# Deliberately does NOT use `set -e` — log FAILED lines instead of aborting the queue.
+# Deliberately no shutdown/poweroff at the end.
 #
 # Usage:
 #   cd ~/Elm/Code/g1_locomotion
 #   nohup ./overnight_train.sh &
-#   (or just run it in a tmux/screen session and detach)
+#   (or run in tmux/screen and detach)
 
 set -o pipefail
 
@@ -48,20 +54,19 @@ PROJECT_ROOT="$HOME/Elm/Code/g1_locomotion"
 STANDING_ITERS=6000
 WALKING_CKPT="chosen_checkpoints/walking_latest.pt"
 ARM_CKPT="chosen_checkpoints/arm_left_latest.pt"
+SEED=42
+TORSO_CLIP_DEG=30
 
 cd "$PROJECT_ROOT"
 mkdir -p phase_logs
 LOG_FILE="$PROJECT_ROOT/phase_logs/overnight_$(date +%Y-%m-%d_%H-%M-%S).log"
 
-# NOTE: no `set -u` here (only pipefail) — conda activate sources Isaac Sim's
+# NOTE: no `set -u` (only pipefail) — conda activate sources Isaac Sim's
 # setup_conda_env.sh, which references $ZSH_VERSION with no default and isn't
-# nounset-safe. `set -u` made that fatal on the first run before anything even
-# started training. The rest of this script doesn't rely on unset-variable
-# checking for correctness, so it's simplest to just leave it off entirely.
+# nounset-safe.
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate "$CONDA_ENV"
 
-# Mirror everything to a log file too, so it survives even if the terminal is closed.
 exec > >(tee -a "$LOG_FILE") 2>&1
 
 run_step() {
@@ -89,59 +94,62 @@ latest_checkpoint() {
     [ -n "$1" ] && ls -v "$1"/model_*.pt 2>/dev/null | tail -1
 }
 
-echo "Intent branch starting $(date). Full log: $LOG_FILE"
+RUN_NAME="ikreach_height_intent_gainmatch_torsoclip30_orienthip"
+TASK="G1-Locomotion-Standing-Flat-IKReach-Height-Intent-GainMatch-TorsoClip-OrientHip-v0"
+ENV_CFG_KEY="ikreachintentgainmatchtorsocliporienthip"
 
-# ---------------------------------------------------------------------------
-# ALREADY COMPLETED in the 2026-07-15_08-37-40 run (do not re-run):
-#   - Bisect A/B/control — DECISIVE: symmetry ckpt falls 100% in its OWN native env with
-#     arms frozen at default (identical with/without push; consolidated control 0%).
-#     The transfer collapse is a training-distribution hole ("standing with motionless
-#     arms" is OOD for the analytic-IK-era checkpoints), not an env-config bug.
-#   - consolidated_torso train + native eval (0% falls, height 0.727 — but
-#     mean |torso| ~48.5deg: the -0.05 penalty did NOT remove the rotation).
-#   - Its integration eval crashed on an obs_groups bug in the new checkpoint-inferred
-#     loader (fixed 2026-07-15 afternoon) — run it manually, see plan.md.
-#
-# Remaining queue below: the consolidated_intent branch only. Updated 2026-07-15 after
-# the torso branch's integration collapse (100% falls even standing still — torso-penalty
-# lever now considered dead after two independent failures):
-#   - The intent config gained no_reach_prob=0.15 (15% of episodes hold both arms at
-#     default — closes the static-arm distribution hole the bisect proved lethal).
-#   - A freeze_arms GATE eval runs before the normal evals: pass = fall_rate ~0.
-# ---------------------------------------------------------------------------
-run_step "Train: standing consolidated_intent ($STANDING_ITERS iters)" \
-    python scripts/rsl_rl/train.py --task G1-Locomotion-Standing-Flat-Consolidated-Intent-v0 --headless \
-        --max_iterations "$STANDING_ITERS" --run_name consolidated_intent
-INTENT_RUN_DIR=$(latest_run_dir "standing/g1_locomotion_flat")
-INTENT_CKPT=$(latest_checkpoint "$INTENT_RUN_DIR")
+echo "Step 2c (TorsoClip + strengthened orientation/hip rewards, 1 seed, $STANDING_ITERS iters) starting $(date). Full log: $LOG_FILE"
 
-if [ -n "$INTENT_CKPT" ]; then
-    # GATE FIRST (90s): native env with arms frozen at default — the condition that
-    # kills collapse-group checkpoints in ~2.5s (see the 2026-07-15 bisect). With
-    # no_reach_prob=0.15 in the intent config this should pass by construction
-    # (fall_rate ~0 in its summary.csv); if it doesn't, the integration numbers
-    # below are pre-explained and the checkpoint is a discard.
-    run_step "Gate (native, arms frozen): standing consolidated_intent" \
-        python validation/eval_standing_ikreach.py --checkpoint "$INTENT_CKPT" --env_cfg intent --freeze_arms --headless
-    run_step "Eval (native): standing consolidated_intent" \
-        python validation/eval_standing_ikreach.py --checkpoint "$INTENT_CKPT" --env_cfg intent --headless
-    run_step "Eval (integration): standing consolidated_intent" \
-        python validation/integration_validation/eval_full_demo.py \
-            --standing_checkpoint "$INTENT_CKPT" --walking_checkpoint "$WALKING_CKPT" \
-            --arm_checkpoint "$ARM_CKPT" --num_envs 32 --headless
+run_step "Train: standing $RUN_NAME (seed=$SEED, $STANDING_ITERS iters, task=$TASK)" \
+    python scripts/rsl_rl/train.py --task "$TASK" --headless \
+        --max_iterations "$STANDING_ITERS" --seed "$SEED" --run_name "$RUN_NAME"
+
+RUN_DIR=$(latest_run_dir "standing/g1_locomotion_flat")
+CKPT=$(latest_checkpoint "$RUN_DIR")
+
+if [ -z "$CKPT" ]; then
+    echo "[WARN] No fresh checkpoint found under $RUN_DIR for $RUN_NAME — aborting eval steps."
 else
-    echo "[WARN] No fresh checkpoint found under $INTENT_RUN_DIR for consolidated_intent — skipping both evals."
+    # GATE FIRST (~90s): native env with arms frozen at default. no_reach_prob=0.15 means
+    # this should pass by construction (fall_rate ~0); if it doesn't, everything below is
+    # pre-explained and this checkpoint is a discard regardless of what it shows.
+    run_step "Gate (native, arms frozen): $RUN_NAME" \
+        python validation/eval_standing_ikreach.py --checkpoint "$CKPT" --env_cfg "$ENV_CFG_KEY" --freeze_arms --headless
+    run_step "Eval (native): $RUN_NAME" \
+        python validation/eval_standing_ikreach.py --checkpoint "$CKPT" --env_cfg "$ENV_CFG_KEY" --headless
+    run_step "Eval (integration, event mode — self-consistency check): $RUN_NAME" \
+        python validation/integration_validation/eval_full_demo.py \
+            --standing_checkpoint "$CKPT" --walking_checkpoint "$WALKING_CKPT" \
+            --arm_checkpoint "$ARM_CKPT" --arm_driver event --torso_clip_deg "$TORSO_CLIP_DEG" --num_envs 32 --headless
+    run_step "Eval (integration, POLICY mode — the decisive real-deployment test): $RUN_NAME" \
+        python validation/integration_validation/eval_full_demo.py \
+            --standing_checkpoint "$CKPT" --walking_checkpoint "$WALKING_CKPT" \
+            --arm_checkpoint "$ARM_CKPT" --arm_driver policy --torso_clip_deg "$TORSO_CLIP_DEG" --num_envs 32 --headless
+
+    echo "$RUN_NAME checkpoint: $CKPT"
 fi
 
 echo ""
 echo "=============================================================="
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Posture two-branch + transfer bisect complete."
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Step 2c (TorsoClip + OrientHip) complete."
 echo "Full log: $LOG_FILE"
-echo "consolidated_intent checkpoint: $INTENT_CKPT"
 echo "Native eval output:      <checkpoint_dir>/ikreach_eval/<timestamp>/summary.csv"
+echo "  + joint_diagnostics.csv in the same folder — THE NUMBERS THAT MATTER THIS TIME:"
+echo "  mean_max_tilt_deg (gate/idle) should drop from Clip's 37.2deg toward GainMatch's"
+echo "  8.4deg or better, and hip_roll frac_of_soft_limit_used should drop from Clip's"
+echo "  60.7%/10.9% toward GainMatch's 10.9%/27.1% or better — without torso_joint"
+echo "  creeping back up past ~32deg (it shouldn't, the clip is unchanged and hard)."
 echo "Integration eval output: validation/integration_validation/<timestamp>/*/*_summary.csv"
-echo "Baselines to compare against: consolidated integration run 2026-07-15_05-13-58"
-echo "(left falls 2.1%, left concluded success ~16%, right falls 54.7%) and height_reward"
-echo "re-baseline 2026-07-15_01-51-10 (left concluded success ~96%). Watch the new"
-echo "mean_max_abs_torso_deg column in the *_stability summaries."
+echo "  (both runs used --torso_clip_deg 30 — verify mean_max_abs_torso_deg reads ~30-32,"
+echo "  NOT 150, before trusting anything else in these files)."
+echo "COMPARE against TorsoClip's own numbers (gate tilt 37.2deg/torso 32.2deg; native"
+echo "26.3% falls; policy-mode 0%/2.1%/24.7%/22.7% left/left_edge/right/right_edge) —"
+echo "the fall-rate numbers should NOT regress just because the reward changed; if they"
+echo "do, -3.0/-0.5 may be fighting legitimate disturbance-recovery motion too hard."
+echo "If this looks like a clear improvement: do a live g1_full_demo.py visual check"
+echo "(--torso_clip_deg 30) before promoting to chosen_checkpoints/standing_latest.pt"
+echo "(ask first) — the whole reason this run exists is a visual complaint, so a visual"
+echo "check is the real pass/fail bar, not just the numbers."
+echo "This is ONE seed — a promising direction should get a second seed before being"
+echo "trusted as final, per the project's proven seed-variance history."
 echo "=============================================================="

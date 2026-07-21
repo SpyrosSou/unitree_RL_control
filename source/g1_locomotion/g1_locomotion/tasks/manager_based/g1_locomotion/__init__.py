@@ -165,6 +165,204 @@ gym.register(
     },
 )
 
+# Step 2 of the 2026-07-20 IK-fix recovery (definitive_next_steps.md): IKReach-Height
+# (analytic-IK disturbance, now with its joint-ordering bug fixed, + base_height_l2) plus
+# the arm-intent observation and no_reach_prob=0.15, both carried over from the
+# Consolidated lineage where they were proven independently. See
+# G1LocomotionStandingFlatIKReachHeightIntentEnvCfg's docstring.
+gym.register(
+    id="G1-Locomotion-Standing-Flat-IKReach-Height-Intent-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.g1_locomotion_env_cfg:G1LocomotionStandingFlatIKReachHeightIntentEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1LocomotionStandingFlatPPORunnerCfg",
+        "rl_games_cfg_entry_point": f"{agents.__name__}:rl_games_flat_ppo_cfg.yaml",
+        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_flat_ppo_cfg.yaml",
+        "sb3_cfg_entry_point": f"{agents.__name__}:sb3_flat_ppo_cfg.yaml",
+    },
+)
+
+gym.register(
+    id="G1-Locomotion-Standing-Flat-IKReach-Height-Intent-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.g1_locomotion_env_cfg:G1LocomotionStandingFlatIKReachHeightIntentEnvCfg_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1LocomotionStandingFlatPPORunnerCfg",
+        "rl_games_cfg_entry_point": f"{agents.__name__}:rl_games_flat_ppo_cfg.yaml",
+        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_flat_ppo_cfg.yaml",
+        "sb3_cfg_entry_point": f"{agents.__name__}:sb3_flat_ppo_cfg.yaml",
+    },
+)
+
+# IKReach-Height-Intent (above) plus match_deployment_arm_gains=True on the disturbance —
+# 2026-07-20, same day: the Intent-only checkpoint collapsed to 99-100% falls specifically
+# under --arm_driver policy (the real deployment condition) because it never trained
+# against the 200/20-stiff active-arm gain that mode actually uses. See
+# G1LocomotionStandingFlatIKReachHeightIntentGainMatchEnvCfg's docstring.
+gym.register(
+    id="G1-Locomotion-Standing-Flat-IKReach-Height-Intent-GainMatch-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.g1_locomotion_env_cfg:G1LocomotionStandingFlatIKReachHeightIntentGainMatchEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1LocomotionStandingFlatPPORunnerCfg",
+        "rl_games_cfg_entry_point": f"{agents.__name__}:rl_games_flat_ppo_cfg.yaml",
+        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_flat_ppo_cfg.yaml",
+        "sb3_cfg_entry_point": f"{agents.__name__}:sb3_flat_ppo_cfg.yaml",
+    },
+)
+
+gym.register(
+    id="G1-Locomotion-Standing-Flat-IKReach-Height-Intent-GainMatch-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.g1_locomotion_env_cfg:G1LocomotionStandingFlatIKReachHeightIntentGainMatchEnvCfg_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1LocomotionStandingFlatPPORunnerCfg",
+        "rl_games_cfg_entry_point": f"{agents.__name__}:rl_games_flat_ppo_cfg.yaml",
+        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_flat_ppo_cfg.yaml",
+        "sb3_cfg_entry_point": f"{agents.__name__}:sb3_flat_ppo_cfg.yaml",
+    },
+)
+
+# IKReach-Height-Intent-GainMatch (above) plus a hard clip on torso_joint's action range,
+# +/-30 degrees (2026-07-20) — fixes the exploit found via joint_diagnostics.csv (new
+# per-joint logging) and confirmed visually: torso sits 60-120deg even at rest with 0%
+# falls, because nothing in the stock ActionsCfg.joint_pos clips any joint's commanded
+# target. See G1LocomotionStandingFlatIKReachHeightIntentGainMatchTorsoClipEnvCfg's
+# docstring for the full mechanism and why this is an action-space constraint, not a
+# reward penalty (the two prior torso reward-penalty attempts were both dead ends).
+gym.register(
+    id="G1-Locomotion-Standing-Flat-IKReach-Height-Intent-GainMatch-TorsoClip-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.g1_locomotion_env_cfg:G1LocomotionStandingFlatIKReachHeightIntentGainMatchTorsoClipEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1LocomotionStandingFlatPPORunnerCfg",
+        "rl_games_cfg_entry_point": f"{agents.__name__}:rl_games_flat_ppo_cfg.yaml",
+        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_flat_ppo_cfg.yaml",
+        "sb3_cfg_entry_point": f"{agents.__name__}:sb3_flat_ppo_cfg.yaml",
+    },
+)
+
+gym.register(
+    id="G1-Locomotion-Standing-Flat-IKReach-Height-Intent-GainMatch-TorsoClip-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.g1_locomotion_env_cfg:G1LocomotionStandingFlatIKReachHeightIntentGainMatchTorsoClipEnvCfg_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1LocomotionStandingFlatPPORunnerCfg",
+        "rl_games_cfg_entry_point": f"{agents.__name__}:rl_games_flat_ppo_cfg.yaml",
+        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_flat_ppo_cfg.yaml",
+        "sb3_cfg_entry_point": f"{agents.__name__}:sb3_flat_ppo_cfg.yaml",
+    },
+)
+
+# TorsoClip (above) plus strengthening two reward terms inherited unchanged from the
+# WALKING-tuned G1RoughEnvCfg and never retuned for standing: flat_orientation_l2 (-1.0
+# -> -3.0) and joint_deviation_hip (-0.1 -> -0.5). 2026-07-21: capping torso correctly
+# removed the 60-120deg twist exploit, but idle-gate tilt got WORSE (8.4deg -> 37.2deg)
+# and hip_roll usage spiked (10.9%/27.1% -> 60.7%/10.9% frac_of_soft_limit_used) — the
+# balance-compensation need didn't go away when torso was capped, it moved to hip
+# abduction ("legs spread far too wide", confirmed live via g1_full_demo.py). See
+# G1LocomotionStandingFlatIKReachHeightIntentGainMatchTorsoClipOrientHipEnvCfg's docstring
+# for the full writeup. Built on TorsoClip, not TorsoLock — Lock is dropped as of today
+# (worse on every axis, numerically and visually).
+gym.register(
+    id="G1-Locomotion-Standing-Flat-IKReach-Height-Intent-GainMatch-TorsoClip-OrientHip-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.g1_locomotion_env_cfg:G1LocomotionStandingFlatIKReachHeightIntentGainMatchTorsoClipOrientHipEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1LocomotionStandingFlatPPORunnerCfg",
+        "rl_games_cfg_entry_point": f"{agents.__name__}:rl_games_flat_ppo_cfg.yaml",
+        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_flat_ppo_cfg.yaml",
+        "sb3_cfg_entry_point": f"{agents.__name__}:sb3_flat_ppo_cfg.yaml",
+    },
+)
+
+gym.register(
+    id="G1-Locomotion-Standing-Flat-IKReach-Height-Intent-GainMatch-TorsoClip-OrientHip-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.g1_locomotion_env_cfg:G1LocomotionStandingFlatIKReachHeightIntentGainMatchTorsoClipOrientHipEnvCfg_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1LocomotionStandingFlatPPORunnerCfg",
+        "rl_games_cfg_entry_point": f"{agents.__name__}:rl_games_flat_ppo_cfg.yaml",
+        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_flat_ppo_cfg.yaml",
+        "sb3_cfg_entry_point": f"{agents.__name__}:sb3_flat_ppo_cfg.yaml",
+    },
+)
+
+# TorsoClip (above) plus a hard TERMINATION on excessive whole-body tilt (isaaclab.envs.
+# mdp.bad_orientation, limit_angle=0.8 — Unitree's own literal value from their real,
+# hardware-deployed G1 recipe at ~/Elm/Code/unitree_rl_lab). 2026-07-21: structurally
+# different from every prior fix (torso clip, OrientHip reward reweight) — those price in
+# ONE joint at a time and the exploit just moves to the next-cheapest one when capped;
+# this terminates on the OUTCOME (excessive tilt) regardless of which joint produced it,
+# so there's no cheaper joint left to move the exploit to. Built on TorsoClip directly,
+# NOT stacked on OrientHip — single-variable sibling, not a combination. See
+# G1LocomotionStandingFlatIKReachHeightIntentGainMatchTorsoClipBadOrientationEnvCfg's
+# docstring for the full writeup and the risk flagged going in (0.8 rad may already be
+# below some of TorsoClip's own observed peak tilt — check training stability first).
+gym.register(
+    id="G1-Locomotion-Standing-Flat-IKReach-Height-Intent-GainMatch-TorsoClip-BadOrientation-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.g1_locomotion_env_cfg:G1LocomotionStandingFlatIKReachHeightIntentGainMatchTorsoClipBadOrientationEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1LocomotionStandingFlatPPORunnerCfg",
+        "rl_games_cfg_entry_point": f"{agents.__name__}:rl_games_flat_ppo_cfg.yaml",
+        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_flat_ppo_cfg.yaml",
+        "sb3_cfg_entry_point": f"{agents.__name__}:sb3_flat_ppo_cfg.yaml",
+    },
+)
+
+gym.register(
+    id="G1-Locomotion-Standing-Flat-IKReach-Height-Intent-GainMatch-TorsoClip-BadOrientation-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.g1_locomotion_env_cfg:G1LocomotionStandingFlatIKReachHeightIntentGainMatchTorsoClipBadOrientationEnvCfg_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1LocomotionStandingFlatPPORunnerCfg",
+        "rl_games_cfg_entry_point": f"{agents.__name__}:rl_games_flat_ppo_cfg.yaml",
+        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_flat_ppo_cfg.yaml",
+        "sb3_cfg_entry_point": f"{agents.__name__}:sb3_flat_ppo_cfg.yaml",
+    },
+)
+
+# Sibling to the TorsoClip task above: same GainMatch base, but torso_joint's action clip
+# is a full 0-width lock instead of +/-30deg (2026-07-20) — see
+# G1LocomotionStandingFlatIKReachHeightIntentGainMatchTorsoLockEnvCfg's docstring for why
+# this is run alongside (not instead of) the +/-30deg version.
+gym.register(
+    id="G1-Locomotion-Standing-Flat-IKReach-Height-Intent-GainMatch-TorsoLock-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.g1_locomotion_env_cfg:G1LocomotionStandingFlatIKReachHeightIntentGainMatchTorsoLockEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1LocomotionStandingFlatPPORunnerCfg",
+        "rl_games_cfg_entry_point": f"{agents.__name__}:rl_games_flat_ppo_cfg.yaml",
+        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_flat_ppo_cfg.yaml",
+        "sb3_cfg_entry_point": f"{agents.__name__}:sb3_flat_ppo_cfg.yaml",
+    },
+)
+
+gym.register(
+    id="G1-Locomotion-Standing-Flat-IKReach-Height-Intent-GainMatch-TorsoLock-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.g1_locomotion_env_cfg:G1LocomotionStandingFlatIKReachHeightIntentGainMatchTorsoLockEnvCfg_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1LocomotionStandingFlatPPORunnerCfg",
+        "rl_games_cfg_entry_point": f"{agents.__name__}:rl_games_flat_ppo_cfg.yaml",
+        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_flat_ppo_cfg.yaml",
+        "sb3_cfg_entry_point": f"{agents.__name__}:sb3_flat_ppo_cfg.yaml",
+    },
+)
+
 # Same as G1-Locomotion-Standing-Flat-IKReach-Height-v0 plus one change: mdp.symmetry.leg_symmetry_l2
 # (weight -2.0), penalizing left-right leg asymmetry directly — added after visually confirming a
 # persistent, lopsided rest pose (tilt, uneven legs) with zero arm disturbance active. See

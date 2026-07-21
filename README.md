@@ -110,6 +110,13 @@ The integrated demo reads default checkpoint paths from:
 - `testing/arm_testing/checkpoints.yaml`
 - `testing/general_testing/checkpoints.yaml`
 
+See the script's own module docstring (top of `g1_full_demo.py`) for the full flag
+reference, keybindings, and arm-target coordinate format — it's the authoritative usage
+doc, kept current with the script itself. One flag worth knowing about: `--wait_arm_rest`
+(2026-07-20) holds off the standing→walking mode switch until an active arm target has
+finished homing back to default, for comparing against the default (un-delayed) behavior
+if you see any instability right as walking starts with an arm away from rest.
+
 ## Repo Layout
 
 - `source/g1_locomotion/` — task registration and environment/task code
