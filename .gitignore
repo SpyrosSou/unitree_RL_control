@@ -80,6 +80,11 @@ _build
 # checking why chosen_checkpoints/exported/ was showing as untracked-but-partially-ignored).
 !chosen_checkpoints/exported/
 !chosen_checkpoints/exported/*
+# Same subdirectory-exception issue as exported/ above (2026-07-21, 23_dof branch archive).
+!chosen_checkpoints/best_checkpoints/
+!chosen_checkpoints/best_checkpoints/*.pt
+!chosen_checkpoints/archive/
+!chosen_checkpoints/archive/*.pt
 
 # Pre-Trained Checkpoints
 /.pretrained_checkpoints/

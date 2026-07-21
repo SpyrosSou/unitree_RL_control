@@ -1,0 +1,2 @@
+episodes,fall_rate,mean_episode_steps,mean_max_tilt_deg,mean_min_base_height_m,mean_max_lin_speed_m_s,mean_max_ang_speed_rad_s,mean_step_count,mean_max_foot_air_time_s,mean_max_abs_torso_deg
+741,1.0000,127.1,77.72,0.148,1.475,3.315,0.52,0.276,65.52
