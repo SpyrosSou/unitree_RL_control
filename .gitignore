@@ -53,6 +53,7 @@ nohup.out
 # by a trailing-slash/subdirectory-only pattern like this).
 validation/eval_standing_ikreach/*/
 validation/integration_validation/*/
+validation/ik_accuracy/*/
 
 # Doc Outputs
 **/docs/_build/*
