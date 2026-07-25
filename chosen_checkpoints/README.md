@@ -2,26 +2,21 @@
 
 This folder contains the curated deployable checkpoints that are intentionally kept in-repo.
 
-Current contents (updated 2026-07-16):
+**Empty as of 2026-07-21** — the 23dof-era checkpoints (`standing_latest.pt`,
+`walking_latest.pt`, `arm_left_latest.pt`, `standing_2026-07-09_prev.pt`, and the
+`exported/` ONNX artifacts) were removed from `main` as part of the pivot to the G1's
+real 29dof hardware layout — they're built against the wrong action space
+(1-DOF waist, 5-DOF arms, no wrists) and would need retraining regardless. They're not
+gone: the full checkpoint set, with a curated best/archive breakdown and a
+`validation/history/` of every eval this project ever ran, lives on the `23_dof` branch.
+See `lessons_learned.md` (repo root) for the findings from that phase worth carrying
+into this one.
 
-- `walking_latest.pt`  -> primary flat walking policy (0% falls in every eval, untouched all phase)
-- `standing_latest.pt` -> primary standing policy = `logs/rsl_rl/standing/g1_locomotion_flat/`
-  `2026-07-13_23-52-48_height_reward/model_5999.pt` — winner of the 2026-07-16 8-checkpoint
-  sweep (only checkpoint at 0% falls in BOTH standing_still and the IK-arm reach bucket,
-  no squat at 0.72m height, ~20° peak torso). See definitive_next_steps.md for the full verdict
-  and the caveat (it must be retrained once the arm's IK reaching is fixed — see there).
-- `standing_2026-07-09_prev.pt` -> the previous standing pointer (kept as backup; its source
-  run may no longer exist under logs/).
-- `arm_left_latest.pt` -> primary left-arm IK policy (RL; reaches well in isolation but its
-  motion destabilizes standing — see definitive_next_steps.md Step 3).
+Recommended update workflow once new checkpoints exist:
 
-These files are the only `.pt` files expected to be committed.
-All other training checkpoints under `logs/` are ignored.
-
-Recommended update workflow:
-
-1. Train and evaluate a new candidate checkpoint (gate with
-   `validation/eval_standing_ikreach.py --freeze_arms` first, then the integration eval).
-2. Copy the chosen `.pt` file into this folder using the standard filename (keep the old
-   one as `*_prev.pt` until the replacement is confirmed in the demo).
+1. Train and evaluate a new candidate checkpoint (gate with `--freeze_arms` first, then
+   the real integration eval — see whatever the 29dof eval scripts end up being called).
+2. Copy the chosen `.pt` file into this folder using a clear filename (`standing_latest.pt`,
+   `walking_latest.pt`, `arm_left_latest.pt`, or similar — keep the old one as `*_prev.pt`
+   until the replacement is confirmed in the demo).
 3. Commit the replacement so demos/tests continue to use stable default paths.

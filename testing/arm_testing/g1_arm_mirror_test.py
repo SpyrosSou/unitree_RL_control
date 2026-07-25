@@ -15,21 +15,21 @@ Usage (from project root, conda activate isaac_g1_control):
     python testing/arm_testing/g1_arm_mirror_test.py \\
         --trained_arm left \\
         --active_arm right \\
-        --checkpoint logs/rsl_rl/arms/g1_arm_ik_left/<run>/model_5000.pt \\
+        --checkpoint logs/rsl_rl/arms/left/<run>/model_5000.pt \\
         --targets 0.3 -0.2 1.0
 
     # Run a left-trained policy on the LEFT arm (no mirror, same as g1_arm_reach_test.py)
     python testing/arm_testing/g1_arm_mirror_test.py \\
         --trained_arm left \\
         --active_arm left \\
-        --checkpoint logs/rsl_rl/arms/g1_arm_ik_left/<run>/model_5000.pt \\
+        --checkpoint logs/rsl_rl/arms/left/<run>/model_5000.pt \\
         --targets 0.3 0.2 1.0
 
     # Run a right-trained policy on the LEFT arm (mirrored)
     python testing/arm_testing/g1_arm_mirror_test.py \\
         --trained_arm right \\
         --active_arm left \\
-        --checkpoint logs/rsl_rl/arms/g1_arm_ik_right/<run>/model_5000.pt \\
+        --checkpoint logs/rsl_rl/arms/right/<run>/model_5000.pt \\
         --targets 0.3 0.2 1.0
 
 Target coordinates are always in the physical robot frame:
@@ -90,12 +90,12 @@ import g1_locomotion.tasks  # noqa: F401 — registers gym envs
 import torch
 import yaml
 from g1_locomotion.tasks.manager_based.g1_arm.agents.rsl_rl_ppo_cfg import (
-    G1ArmIKLeftPPORunnerCfg,  # same architecture for both arms — used for network shape only
+    G1ArmLeftPPORunnerCfg,  # same architecture for both arms — used for network shape only
 )
 from g1_locomotion.tasks.manager_based.g1_arm.g1_arm_env import (
-    G1ArmIKEnv,
-    G1ArmIKLeftEnvCfg_PLAY,
-    G1ArmIKRightEnvCfg_PLAY,
+    G1ArmEnv,
+    G1ArmLeftEnvCfg_PLAY,
+    G1ArmRightEnvCfg_PLAY,
 )
 from g1_locomotion.tasks.manager_based.g1_arm.mdp.symmetry import mirror_arm_actions, mirror_arm_obs
 from rsl_rl.runners import OnPolicyRunner
@@ -240,10 +240,10 @@ def main():
     # ------------------------------------------------------------------
     # Build environment for the ACTIVE arm (1 env)
     # ------------------------------------------------------------------
-    env_cfg = G1ArmIKLeftEnvCfg_PLAY() if active_arm == "left" else G1ArmIKRightEnvCfg_PLAY()
+    env_cfg = G1ArmLeftEnvCfg_PLAY() if active_arm == "left" else G1ArmRightEnvCfg_PLAY()
     env_cfg.scene.num_envs = 1
 
-    inner_env = G1ArmIKEnv(env_cfg, render_mode=None)
+    inner_env = G1ArmEnv(env_cfg, render_mode=None)
     env = RslRlVecEnvWrapper(inner_env)
     device = inner_env.device
     targets_local = [t.to(device) for t in targets_local]
@@ -251,7 +251,7 @@ def main():
     # ------------------------------------------------------------------
     # Load policy — architecture is identical for left and right (17→5)
     # ------------------------------------------------------------------
-    agent_cfg = G1ArmIKLeftPPORunnerCfg()
+    agent_cfg = G1ArmLeftPPORunnerCfg()
     runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=str(device))
     runner.load(checkpoint_path)
     policy = runner.get_inference_policy(device=device)

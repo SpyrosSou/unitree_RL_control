@@ -29,7 +29,7 @@ import torch
 
 from isaaclab.utils.math import euler_xyz_from_quat, quat_apply, wrap_to_pi
 
-from g1_locomotion.tasks.manager_based.g1_locomotion.mdp.events import StandingArmTrajectoryDisturbance
+from g1_locomotion.tasks.manager_based.g1_locomotion.mdp.events import ArmMotionDisturbance
 
 
 def _next_episode_index(csv_path: str) -> int:
@@ -53,16 +53,16 @@ def _next_episode_index(csv_path: str) -> int:
 def _arm_disturbance_phase(common_step_counter: int) -> int:
     """Which arm-motion-disturbance curriculum phase a given env-step falls in.
 
-    Mirrors ``StandingArmTrajectoryDisturbance._phase_index`` using the class's default
+    Mirrors ``ArmMotionDisturbance._phase_index`` using the class's default
     phase boundaries (the ones actually used during training; only the *_PLAY* configs
     override them for faster visual demos). Kept here instead of read off the live event
     term instance so a finished-episode row can be labelled without holding a reference
     to the event manager.
     """
-    for i, boundary in enumerate(StandingArmTrajectoryDisturbance._PHASE_STEP_BOUNDARIES):
+    for i, boundary in enumerate(ArmMotionDisturbance._PHASE_STEP_BOUNDARIES):
         if common_step_counter < boundary:
             return i
-    return len(StandingArmTrajectoryDisturbance._PHASE_STEP_BOUNDARIES)
+    return len(ArmMotionDisturbance._PHASE_STEP_BOUNDARIES)
 
 
 class _DualCsvWriter:
@@ -328,7 +328,14 @@ class StandingMetricsCsvWrapper(gym.Wrapper):
             self._episode_max_action_delta_abs, action_delta.detach().float()
         )
         if self._torso_joint_id is None:
-            torso_ids, _ = robot.find_joints("torso_joint")
+            # "torso_joint" (2026-07-21): the 29dof asset has no single torso joint —
+            # replaced by a 3-DOF waist (waist_yaw/roll/pitch). waist_yaw is the direct
+            # analog of the old joint (the 23dof-era code's own comment already
+            # described "torso_joint" as "a waist YAW joint" — this column always meant
+            # torso *twist* specifically, not general waist motion), so this column
+            # keeps its original meaning and name unchanged, just repointed to the
+            # equivalent joint on the new asset. See 29dof_implementation_plan.md.
+            torso_ids, _ = robot.find_joints("waist_yaw_joint")
             self._torso_joint_id = torso_ids[0]
         abs_torso = robot.data.joint_pos[:, self._torso_joint_id].abs().detach().float()
         self._episode_max_abs_torso = torch.maximum(self._episode_max_abs_torso, abs_torso)

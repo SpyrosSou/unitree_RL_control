@@ -3,35 +3,45 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Deterministic, command-conditioned evaluation for a walking checkpoint.
+"""Deterministic, command-conditioned evaluation for a G1 29dof unified stand+walk
+checkpoint — the "training-only" metrics eval (as opposed to
+``validation/integration_validation/eval_full_demo.py``-style testing with a separate
+arm policy layered on top, which doesn't exist for the 29dof arm yet anyway).
 
-Where eval_standing.py sweeps disturbance intensity at a fixed (near-zero) command,
-this sweeps a fixed command envelope (forward/backward/strafe/turn, at a few speeds)
-and holds it constant for the whole rollout — unlike training, where the command
-resamples every ~1-2.5s, so no single episode cleanly isolates "how well does it track
-*this* command." Random pushes and external-force events are disabled for this eval so
-the numbers reflect the policy's own tracking/gait behavior, not push recovery.
+Rewritten 2026-07-21 for the 29dof pivot — replaces the 23dof-era version that used to
+live at this exact path (preserved on the ``23_dof`` git branch, not carried forward
+here) — see ``29dof_implementation_plan.md``. Structurally close to a straight port:
+same command-bucket sweep, same drift-check methodology, same
+``WalkingMetricsCsvWrapper`` reuse (so these numbers are directly comparable to a run's
+own ``walking_detailed.csv`` — see that wrapper's docstring). Two real differences from
+the 23dof version:
 
-Includes drift buckets (pure forward/backward, zero lateral/yaw commanded) specifically
-to catch the failure mode of the robot wandering off a straight line even when nothing
-asked it to turn or strafe — instantaneous velocity-tracking error can look fine on
-average while this still happens, since a small systematic yaw-rate bias accumulates
-over an episode instead of showing up per-step. See validation/README.md for what the
-numbers mean and what "good" looks like.
+1. This project's 23dof phase had separate standing and walking checkpoints/tasks;
+   the 29dof recipe is one unified policy (``rel_standing_envs`` covers near-zero-
+   velocity "standing" as an edge case of the same command distribution) — so this one
+   script covers what used to need two (``eval_standing.py`` + ``eval_walking.py``). The
+   ``stand_still`` bucket already in ``_BUCKETS`` below exercises exactly that regime.
+2. ``--arm_disturbance`` — if the checkpoint was trained on
+   ``G1-Locomotion-Velocity-ArmDisturbance-v0`` (the arm-motion-disturbance
+   curriculum, see Phase 2 of the plan), pass this to build the eval env from
+   ``G1LocomotionArmDisturbanceEnvCfg_PLAY`` instead of the plain ``G1LocomotionEnvCfg_PLAY`` — forces
+   the disturbance curriculum fully on (matching that _PLAY cfg's own phase-boundary
+   override) instead of leaving arms scripted-static, so the command-tracking numbers
+   reflect what the checkpoint actually has to cope with. Omit for a base-recipe
+   checkpoint (``G1-Locomotion-Velocity-v0``) — arms just sit at default the whole
+   time either way for that one.
 
 Usage:
     conda activate isaac_g1_control
     cd ~/Elm/Code/g1_locomotion
 
     python validation/eval_walking.py \\
-        --checkpoint logs/rsl_rl/legs/g1_locomotion_flat/<run>/model_2998.pt \\
+        --checkpoint logs/rsl_rl/walking/base/<run>/model_2998.pt \\
         --headless
 
     python validation/eval_walking.py \\
-        --checkpoint chosen_checkpoints/walking_latest.pt \\
-        --buckets forward_medium forward_fast turn_left \\
-        --num_envs 512 \\
-        --steps_per_bucket 3000 \\
+        --checkpoint logs/rsl_rl/walking/arm_disturbance/<run>/model_2998.pt \\
+        --arm_disturbance \\
         --headless
 
 Output:
@@ -64,11 +74,28 @@ _BUCKETS = {
 }
 _STRAIGHT_BUCKETS = {"forward_slow", "forward_medium", "forward_fast", "backward"}
 
-parser = argparse.ArgumentParser(description="Command-conditioned eval for a walking checkpoint.")
-parser.add_argument("--checkpoint", type=str, required=True, help="Path to a trained walking checkpoint (.pt).")
+parser = argparse.ArgumentParser(description="Command-conditioned eval for a G1 29dof stand+walk checkpoint.")
+parser.add_argument("--checkpoint", type=str, required=True, help="Path to a trained checkpoint (.pt).")
+parser.add_argument(
+    "--arm_disturbance", action="store_true",
+    help="Build the eval env from G1LocomotionArmDisturbanceEnvCfg_PLAY (disturbance forced on) "
+    "instead of the plain G1LocomotionEnvCfg_PLAY — pass this for a checkpoint trained on "
+    "G1-Locomotion-Velocity-ArmDisturbance-v0.",
+)
 parser.add_argument(
     "--buckets", type=str, nargs="+", default=list(_BUCKETS.keys()), choices=list(_BUCKETS.keys()),
     help="Which command buckets to evaluate.",
+)
+parser.add_argument(
+    "--pin_disturbance_phase", type=int, default=None, choices=[0, 1, 2, 3],
+    help="Pin mdp.ArmMotionDisturbance at exactly this phase for the whole eval, instead of letting "
+    "it cycle through phases over elapsed eval time (the default _PLAY phase_step_boundaries are "
+    "tuned for a quick play.py look, not a clean per-phase measurement — a stand_still bucket run "
+    "with this unset blends whatever mix of phases happened to occur during the eval window into "
+    "one fall-rate number, dominated by whichever phase produced the most short/failing episodes). "
+    "Works by setting phase_step_boundaries to N copies of 0, which makes the phase-index lookup "
+    "fall through immediately to phase N regardless of step count — no new logic, just forces the "
+    "existing one. Only meaningful with --arm_disturbance. Ignored otherwise.",
 )
 parser.add_argument("--num_envs", type=int, default=256, help="Parallel envs per bucket.")
 parser.add_argument(
@@ -96,14 +123,15 @@ from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
 
 import g1_locomotion.tasks  # noqa: F401 — registers gym envs
-from g1_locomotion.tasks.manager_based.g1_locomotion.agents.rsl_rl_ppo_cfg import (
-    G1LocomotionFlatPPORunnerCfg,
-)
+from g1_locomotion.tasks.manager_based.g1_locomotion.agents.rsl_rl_ppo_cfg import BasePPORunnerCfg
 from g1_locomotion.tasks.manager_based.g1_locomotion.g1_locomotion_env_cfg import (
-    G1LocomotionFlatEnvCfg_PLAY,
+    G1LocomotionArmDisturbanceEnvCfg_PLAY,
+    G1LocomotionEnvCfg_PLAY,
 )
 # Reuse the exact same per-episode metrics wrapper training runs use — keeps the eval's
-# numbers directly comparable to what you'd see in a run's walking_detailed.csv.
+# numbers directly comparable to what you'd see in a run's walking_detailed.csv. No
+# 29dof-specific wrapper needed: WalkingMetricsCsvWrapper has no DOF-count assumptions
+# (unlike StandingMetricsCsvWrapper, not used here — see 29dof_implementation_plan.md).
 from g1_locomotion.utils.eval_meta import write_eval_meta
 from g1_locomotion.utils.metrics_wrappers import WalkingMetricsCsvWrapper
 
@@ -135,7 +163,8 @@ def _summarize(csv_path: str, is_straight: bool) -> dict:
 
 
 def _build_base_env() -> ManagerBasedRLEnv:
-    env_cfg = G1LocomotionFlatEnvCfg_PLAY()
+    env_cfg_cls = G1LocomotionArmDisturbanceEnvCfg_PLAY if args_cli.arm_disturbance else G1LocomotionEnvCfg_PLAY
+    env_cfg = env_cfg_cls()
     env_cfg.scene.num_envs = args_cli.num_envs
     env_cfg.seed = args_cli.seed
 
@@ -155,12 +184,21 @@ def _build_base_env() -> ManagerBasedRLEnv:
 
     # Disable heading_command mode (if present) so ranges.ang_vel_z drives the yaw-rate
     # command directly instead of being overridden by an internal heading-tracking law
-    # that chases an independently sampled target heading — same reasoning the standing
-    # config already applies. Actual per-bucket values get set live in _run_bucket().
+    # that chases an independently sampled target heading.
     base_velocity = env_cfg.commands.base_velocity
     if hasattr(base_velocity, "heading_command"):
         base_velocity.heading_command = False
     base_velocity.rel_standing_envs = 0.0
+    # debug_vis=True (the class default) spawns a debug-arrow USD prim fetched from a
+    # remote Nucleus/S3 asset path — with no local cache and a slow/unreachable network
+    # path this hangs for up to a 300s timeout per env launch, even in --headless mode
+    # (confirmed 2026-07-24 — see check_arm_disturbance_magnitude.py's identical fix).
+    base_velocity.debug_vis = False
+
+    if args_cli.pin_disturbance_phase is not None and hasattr(env_cfg.events, "arm_motion_disturbance"):
+        n = args_cli.pin_disturbance_phase
+        env_cfg.events.arm_motion_disturbance.params["phase_step_boundaries"] = tuple([0] * n)
+        env_cfg.events.arm_motion_disturbance.params["phase_step_offset"] = 0
 
     return ManagerBasedRLEnv(cfg=env_cfg)
 
@@ -170,11 +208,9 @@ def _run_bucket(base_env: ManagerBasedRLEnv, name: str, eval_root: str) -> dict:
 
     Deliberately reuses one ManagerBasedRLEnv across all buckets instead of building a
     fresh one per bucket — repeatedly constructing/tearing down Isaac Sim's simulation
-    context within a single process is unreliable and was observed to hang indefinitely
-    in the standing eval's equivalent original design. The velocity command term reads
-    its cfg.ranges fresh on every resample (see UniformVelocityCommand._resample_command),
-    so mutating the live term's ranges and calling reset() is enough to switch buckets —
-    no rebuild needed.
+    context within a single process is unreliable. The velocity command term reads its
+    cfg.ranges fresh on every resample, so mutating the live term's ranges and calling
+    reset() is enough to switch buckets — no rebuild needed.
     """
     vx, vy, wz = _BUCKETS[name]
     print(f"\n[Eval] --- Bucket '{name}' (vx={vx}, vy={vy}, wz={wz}) ---")
@@ -191,16 +227,14 @@ def _run_bucket(base_env: ManagerBasedRLEnv, name: str, eval_root: str) -> dict:
     # onward those tensors get written to while already tagged as PyTorch "inference
     # tensors" (the first bucket's rollout ran inside inference_mode) — in-place writes
     # to an inference tensor are only legal from *inside* inference_mode, so
-    # construction/reset must be in this block too, not just the stepping loop (outside
-    # it raises "Inplace update to inference tensor outside InferenceMode is not
-    # allowed").
+    # construction/reset must be in this block too, not just the stepping loop.
     torch.manual_seed(args_cli.seed)
     with torch.inference_mode():
         env = WalkingMetricsCsvWrapper(base_env, bucket_dir)
         device = base_env.device
         wrapped_env = RslRlVecEnvWrapper(env)
 
-        agent_cfg = G1LocomotionFlatPPORunnerCfg()
+        agent_cfg = BasePPORunnerCfg()
         runner = OnPolicyRunner(wrapped_env, agent_cfg.to_dict(), log_dir=None, device=device)
         runner.load(args_cli.checkpoint)
         policy = runner.get_inference_policy(device=device)
@@ -208,6 +242,16 @@ def _run_bucket(base_env: ManagerBasedRLEnv, name: str, eval_root: str) -> dict:
         # reset() forces every env to resample its command immediately, picking up the
         # ranges just set above rather than waiting for the natural resampling_time_range.
         obs, _ = wrapped_env.reset()
+        # FOUND 2026-07-23 (g1_full_demo.py investigation): that same reset() also
+        # re-rolls is_standing_env per env (probability rel_standing_envs), and
+        # UniformVelocityCommand._update_command() force-zeroes vel_command_b every
+        # step for any env still flagged — silently overriding the fixed (vx,vy,wz)
+        # this bucket is supposed to be testing for whichever ~2% of envs get unlucky.
+        # Small-scale here (num_envs is large, so only a handful of episodes per bucket
+        # are affected, not the near-total corruption a 1-env demo saw) but still a
+        # real, unnecessary contamination of buckets that are supposed to be a fixed,
+        # pinned command for every env.
+        command_term.is_standing_env[:] = False
         for _ in range(args_cli.steps_per_bucket):
             action = policy(obs)
             obs, _, _, _ = wrapped_env.step(action)
@@ -220,21 +264,28 @@ def _run_bucket(base_env: ManagerBasedRLEnv, name: str, eval_root: str) -> dict:
 
 def main():
     checkpoint_dir = os.path.dirname(os.path.abspath(args_cli.checkpoint))
-    eval_root = os.path.join(checkpoint_dir, "command_eval")
+    eval_dir_name = "command_eval"
+    if args_cli.pin_disturbance_phase is not None:
+        # Namespaced separately per phase — otherwise repeated per-phase runs against the
+        # same checkpoint would overwrite each other's summary.md/CSVs in "command_eval/".
+        eval_dir_name = f"command_eval_phase{args_cli.pin_disturbance_phase}"
+    eval_root = os.path.join(checkpoint_dir, eval_dir_name)
     os.makedirs(eval_root, exist_ok=True)
     write_eval_meta(eval_root, args_cli, __file__)
 
-    print(f"[Eval] Checkpoint : {args_cli.checkpoint}")
-    print(f"[Eval] Buckets    : {args_cli.buckets}")
-    print(f"[Eval] num_envs   : {args_cli.num_envs}   steps_per_bucket: {args_cli.steps_per_bucket}")
+    print(f"[Eval] Checkpoint     : {args_cli.checkpoint}")
+    print(f"[Eval] Arm disturbance: {args_cli.arm_disturbance}")
+    print(f"[Eval] Buckets        : {args_cli.buckets}")
+    print(f"[Eval] num_envs       : {args_cli.num_envs}   steps_per_bucket: {args_cli.steps_per_bucket}")
 
     print("[Eval] Building simulation (once, reused across all buckets)...")
     base_env = _build_base_env()
 
     summary_lines = [
-        "# Walking Command-Conditioned Eval",
+        "# G1 29dof Locomotion Command-Conditioned Eval",
         "",
         f"Checkpoint: `{args_cli.checkpoint}`",
+        f"Arm disturbance forced on: {args_cli.arm_disturbance}",
         "",
         "| Bucket | vx, vy, wz | Episodes | Fall rate | Lin. track err (m/s) | Ang. track err (rad/s) "
         "| Foot slip (m/s) | Mean\\|heading drift\\| (deg) | Mean\\|lateral drift\\| (m) |",

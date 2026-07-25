@@ -1,6 +1,14 @@
 # Copyright (c) 2022-2026, The Isaac Lab Project Developers.
 # SPDX-License-Identifier: BSD-3-Clause
 
+"""G1 29dof arm policy — see 29dof_implementation_plan.md Phase 3.
+
+Task ids deliberately don't say "IK" (2026-07-21, user request) — the deployed policy is
+pure RL joint-space control, no inverse kinematics involved. See g1_arm_env.py's module
+docstring for the full rationale and what changed from the 23dof-era 5-DOF/"Arm-IK"-named
+task this was adapted from.
+"""
+
 import gymnasium as gym
 
 from . import agents
@@ -13,86 +21,56 @@ from . import agents
 # Left arm  (train + play)
 # ---------------------------------------------------------------------------
 gym.register(
-    id="G1-Arm-IK-Left-v0",
-    entry_point="g1_locomotion.tasks.manager_based.g1_arm.g1_arm_env:G1ArmIKEnv",
+    id="G1-Arm-Left-v0",
+    entry_point="g1_locomotion.tasks.manager_based.g1_arm.g1_arm_env:G1ArmEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": f"{__name__}.g1_arm_env:G1ArmIKLeftEnvCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1ArmIKLeftPPORunnerCfg",
+        "env_cfg_entry_point": f"{__name__}.g1_arm_env:G1ArmLeftEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1ArmLeftPPORunnerCfg",
     },
 )
 
 gym.register(
-    id="G1-Arm-IK-Left-Play-v0",
-    entry_point="g1_locomotion.tasks.manager_based.g1_arm.g1_arm_env:G1ArmIKEnv",
+    id="G1-Arm-Left-Play-v0",
+    entry_point="g1_locomotion.tasks.manager_based.g1_arm.g1_arm_env:G1ArmEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": f"{__name__}.g1_arm_env:G1ArmIKLeftEnvCfg_PLAY",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1ArmIKLeftPPORunnerCfg",
+        "env_cfg_entry_point": f"{__name__}.g1_arm_env:G1ArmLeftEnvCfg_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1ArmLeftPPORunnerCfg",
     },
 )
 
-# ---------------------------------------------------------------------------
-# Left arm — overnight sweep experiments (2026-07-07), see known_issues.md.
-# Each isolates exactly one change vs. G1-Arm-IK-Left-v0's baseline.
-# ---------------------------------------------------------------------------
+# 2026-07-24: wrist_pitch/wrist_yaw locked at default, 5 controlled joints instead of
+# 7 — see G1ArmLeftLockedWristEnvCfg's own docstring.
 gym.register(
-    id="G1-Arm-IK-Left-RewardShape-v0",
-    entry_point="g1_locomotion.tasks.manager_based.g1_arm.g1_arm_env:G1ArmIKEnv",
+    id="G1-Arm-Left-LockedWrist-v0",
+    entry_point="g1_locomotion.tasks.manager_based.g1_arm.g1_arm_env:G1ArmEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": f"{__name__}.g1_arm_env:G1ArmIKLeftRewardShapeEnvCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1ArmIKLeftRewardShapePPORunnerCfg",
+        "env_cfg_entry_point": f"{__name__}.g1_arm_env:G1ArmLeftLockedWristEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1ArmLeftLockedWristPPORunnerCfg",
     },
 )
 
+# 2026-07-24 walking-fix-style ablations for the arm task — see G1ArmLeftAblation*
+# classes in g1_arm_env.py/agents/rsl_rl_ppo_cfg.py for what each isolates.
 gym.register(
-    id="G1-Arm-IK-Left-GoalCurriculum-v0",
-    entry_point="g1_locomotion.tasks.manager_based.g1_arm.g1_arm_env:G1ArmIKEnv",
+    id="G1-Arm-Left-Ablation-EntropyCoef-v0",
+    entry_point="g1_locomotion.tasks.manager_based.g1_arm.g1_arm_env:G1ArmEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": f"{__name__}.g1_arm_env:G1ArmIKLeftGoalCurriculumEnvCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1ArmIKLeftGoalCurriculumPPORunnerCfg",
-    },
-)
-
-gym.register(
-    id="G1-Arm-IK-Left-StressRegion-v0",
-    entry_point="g1_locomotion.tasks.manager_based.g1_arm.g1_arm_env:G1ArmIKEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.g1_arm_env:G1ArmIKLeftStressRegionEnvCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1ArmIKLeftStressRegionPPORunnerCfg",
+        "env_cfg_entry_point": f"{__name__}.g1_arm_env:G1ArmLeftEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1ArmLeftAblationEntropyCoefPPORunnerCfg",
     },
 )
 
 gym.register(
-    id="G1-Arm-IK-Left-WideNet-v0",
-    entry_point="g1_locomotion.tasks.manager_based.g1_arm.g1_arm_env:G1ArmIKEnv",
+    id="G1-Arm-Left-Ablation-ExpScale-v0",
+    entry_point="g1_locomotion.tasks.manager_based.g1_arm.g1_arm_env:G1ArmEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": f"{__name__}.g1_arm_env:G1ArmIKLeftEnvCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1ArmIKLeftWideNetPPORunnerCfg",
-    },
-)
-
-gym.register(
-    id="G1-Arm-IK-Left-Entropy-v0",
-    entry_point="g1_locomotion.tasks.manager_based.g1_arm.g1_arm_env:G1ArmIKEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.g1_arm_env:G1ArmIKLeftEnvCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1ArmIKLeftEntropyPPORunnerCfg",
-    },
-)
-
-gym.register(
-    id="G1-Arm-IK-Left-PPOTuning-v0",
-    entry_point="g1_locomotion.tasks.manager_based.g1_arm.g1_arm_env:G1ArmIKEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.g1_arm_env:G1ArmIKLeftEnvCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1ArmIKLeftPPOTuningPPORunnerCfg",
+        "env_cfg_entry_point": f"{__name__}.g1_arm_env:G1ArmLeftAblationExpScaleEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1ArmLeftAblationExpScalePPORunnerCfg",
     },
 )
 
@@ -100,22 +78,22 @@ gym.register(
 # Right arm  (train + play)
 # ---------------------------------------------------------------------------
 gym.register(
-    id="G1-Arm-IK-Right-v0",
-    entry_point="g1_locomotion.tasks.manager_based.g1_arm.g1_arm_env:G1ArmIKEnv",
+    id="G1-Arm-Right-v0",
+    entry_point="g1_locomotion.tasks.manager_based.g1_arm.g1_arm_env:G1ArmEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": f"{__name__}.g1_arm_env:G1ArmIKRightEnvCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1ArmIKRightPPORunnerCfg",
+        "env_cfg_entry_point": f"{__name__}.g1_arm_env:G1ArmRightEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1ArmRightPPORunnerCfg",
     },
 )
 
 gym.register(
-    id="G1-Arm-IK-Right-Play-v0",
-    entry_point="g1_locomotion.tasks.manager_based.g1_arm.g1_arm_env:G1ArmIKEnv",
+    id="G1-Arm-Right-Play-v0",
+    entry_point="g1_locomotion.tasks.manager_based.g1_arm.g1_arm_env:G1ArmEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": f"{__name__}.g1_arm_env:G1ArmIKRightEnvCfg_PLAY",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1ArmIKRightPPORunnerCfg",
+        "env_cfg_entry_point": f"{__name__}.g1_arm_env:G1ArmRightEnvCfg_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1ArmRightPPORunnerCfg",
     },
 )
 
@@ -123,21 +101,21 @@ gym.register(
 # Both arms  (train + play)
 # ---------------------------------------------------------------------------
 gym.register(
-    id="G1-Arm-IK-Both-v0",
-    entry_point="g1_locomotion.tasks.manager_based.g1_arm.g1_arm_env:G1ArmIKEnv",
+    id="G1-Arm-Both-v0",
+    entry_point="g1_locomotion.tasks.manager_based.g1_arm.g1_arm_env:G1ArmEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": f"{__name__}.g1_arm_env:G1ArmIKBothEnvCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1ArmIKBothPPORunnerCfg",
+        "env_cfg_entry_point": f"{__name__}.g1_arm_env:G1ArmBothEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1ArmBothPPORunnerCfg",
     },
 )
 
 gym.register(
-    id="G1-Arm-IK-Both-Play-v0",
-    entry_point="g1_locomotion.tasks.manager_based.g1_arm.g1_arm_env:G1ArmIKEnv",
+    id="G1-Arm-Both-Play-v0",
+    entry_point="g1_locomotion.tasks.manager_based.g1_arm.g1_arm_env:G1ArmEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": f"{__name__}.g1_arm_env:G1ArmIKBothEnvCfg_PLAY",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1ArmIKBothPPORunnerCfg",
+        "env_cfg_entry_point": f"{__name__}.g1_arm_env:G1ArmBothEnvCfg_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1ArmBothPPORunnerCfg",
     },
 )

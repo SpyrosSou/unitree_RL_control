@@ -1,17 +1,17 @@
-# Arm Workspace Reachability Check
+# G1 29dof Arm Workspace Reachability Check
 
-Arm: `left` — Goal bounds: `{'x': (0.15, 0.42), 'y': (0.05, 0.4), 'z': (0.9, 1.15)}`
+Arm: `left` — Goal bounds: `{'x': (0.2, 0.42), 'y': (0.08, 0.4), 'z': (0.9, 1.15)}` (starting hypothesis, reused numerically from the 23dof-era 5-DOF task — see g1_arm_env.py's module docstring)
 Reachable-workspace samples: 409600 (random joint configs within real hardware limits)
 Goal-box grid points checked: 2744 (14^3)
 
 | Tolerance | Coverage (% of goal box within this distance of a reachable point) |
 |---|---|
-| 2.0cm | 65.3% |
-| 5.0cm | 84.0% |
-| 10.0cm | 98.5% |
+| 2.0cm | 97.0% |
+| 5.0cm | 99.9% |
+| 10.0cm | 100.0% |
 | 15.0cm | 100.0% |
 
-Nearest-reachable-point distance over the grid: mean=2.24cm, median=0.76cm, p90=6.56cm, max=11.90cm
+Nearest-reachable-point distance over the grid: mean=0.61cm, median=0.50cm, p90=0.95cm, max=5.21cm
 
 ## Per-octant breakdown (split the box at its own x/y/z median)
 
@@ -20,11 +20,11 @@ here means that region is systematically far from anything the arm can reach.
 
 | x half | y half | z half | n points | mean dist (cm) | max dist (cm) |
 |---|---|---|---|---|---|
-| low | low | low | 343 | 4.61 | 11.90 |
-| low | low | high | 343 | 4.13 | 11.76 |
-| low | high | low | 343 | 1.82 | 10.30 |
-| low | high | high | 343 | 1.66 | 9.88 |
-| high | low | low | 343 | 0.81 | 4.08 |
-| high | low | high | 343 | 0.90 | 4.77 |
-| high | high | low | 343 | 1.93 | 9.33 |
-| high | high | high | 343 | 2.08 | 9.89 |
+| low | low | low | 343 | 0.49 | 1.02 |
+| low | low | high | 343 | 0.45 | 0.94 |
+| low | high | low | 343 | 0.48 | 1.23 |
+| low | high | high | 343 | 0.43 | 1.02 |
+| high | low | low | 343 | 0.55 | 1.62 |
+| high | low | high | 343 | 0.50 | 1.04 |
+| high | high | low | 343 | 1.19 | 5.21 |
+| high | high | high | 343 | 0.82 | 4.54 |

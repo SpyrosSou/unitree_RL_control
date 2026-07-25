@@ -11,15 +11,18 @@
 #   z  height     reachable 0.9 – 1.15 m  (ground = 0)
 
 left:
-  # Training: scripts/rsl_rl/train.py  task=G1-Arm-IK-Left-v0
-  checkpoint: chosen_checkpoints/arm_left_latest.pt
+  # Training: scripts/rsl_rl/train.py  task=G1-Arm-Left-v0
+  # 2026-07-22: mid-training checkpoint (iteration 2400, resuming to ~3000) — already
+  # ~99.8% reach success / ~1.9cm mean miss distance per the live training CSV. Update
+  # once the resume finishes.
+  checkpoint: logs/rsl_rl/arms/left/2026-07-22_06-20-55/model_2400.pt
 
 right:
-  # Training: scripts/rsl_rl/train.py  task=G1-Arm-IK-Right-v0
+  # Training: scripts/rsl_rl/train.py  task=G1-Arm-Right-v0
   # (no right-arm run yet — fill in after training)
   checkpoint: ~
 
 both:
-  # Training: scripts/rsl_rl/train.py  task=G1-Arm-IK-Both-v0
+  # Training: scripts/rsl_rl/train.py  task=G1-Arm-Both-v0
   # Fill in after training a both-arm policy and curating a checkpoint.
   checkpoint: ~

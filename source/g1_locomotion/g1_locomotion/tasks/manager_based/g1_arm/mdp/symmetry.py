@@ -3,24 +3,22 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Left-right symmetry augmentation for the G1 arm-IK observation and action space.
+"""Left-right symmetry augmentation for the G1 29dof arm-policy observation and action
+space.
 
-Used via ``RslRlSymmetryCfg.data_augmentation_func`` (see ``agents/rsl_rl_ppo_cfg.py``) so the
-left-right mirror relationship ``testing/arm_testing/g1_arm_mirror_test.py`` already relies on at
-deployment time (to run a left-trained policy on the right arm, or vice versa) is something the
-policy was actually trained to satisfy, rather than an assumption that happens to look right
-because the workspace bounds are symmetric. Every training experience is mirrored and trained on
-alongside the original, so ``policy(mirror(obs)) == mirror(policy(obs))`` becomes a real, trained
-property instead of an untested one.
+Full rewrite, 2026-07-21, from the 23dof-era ``g1_arm/mdp/symmetry.py`` — that version's
+hardcoded per-dimension sign vectors were sized for the 28-D/5-D single-arm layout (no
+wrist); this task's per-arm block is 32-D/7-D (see ``g1_arm_env.py``'s module
+docstring). Same approach as before (hardcoded, not built dynamically like the
+locomotion task's symmetry code) since this task's observation/action layout is small
+and fixed by construction, not derived from a variable joint set.
 
-Unlike ``g1_locomotion/mdp/symmetry.py`` (which builds its joint swap/sign maps dynamically from
-the robot's full joint list, since walking's whole-body layout varies by task), this task's
-observation/action layout is small and fixed by construction (see ``g1_arm_env.py``'s module
-docstring), so the mirror maps here are simply hardcoded — same approach already used and
-validated in ``g1_arm_mirror_test.py``'s ``_OBS_FLIP_IDX``/``_ACT_FLIP_IDX`` (this module's index
-math is that same mapping, just re-expressed as dense per-dimension sign vectors covering the new,
-larger per-arm block introduced in Phase 2 — the arm mirror test's own indices need updating to
-match when this lands, per known_issues.md).
+Used via ``RslRlSymmetryCfg.data_augmentation_func`` (see ``agents/rsl_rl_ppo_cfg.py``)
+so the left-right mirror relationship a future arm-mirror-test script would rely on (to
+run a left-trained policy on the right arm, or vice versa — see the 23dof-era
+``testing/arm_testing/g1_arm_mirror_test.py`` for the pattern to adapt) is something the
+policy was actually trained to satisfy, not an assumption that happens to look right
+because the workspace bounds are symmetric.
 """
 
 from __future__ import annotations
@@ -35,38 +33,41 @@ if TYPE_CHECKING:
 
 __all__ = ["compute_symmetric_arm_states", "mirror_arm_obs", "mirror_arm_actions"]
 
-# Per-arm observation block (28-D, see g1_arm_env.py's module docstring):
+# Per-arm observation block (32-D, see g1_arm_env.py's module docstring):
 #   [0:3]   base_lin_vel        — lateral (y) component flips
 #   [3:6]   base_ang_vel        — roll-rate (x) and yaw-rate (z) flip, pitch-rate (y) doesn't
 #   [6:9]   projected_gravity   — lateral (y) component flips
-#   [9:14]  joint_pos  (5): shoulder_pitch, shoulder_roll, shoulder_yaw, elbow_pitch, elbow_roll
-#   [14:19] joint_vel  (5): shoulder_pitch, shoulder_roll, shoulder_yaw, elbow_pitch, elbow_roll
-#   [19:22] ee_pos              — y flips
-#   [22:25] goal                — y flips
-#   [25:28] error               — y flips (= goal - ee_pos, consistent with both flipping)
-# Roll/yaw joints flip sign under a left-right mirror, pitch joints don't — same convention as
-# g1_locomotion/mdp/symmetry.py and the arm mirror test.
-#
-# joint_vel was only 3-D (shoulder joints only) until 2026-07-08 — g1_arm_env.py's
-# observation builder sliced it to jt[:3], silently dropping elbow_pitch/elbow_roll
-# velocity. Fixed alongside that bug fix; see known_issues.md.
-_PER_ARM_OBS_DIM = 28
-_PER_ARM_ACTION_DIM = 5
+#   [9:16]  joint_pos  (7): shoulder_pitch, shoulder_roll, shoulder_yaw, elbow,
+#                            wrist_roll, wrist_pitch, wrist_yaw
+#   [16:23] joint_vel  (7): same order as joint_pos
+#   [23:26] ee_pos              — y flips
+#   [26:29] goal                — y flips
+#   [29:32] error               — y flips (= goal - ee_pos, consistent with both flipping)
+# Roll/yaw joints flip sign under a left-right mirror, pitch joints (and the single-hinge
+# elbow) don't — same convention as g1_locomotion/mdp/symmetry.py.
+_PER_ARM_OBS_DIM = 32
+_PER_ARM_ACTION_DIM = 7
 
 _OBS_SIGN = torch.tensor(
     [
         1.0, -1.0, 1.0,        # base_lin_vel
         -1.0, 1.0, -1.0,       # base_ang_vel
         1.0, -1.0, 1.0,        # projected_gravity
-        1.0, -1.0, -1.0, 1.0, -1.0,  # joint_pos: pitch, roll*, yaw*, pitch, roll*
-        1.0, -1.0, -1.0, 1.0, -1.0,  # joint_vel: pitch, roll*, yaw*, pitch, roll*
+        # joint_pos: shoulder_pitch, shoulder_roll*, shoulder_yaw*, elbow,
+        #            wrist_roll*, wrist_pitch, wrist_yaw*
+        1.0, -1.0, -1.0, 1.0, -1.0, 1.0, -1.0,
+        # joint_vel: same order/signs as joint_pos
+        1.0, -1.0, -1.0, 1.0, -1.0, 1.0, -1.0,
         1.0, -1.0, 1.0,        # ee_pos
         1.0, -1.0, 1.0,        # goal
         1.0, -1.0, 1.0,        # error
     ],
     dtype=torch.float32,
 )
-_ACTION_SIGN = torch.tensor([1.0, -1.0, -1.0, 1.0, -1.0], dtype=torch.float32)
+_ACTION_SIGN = torch.tensor([1.0, -1.0, -1.0, 1.0, -1.0, 1.0, -1.0], dtype=torch.float32)
+
+assert _OBS_SIGN.numel() == _PER_ARM_OBS_DIM
+assert _ACTION_SIGN.numel() == _PER_ARM_ACTION_DIM
 
 
 def mirror_arm_obs(obs: torch.Tensor) -> torch.Tensor:
@@ -74,21 +75,20 @@ def mirror_arm_obs(obs: torch.Tensor) -> torch.Tensor:
     sign = _OBS_SIGN.to(obs.device)
 
     if total_dim == _PER_ARM_OBS_DIM:
-        # Single-arm mode: pure sign flip, no block swap needed (mirrors the arm's own
-        # workspace onto itself — see module docstring for why this is still meaningful
-        # training signal, not a no-op).
+        # Single-arm mode: pure sign flip, no block swap needed.
         return obs * sign
 
     if total_dim == 2 * _PER_ARM_OBS_DIM:
-        # Both-arms mode: mirroring swaps which arm is "left" and which is "right", so the
-        # two 26-D blocks swap position *and* each gets sign-flipped.
+        # Both-arms mode: mirroring swaps which arm is "left" and which is "right", so
+        # the two 32-D blocks swap position *and* each gets sign-flipped.
         left, right = obs[:, :_PER_ARM_OBS_DIM], obs[:, _PER_ARM_OBS_DIM:]
         return torch.cat([right * sign, left * sign], dim=-1)
 
     raise RuntimeError(
-        f"G1 arm symmetry: observation dim {total_dim} is neither one arm ({_PER_ARM_OBS_DIM}) "
-        f"nor both arms ({2 * _PER_ARM_OBS_DIM}) — check this wasn't applied to a task with a "
-        "different observation layout than g1_arm_env.py currently defines."
+        f"G1 29dof arm symmetry: observation dim {total_dim} is neither one arm "
+        f"({_PER_ARM_OBS_DIM}) nor both arms ({2 * _PER_ARM_OBS_DIM}) — check this "
+        "wasn't applied to a task with a different observation layout than "
+        "g1_arm_env.py currently defines."
     )
 
 
@@ -104,8 +104,8 @@ def mirror_arm_actions(actions: torch.Tensor) -> torch.Tensor:
         return torch.cat([right * sign, left * sign], dim=-1)
 
     raise RuntimeError(
-        f"G1 arm symmetry: action dim {total_dim} is neither one arm ({_PER_ARM_ACTION_DIM}) "
-        f"nor both arms ({2 * _PER_ARM_ACTION_DIM})."
+        f"G1 29dof arm symmetry: action dim {total_dim} is neither one arm "
+        f"({_PER_ARM_ACTION_DIM}) nor both arms ({2 * _PER_ARM_ACTION_DIM})."
     )
 
 
@@ -117,9 +117,7 @@ def compute_symmetric_arm_states(
 ):
     """Augment observations/actions with their left-right mirror (2x batch).
 
-    Same call signature as ``RslRlSymmetryCfg.data_augmentation_func`` expects (and the same
-    pattern as ``g1_locomotion/mdp/symmetry.py``'s ``compute_symmetric_states``), just for the
-    arm task's fixed, smaller observation/action layout.
+    Same call signature as ``RslRlSymmetryCfg.data_augmentation_func`` expects.
     """
     del env  # unused — the mirror here is purely a fixed index/sign transform, no scene lookup
 

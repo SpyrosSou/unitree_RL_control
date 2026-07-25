@@ -3,30 +3,32 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Checks how much of `_GOAL_BOUNDS` (the arm-IK task's goal workspace) is actually
-kinematically reachable, independent of any trained policy.
+"""Checks how much of `_GOAL_BOUNDS` (the G1 29dof arm policy's goal workspace) is
+actually kinematically reachable, independent of any trained policy.
 
-Motivation (2026-07-08, see known_issues.md): every arm-policy variant tried so far
-plateaus around 55-58% success, and failures miss by a real margin (median 8.5cm at
-timeout, not a near-miss) fairly uniformly across nominal start-to-goal distance. That
-pattern is also consistent with a much simpler explanation nothing so far has ruled out:
-some fraction of `_GOAL_BOUNDS` may just not be reachable by the arm's actual kinematic
-chain within its real hardware joint limits — no amount of retraining fixes that, only
-reshaping the goal box would.
+Rewritten 2026-07-21 for the 29dof pivot — replaces the 23dof-era, 5-DOF version that
+used to live at this exact path (preserved on the `23_dof` git branch) — see
+`g1_arm_env.py`'s module docstring and `29dof_implementation_plan.md` Phase 3.2.
+`_GOAL_BOUNDS` in `g1_arm_env.py` reuses the old 5-DOF task's own reachability-validated
+numeric box as a STARTING HYPOTHESIS (reasoning: position reach is governed mostly by
+upper-arm/forearm length, which the wrist addition shouldn't change) — that's a
+hypothesis, not a verified fact for this asset's actual kinematic chain, hence this
+script. Run BEFORE trusting a goal box for a real training run — a hand-picked box in
+the 23dof phase turned out only ~47% reachable, cost weeks before anyone checked (see
+`lessons_learned.md`).
+
+**Result, left arm, 2026-07-21** (see `validation/arm_reachability/left_summary.md`):
+97.0% of the box covered within 2cm (the actual `goal_threshold`), mean nearest-reachable
+distance 0.61cm — better than the 5-DOF box's own best score (~65% at 2cm, after two
+rounds of reshaping). The reuse hypothesis held; no reshaping needed. Re-run for the
+right arm and after any future change to the arm's joint limits or kinematic chain.
 
 Method: samples a large number of random joint configurations within the arm's real
-hardware limits (`self._arm_hw_limits`, the same limits training/eval already clamp to),
-reads off where the palm actually ends up, and builds a point cloud of the arm's true
-reachable workspace — no RL policy involved at all, pure kinematics via the physics sim.
-Then checks, for a dense grid of points inside `_GOAL_BOUNDS`, how close the nearest
-reachable point is. A grid point with no reachable point within a few cm is a goal that
-was *never actually achievable*, regardless of training.
-
-Caveat: self-collision (`enabled_self_collisions=True`) means a small fraction of random
-samples may be affected by contact-response artifacts from self-intersecting configs
-before the palm position is read. This should bias coverage estimates conservative (down),
-not inflate them — a real point could occasionally get missed by an artifact-affected
-sample, but an unreachable point won't get counted as reachable because of one.
+hardware limits (the same limits training/eval already clamp to), reads off where the
+end-effector actually ends up, and builds a point cloud of the arm's true reachable
+workspace — no RL policy involved at all, pure kinematics via the physics sim. Then
+checks, for a dense grid of points inside `_GOAL_BOUNDS`, how close the nearest
+reachable point is.
 
 Usage:
     conda activate isaac_g1_control
@@ -35,8 +37,7 @@ Usage:
     python validation/check_arm_reachability.py --arm left --headless
 
 Output: printed coverage percentages at multiple tolerances, plus a coarse per-octant
-breakdown (which corner/region of the box is hardest to reach, if any), and a summary
-written to validation/arm_reachability/<arm>_summary.md.
+breakdown, and a summary written to validation/arm_reachability/<arm>_summary.md.
 """
 
 # ---------------------------------------------------------------------------
@@ -46,12 +47,22 @@ import argparse
 
 from isaaclab.app import AppLauncher
 
-parser = argparse.ArgumentParser(description="Kinematic reachability check for the G1 arm-IK goal workspace.")
+parser = argparse.ArgumentParser(description="Kinematic reachability check for the G1 29dof arm policy's goal workspace.")
 parser.add_argument("--arm", type=str, default="left", choices=["left", "right"], help="Which arm's workspace to check.")
 parser.add_argument("--num_envs", type=int, default=4096, help="Parallel envs per sampling batch.")
 parser.add_argument("--num_batches", type=int, default=100, help="Number of random-sample batches (total samples = num_envs * num_batches).")
 parser.add_argument("--grid_res", type=int, default=14, help="Grid points per axis when checking goal-box coverage (grid_res^3 total).")
 parser.add_argument("--seed", type=int, default=42, help="Fixed seed for reproducibility.")
+parser.add_argument(
+    "--locked_wrist", action="store_true",
+    help="Check reachability for the G1-Arm-Left/Right-LockedWrist-v0 configuration "
+    "(wrist_pitch/wrist_yaw held at default, 5 sampled joints instead of 7) instead of "
+    "the standard 7-DOF arm. Added 2026-07-24 after that variant's eval_arm.py success "
+    "rate collapsed to ~2-3% (vs. ~28% for the 7-DOF baseline) — this checks how much "
+    "of that is the goal box becoming less reachable with 2 fewer DOF, vs. something "
+    "else. Writes to a separate <arm>_lockedwrist_summary.md, does not overwrite the "
+    "existing 7-DOF result.",
+)
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 
@@ -68,13 +79,24 @@ import torch
 from scipy.spatial import cKDTree
 
 import g1_locomotion.tasks  # noqa: F401 — registers gym envs
-from g1_locomotion.tasks.manager_based.g1_arm.g1_arm_env import _GOAL_BOUNDS, G1ArmIKEnv, G1ArmIKLeftEnvCfg_PLAY, G1ArmIKRightEnvCfg_PLAY
+from g1_locomotion.tasks.manager_based.g1_arm.g1_arm_env import (
+    _GOAL_BOUNDS,
+    G1ArmEnv,
+    G1ArmLeftEnvCfg_PLAY,
+    G1ArmLeftLockedWristEnvCfg,
+    G1ArmRightEnvCfg_PLAY,
+)
 
 
 def main():
     torch.manual_seed(args_cli.seed)
 
-    env_cfg = (G1ArmIKLeftEnvCfg_PLAY if args_cli.arm == "left" else G1ArmIKRightEnvCfg_PLAY)()
+    if args_cli.locked_wrist:
+        if args_cli.arm != "left":
+            raise NotImplementedError("--locked_wrist is only registered for the left arm so far.")
+        env_cfg = G1ArmLeftLockedWristEnvCfg()
+    else:
+        env_cfg = (G1ArmLeftEnvCfg_PLAY if args_cli.arm == "left" else G1ArmRightEnvCfg_PLAY)()
     env_cfg.scene.num_envs = args_cli.num_envs
     env_cfg.seed = args_cli.seed
     # Disable everything not relevant to a pure kinematics check — smaller, faster, and
@@ -84,13 +106,12 @@ def main():
     env_cfg.joint_vel_noise = 0.0
 
     print(f"[Reachability] Building env (arm={args_cli.arm}, num_envs={args_cli.num_envs})...")
-    env = G1ArmIKEnv(env_cfg)
+    env = G1ArmEnv(env_cfg)
 
     arm = env._arm_groups[0]
     jt = arm["joint_tensor"]
     ee_idx = arm["ee_idx"]
-    hw_limits = env._arm_hw_limits.cpu().numpy()  # (5, 2)
-    n_joints = len(jt)
+    n_joints = len(jt)  # 7
 
     device = env.device
     reachable_points = []
@@ -119,7 +140,7 @@ def main():
 
             # A couple of zero-action steps to let cached body_pos_w refresh and any
             # self-collision contact response (if the sampled config self-intersects)
-            # settle before reading the palm position.
+            # settle before reading the end-effector position.
             zero_actions = torch.zeros((env.num_envs, env.cfg.action_space), device=device)
             for _ in range(3):
                 env.step(zero_actions)
@@ -149,9 +170,10 @@ def main():
 
     tolerances_cm = [2.0, 5.0, 10.0, 15.0]
     lines = [
-        "# Arm Workspace Reachability Check",
+        "# G1 29dof Arm Workspace Reachability Check",
         "",
-        f"Arm: `{args_cli.arm}` — Goal bounds: `{bounds}`",
+        f"Arm: `{args_cli.arm}` — Goal bounds: `{bounds}` (starting hypothesis, reused "
+        "numerically from the 23dof-era 5-DOF task — see g1_arm_env.py's module docstring)",
         f"Reachable-workspace samples: {cloud.shape[0]} (random joint configs within real hardware limits)",
         f"Goal-box grid points checked: {grid.shape[0]} ({args_cli.grid_res}^3)",
         "",
@@ -196,7 +218,8 @@ def main():
 
     out_dir = "validation/arm_reachability"
     os.makedirs(out_dir, exist_ok=True)
-    out_path = os.path.join(out_dir, f"{args_cli.arm}_summary.md")
+    suffix = "_lockedwrist" if args_cli.locked_wrist else ""
+    out_path = os.path.join(out_dir, f"{args_cli.arm}{suffix}_summary.md")
     with open(out_path, "w") as f:
         f.write("\n".join(lines) + "\n")
     print(f"\n[Reachability] Summary written to: {out_path}")

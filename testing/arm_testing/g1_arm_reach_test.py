@@ -1,8 +1,21 @@
 """
-G1 arm IK reach test — command specific (x,y,z) targets and watch the policy reach them.
+G1 arm reach test — command specific (x,y,z) targets and watch the policy reach them.
+
+Deliberately not called "IK": the deployed policy is pure RL joint-space control, no
+inverse kinematics involved (see 29dof_implementation_plan.md).
 
 Red spheres mark each target position. The terminal prints distance-to-goal every step.
-Targets are cycled automatically when reached (< 2 cm) or after --hold_steps steps.
+Targets never auto-advance on a timeout (2026-07-22 fix — the old --hold_steps timeout
+forced a blocking input() prompt at a fixed step count regardless of whether the policy
+had actually converged yet, freezing the sim mid-attempt for anything slower than the
+default 150 steps/5s). Instead: press R at any time for a new target — this only sets a
+flag from an async keyboard callback (isaaclab.devices.keyboard.Se2Keyboard, same pattern
+testing/general_testing/g1_full_demo.py already uses), so the sim keeps stepping and
+rendering continuously until you actually decide to stop and type, not on a forced
+schedule. A REACHED message prints when the goal is hit, but the arm keeps holding it —
+watch as long as you want. The episode's own natural boundary (300 steps/10s) still
+resets joints via the env, but the current target is immediately reissued, so it's
+invisible — no prompt, no interruption.
 
 For --arm both, supply one triplet per target; it is applied to the LEFT arm and
 mirrored in y for the RIGHT arm (e.g. 0.3 0.2 1.0 → left=(0.3,0.2,1.0), right=(0.3,-0.2,1.0)).
@@ -14,19 +27,19 @@ Usage:
     # Single arm
     python testing/arm_testing/g1_arm_reach_test.py \\
         --arm left \\
-        --checkpoint logs/rsl_rl/arms/g1_arm_ik_left/<run>/model_5000.pt \\
+        --checkpoint logs/rsl_rl/arms/left/<run>/model_5000.pt \\
         --targets 0.3 0.2 1.0
 
     # Cycle through multiple targets
     python testing/arm_testing/g1_arm_reach_test.py \\
         --arm left \\
-        --checkpoint logs/rsl_rl/arms/g1_arm_ik_left/<run>/model_5000.pt \\
+        --checkpoint logs/rsl_rl/arms/left/<run>/model_5000.pt \\
         --targets 0.3 0.2 1.0  0.4 0.3 1.1  0.2 0.15 0.95
 
     # Both arms (y is auto-mirrored for right arm)
     python testing/arm_testing/g1_arm_reach_test.py \\
         --arm both \\
-        --checkpoint logs/rsl_rl/arms/g1_arm_ik_both/<run>/model_5000.pt \\
+        --checkpoint logs/rsl_rl/arms/both/<run>/model_5000.pt \\
         --targets 0.3 0.2 1.0  0.4 0.3 1.1
 
 Target coordinate reference (robot-local frame, base at origin):
@@ -42,7 +55,7 @@ import argparse
 
 from isaaclab.app import AppLauncher
 
-parser = argparse.ArgumentParser(description="G1 arm IK reach test with specific (x,y,z) targets.")
+parser = argparse.ArgumentParser(description="G1 arm reach test with specific (x,y,z) targets.")
 parser.add_argument("--arm", type=str, default="left", choices=["left", "right", "both"],
                     help="Which arm(s) to test.")
 parser.add_argument("--checkpoint", type=str, default=None,
@@ -50,8 +63,10 @@ parser.add_argument("--checkpoint", type=str, default=None,
                     "If omitted, testing/arm_testing/checkpoints.yaml is consulted.")
 parser.add_argument("--targets", type=float, nargs="+", required=True,
                     help="Target positions as flat list of x y z triplets, e.g. 0.3 0.2 1.0  0.4 0.3 1.1")
-parser.add_argument("--hold_steps", type=int, default=150,
-                    help="Steps to hold each target before auto-advancing (default 150 ≈ 5 s at 30 Hz).")
+parser.add_argument("--locked_wrist", action="store_true",
+                    help="Load a G1-Arm-Left-LockedWrist-v0 checkpoint (5 controlled joints, "
+                    "wrist_pitch/wrist_yaw held at default) instead of the standard 7-DOF arm. "
+                    "--arm left only.")
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 
@@ -74,15 +89,17 @@ from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
 import g1_locomotion.tasks  # noqa: F401 — registers gym envs
 from g1_locomotion.tasks.manager_based.g1_arm.g1_arm_env import (
     _GOAL_BOUNDS,
-    G1ArmIKEnv,
-    G1ArmIKLeftEnvCfg_PLAY,
-    G1ArmIKRightEnvCfg_PLAY,
-    G1ArmIKBothEnvCfg_PLAY,
+    G1ArmEnv,
+    G1ArmLeftEnvCfg_PLAY,
+    G1ArmLeftLockedWristEnvCfg,
+    G1ArmRightEnvCfg_PLAY,
+    G1ArmBothEnvCfg_PLAY,
 )
 from g1_locomotion.tasks.manager_based.g1_arm.agents.rsl_rl_ppo_cfg import (
-    G1ArmIKLeftPPORunnerCfg,
-    G1ArmIKRightPPORunnerCfg,
-    G1ArmIKBothPPORunnerCfg,
+    G1ArmLeftLockedWristPPORunnerCfg,
+    G1ArmLeftPPORunnerCfg,
+    G1ArmRightPPORunnerCfg,
+    G1ArmBothPPORunnerCfg,
 )
 
 
@@ -193,7 +210,6 @@ def main():
     arm = args_cli.arm
     checkpoint_path = args_cli.checkpoint
     targets_local = parse_targets(args_cli.targets)   # robot-local frame
-    hold_steps = args_cli.hold_steps
 
     # Fall back to checkpoints.yaml if no --checkpoint supplied
     if checkpoint_path is None:
@@ -211,25 +227,27 @@ def main():
     print(f"\n[ArmTest] Arm       : {arm}")
     print(f"[ArmTest] Checkpoint: {checkpoint_path}")
     print(f"[ArmTest] Targets   : {[t.tolist() for t in targets_local]}")
-    print(f"[ArmTest] Hold steps: {hold_steps}")
-    print("[ArmTest] When a target is reached/timed out, you will be prompted to type the next one.\n")
+    print("[ArmTest] Press R at any time for a new target — the sim keeps running until you do.\n")
 
     # ------------------------------------------------------------------
     # Build environment  (1 env, no episode randomisation)
     # ------------------------------------------------------------------
-    if arm == "left":
-        env_cfg = G1ArmIKLeftEnvCfg_PLAY()
-        agent_cfg = G1ArmIKLeftPPORunnerCfg()
+    if arm == "left" and args_cli.locked_wrist:
+        env_cfg = G1ArmLeftLockedWristEnvCfg()
+        agent_cfg = G1ArmLeftLockedWristPPORunnerCfg()
+    elif arm == "left":
+        env_cfg = G1ArmLeftEnvCfg_PLAY()
+        agent_cfg = G1ArmLeftPPORunnerCfg()
     elif arm == "right":
-        env_cfg = G1ArmIKRightEnvCfg_PLAY()
-        agent_cfg = G1ArmIKRightPPORunnerCfg()
+        env_cfg = G1ArmRightEnvCfg_PLAY()
+        agent_cfg = G1ArmRightPPORunnerCfg()
     else:  # both
-        env_cfg = G1ArmIKBothEnvCfg_PLAY()
-        agent_cfg = G1ArmIKBothPPORunnerCfg()
+        env_cfg = G1ArmBothEnvCfg_PLAY()
+        agent_cfg = G1ArmBothPPORunnerCfg()
 
     env_cfg.scene.num_envs = 1
 
-    inner_env = G1ArmIKEnv(env_cfg, render_mode=None)
+    inner_env = G1ArmEnv(env_cfg, render_mode=None)
     env = RslRlVecEnvWrapper(inner_env)
     device = inner_env.device
 
@@ -290,14 +308,27 @@ def main():
         goal_vis.visualize(marker_positions)
 
     # ------------------------------------------------------------------
+    # Keyboard: R requests a new target — only sets a flag from an async carb
+    # callback (non-blocking); the actual blocking input() runs from the main loop
+    # below, only once per press, so the sim never freezes on a schedule the user
+    # didn't ask for. Same pattern as g1_full_demo.py's _prompt_target/"T" key.
+    # ------------------------------------------------------------------
+    from isaaclab.devices.keyboard import Se2Keyboard, Se2KeyboardCfg
+
+    new_target_requested = [False]  # single-item list: mutable cell for the closure below
+    keyboard = Se2Keyboard(Se2KeyboardCfg(sim_device=str(device)))
+    keyboard.add_callback("R", lambda: new_target_requested.__setitem__(0, True))
+
+    # ------------------------------------------------------------------
     # Run loop
     # ------------------------------------------------------------------
     obs, _ = env.reset()
     current_idx = 0
     step_count = 0
+    already_reported_reached = False
     set_target(current_idx)
 
-    print("[ArmTest] Running — Ctrl+C to stop")
+    print("[ArmTest] Running — press R for a new target, Ctrl+C to stop")
 
     while simulation_app.is_running():
         with torch.inference_mode():
@@ -317,20 +348,28 @@ def main():
         print(f"\r  step {step_count:5d}  |  {status}   ", end="", flush=True)
 
         reached = all(d < inner_env.cfg.goal_threshold for d in dists)
-        timed_out = step_count >= hold_steps
+        if reached and not already_reported_reached:
+            dist_cm = ", ".join(f"{d * 100:.1f} cm" for d in dists)
+            print(f"\n  >> REACHED in {step_count} steps ({dist_cm}) — still holding, press R for a new target")
+            already_reported_reached = True
 
-        if reached or timed_out or dones[0]:
+        if dones[0] and not new_target_requested[0]:
+            # Episode's own natural boundary (300 steps/10s) reset the joints under us —
+            # silently reissue the same target instead of forcing a prompt, so this is
+            # invisible to whoever's watching, not an interruption.
+            step_count = 0
+            already_reported_reached = False
+            set_target(current_idx)
+            continue
+
+        if new_target_requested[0]:
+            new_target_requested[0] = False
             print()  # end the \r line
-            if reached:
-                dist_cm = ", ".join(f"{d * 100:.1f} cm" for d in dists)
-                print(f"  >> REACHED in {step_count} steps ({dist_cm})")
-            else:
-                print(f"  >> Hold time reached ({step_count} steps)")
-
             targets_local, current_idx = _prompt_next_target(
                 targets_local, current_idx, arm, device
             )
             step_count = 0
+            already_reported_reached = False
             set_target(current_idx)
 
     env.close()

@@ -3,14 +3,18 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Deterministic, fixed-seed evaluation for an arm-IK checkpoint.
+"""Deterministic, fixed-seed evaluation for a G1 29dof arm-policy checkpoint (7-DOF,
+position-only — see g1_arm_env.py's module docstring; deliberately not called "arm-IK",
+the deployed policy is pure RL joint-space control).
 
-Sweeps two buckets — wobble curriculum forced off vs. forced on — so a single run
-answers both "can it actually reach goals" (the base sanity check) and "does the
-synthetic base-tilt signal (Phase 2, see g1_arm_env.py) meaningfully hurt it". Reuses
-``ArmMetricsCsvWrapper``, same as training, so numbers are directly comparable to a run's
-own arm_detailed.csv. See validation/README.md for what the numbers mean and what "good"
-looks like.
+Rewritten 2026-07-21 for the 29dof pivot — replaces the 23dof-era, 5-DOF version that
+used to live at this exact path (preserved on the `23_dof` git branch) — see
+`29dof_implementation_plan.md` Phase 3. Structurally unchanged: same two-bucket sweep
+(wobble curriculum forced off vs. forced on) answering both "can it actually reach
+goals" and "does the synthetic base-tilt signal meaningfully hurt it", same
+`ArmMetricsCsvWrapper` reuse so numbers are directly comparable to a run's own
+arm_detailed.csv. Only the imports/class names and the default network size (see
+`--hidden_dims` below) changed for the new 7-DOF task.
 
 Built after a real regression this eval would have caught immediately: a first attempt at
 restricting the arm's joint ranges made a large fraction of the goal workspace physically
@@ -18,14 +22,14 @@ unreachable, but this only showed up after actually training for 1500 iterations
 noticing `min_dist_to_goal_cm` had plateaued far from 0. Sweeping a fixed-seed rollout
 against a *known* checkpoint (rather than reading training-time CSVs, which mix improving
 and already-converged episodes together) gives a clean, repeatable "is this specific
-checkpoint actually any good" answer — the same reasoning as the standing/walking evals.
+checkpoint actually any good" answer — the same reasoning as the walking eval.
 
 Usage:
     conda activate isaac_g1_control
     cd ~/Elm/Code/g1_locomotion
 
     python validation/eval_arm.py \\
-        --checkpoint logs/rsl_rl/arms/g1_arm_ik_left/<run>/model_4999.pt \\
+        --checkpoint logs/rsl_rl/arms/left/<run>/model_4999.pt \\
         --headless
 
     python validation/eval_arm.py \\
@@ -49,7 +53,7 @@ from isaaclab.app import AppLauncher
 
 _BUCKETS = ["no_wobble", "with_wobble"]
 
-parser = argparse.ArgumentParser(description="Fixed-seed eval for a G1 arm-IK checkpoint.")
+parser = argparse.ArgumentParser(description="Fixed-seed eval for a G1 29dof arm-policy checkpoint.")
 parser.add_argument("--checkpoint", type=str, required=True, help="Path to a trained arm checkpoint (.pt).")
 parser.add_argument(
     "--buckets", type=str, nargs="+", default=_BUCKETS, choices=_BUCKETS,
@@ -68,16 +72,25 @@ parser.add_argument(
         "--goal_x_range 0.35 0.42 to evaluate any checkpoint against just the elbow-"
         "extension stress region (2026-07-08, see known_issues.md), for a fair "
         "before/after comparison independent of which checkpoint was trained on it. "
-        "Default: None (use the checkpoint's own G1ArmIKLeftEnvCfg_PLAY bounds)."
+        "Default: None (use the checkpoint's own G1ArmLeftEnvCfg_PLAY bounds)."
     ),
+)
+parser.add_argument(
+    "--locked_wrist", action="store_true",
+    help="Evaluate a G1-Arm-Left-LockedWrist-v0 checkpoint (5 controlled joints, "
+    "28-D obs) instead of the standard 7-DOF/32-D one. Required or runner.load() "
+    "fails with a strict shape-mismatch error (safe failure, not silent corruption — "
+    "confirmed 2026-07-24 trying to load a locked-wrist checkpoint without this flag).",
 )
 parser.add_argument(
     "--hidden_dims", type=int, nargs="+", default=None,
     help=(
         "Override actor/critic hidden dims to match the checkpoint being evaluated — "
         "must match what it was trained with or runner.load() fails on a shape mismatch. "
-        "E.g. --hidden_dims 512 256 128 for the WideNet overnight-sweep experiment. "
-        "Default: baseline [256, 128, 64] (matches G1ArmIKLeftPPORunnerCfg)."
+        "Default: None (use G1ArmLeftPPORunnerCfg's own default, [512, 256, 128] — the "
+        "23dof-era 'WideNet' network size is the default here, not an opt-in variant, "
+        "see g1_arm_env.py's module docstring). Only pass this if evaluating a "
+        "checkpoint trained with a different, non-default network size."
     ),
 )
 AppLauncher.add_app_launcher_args(parser)
@@ -95,8 +108,18 @@ import os
 
 import g1_locomotion.tasks  # noqa: F401 — registers gym envs
 import torch
-from g1_locomotion.tasks.manager_based.g1_arm.agents.rsl_rl_ppo_cfg import G1ArmIKLeftPPORunnerCfg
-from g1_locomotion.tasks.manager_based.g1_arm.g1_arm_env import G1ArmIKEnv, G1ArmIKLeftEnvCfg_PLAY
+from g1_locomotion.tasks.manager_based.g1_arm.agents.rsl_rl_ppo_cfg import (
+    G1ArmLeftLockedWristPPORunnerCfg,
+    G1ArmLeftPPORunnerCfg,
+)
+from g1_locomotion.tasks.manager_based.g1_arm.g1_arm_env import (
+    G1ArmEnv,
+    G1ArmLeftEnvCfg_PLAY,
+    G1ArmLeftLockedWristEnvCfg,
+)
+
+_EnvCfgCls = G1ArmLeftLockedWristEnvCfg if args_cli.locked_wrist else G1ArmLeftEnvCfg_PLAY
+_PPORunnerCfgCls = G1ArmLeftLockedWristPPORunnerCfg if args_cli.locked_wrist else G1ArmLeftPPORunnerCfg
 
 # Reuse the exact same per-episode metrics wrapper training runs use — keeps the eval's
 # numbers directly comparable to what you'd see in a run's arm_detailed.csv.
@@ -130,16 +153,16 @@ def _summarize(csv_path: str) -> dict:
     }
 
 
-def _build_base_env() -> G1ArmIKEnv:
-    env_cfg = G1ArmIKLeftEnvCfg_PLAY()
+def _build_base_env() -> G1ArmEnv:
+    env_cfg = _EnvCfgCls()
     env_cfg.scene.num_envs = args_cli.num_envs
     env_cfg.seed = args_cli.seed
     if args_cli.goal_x_range is not None:
         env_cfg.goal_bounds_x_override = tuple(args_cli.goal_x_range)
-    return G1ArmIKEnv(env_cfg)
+    return G1ArmEnv(env_cfg)
 
 
-def _joint_range_utilization(base_env: G1ArmIKEnv, min_pos: torch.Tensor, max_pos: torch.Tensor) -> list[dict]:
+def _joint_range_utilization(base_env: G1ArmEnv, min_pos: torch.Tensor, max_pos: torch.Tensor) -> list[dict]:
     """Per-joint achieved range vs. the real hardware range it's clamped to.
 
     Answers "did training actually explore a healthy chunk of what the joint can do, or
@@ -165,7 +188,7 @@ def _joint_range_utilization(base_env: G1ArmIKEnv, min_pos: torch.Tensor, max_po
     return rows
 
 
-def _run_bucket(base_env: G1ArmIKEnv, name: str, eval_root: str) -> tuple[dict, list[dict]]:
+def _run_bucket(base_env: G1ArmEnv, name: str, eval_root: str) -> tuple[dict, list[dict]]:
     print(f"\n[Eval] --- Bucket '{name}' ---")
 
     # Wobble is a synthetic observation-only signal now (see g1_arm_env.py's Phase 2
@@ -183,7 +206,7 @@ def _run_bucket(base_env: G1ArmIKEnv, name: str, eval_root: str) -> tuple[dict, 
         device = base_env.device
         wrapped_env = RslRlVecEnvWrapper(env)
 
-        agent_cfg = G1ArmIKLeftPPORunnerCfg()
+        agent_cfg = _PPORunnerCfgCls()
         if args_cli.hidden_dims is not None:
             agent_cfg.policy.actor_hidden_dims = list(args_cli.hidden_dims)
             agent_cfg.policy.critic_hidden_dims = list(args_cli.hidden_dims)

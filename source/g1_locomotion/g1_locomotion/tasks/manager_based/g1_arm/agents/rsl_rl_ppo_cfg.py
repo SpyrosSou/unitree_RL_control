@@ -1,20 +1,25 @@
 # Copyright (c) 2022-2026, The Isaac Lab Project Developers.
+# All rights reserved.
+#
 # SPDX-License-Identifier: BSD-3-Clause
 
-from isaaclab.utils import configclass
+"""RSL-RL PPO configs for the G1 29dof arm policy.
 
+Adapted 2026-07-21 from the 23dof-era ``g1_arm/agents/rsl_rl_ppo_cfg.py`` — see
+``g1_arm_env.py``'s module docstring for the full rationale on what changed vs. carried
+forward. Network size ([512,256,128]) and symmetry augmentation are the DEFAULT here
+(not opt-in experimental variants the way the 23dof-era task first discovered them),
+since both were confirmed-good findings from that phase, not open questions.
+"""
+
+from isaaclab.utils import configclass
 from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticCfg, RslRlPpoAlgorithmCfg, RslRlSymmetryCfg
 
 from ..mdp.symmetry import compute_symmetric_arm_states
 
 
 def _arm_symmetry_cfg() -> RslRlSymmetryCfg:
-    """Fresh RslRlSymmetryCfg per runner cfg instance (not a shared module-level object).
-
-    See ``mdp/symmetry.py`` for why this replaces the assumption
-    ``testing/arm_testing/g1_arm_mirror_test.py``'s runtime mirror relies on with a trained-for
-    property instead (Phase 2, finding #7 in the roadmap plan).
-    """
+    """Fresh RslRlSymmetryCfg per runner cfg instance (not a shared module-level object)."""
     return RslRlSymmetryCfg(
         use_data_augmentation=True,
         use_mirror_loss=False,
@@ -23,42 +28,39 @@ def _arm_symmetry_cfg() -> RslRlSymmetryCfg:
 
 
 @configclass
-class G1ArmIKPPORunnerCfg(RslRlOnPolicyRunnerCfg):
-    """RSL-RL PPO config for the G1 arm IK reaching task.
+class G1ArmPPORunnerCfg(RslRlOnPolicyRunnerCfg):
+    """RSL-RL PPO config for the G1 29dof arm-reaching task.
 
-    A single runner config is shared for left/right arm; only ``experiment_name``
-    differs in the two public subclasses below.
-
-    Trains with left-right symmetry data augmentation (see ``mdp/symmetry.py``) so the
-    left/right mirror deployment path is a trained-for property, not an assumption.
+    A single runner config is shared for left/right/both arm; only ``experiment_name``
+    differs in the public subclasses below. Trains with left-right symmetry data
+    augmentation (see ``mdp/symmetry.py``) from the start.
     """
 
     num_steps_per_env = 24
-    max_iterations = 5000
+    max_iterations = 6000  # 2026-07-21, per user: match the walking overnight budget
     save_interval = 100
 
-    # Map the env's single "policy" observation group to both actor and critic
     obs_groups = {"policy": ["policy"], "critic": ["policy"]}
 
     policy = RslRlPpoActorCriticCfg(
         init_noise_std=1.0,
         actor_obs_normalization=True,
         critic_obs_normalization=True,
-        actor_hidden_dims=[256, 128, 64],
-        critic_hidden_dims=[256, 128, 64],
+        actor_hidden_dims=[512, 256, 128],
+        critic_hidden_dims=[512, 256, 128],
         activation="elu",
     )
     algorithm = RslRlPpoAlgorithmCfg(
         value_loss_coef=1.0,
         use_clipped_value_loss=True,
         clip_param=0.2,
-        # Tried 0.005 (2026-07-07, alongside the reward-shaping change reverted in
-        # g1_arm_env.py — see known_issues.md) to keep exploration alive longer against
-        # an apparent early plateau. That retrain regressed badly (success rate declined
-        # over the run instead of improving), and since both changes were bundled into
-        # the same retrain there's no way to tell whether entropy or the reward term was
-        # responsible. Reverted to 0.0 (the confirmed-good baseline) — if revisited,
-        # change this alone, not together with other reward/hyperparameter changes.
+        # REVERTED 2026-07-24 back to 0.0 (the original) — briefly bumped to 0.01
+        # (matching walking) alongside a position_reward_exp_scale change (see
+        # g1_arm_env.py) as a combined guess to fix a plateaued training run. That
+        # combination caused Policy/mean_noise_std to explode (1.0 -> 57 over 2000
+        # iterations) and Train/mean_reward to get steadily worse. Superseded by
+        # G1ArmLeftAblationEntropyCoefPPORunnerCfg below, which tests this exact value
+        # (0.01) in isolation, position_reward_exp_scale left at baseline 0.0.
         entropy_coef=0.0,
         num_learning_epochs=5,
         num_mini_batches=4,
@@ -76,119 +78,72 @@ class G1ArmIKPPORunnerCfg(RslRlOnPolicyRunnerCfg):
 
 
 @configclass
-class G1ArmIKLeftPPORunnerCfg(G1ArmIKPPORunnerCfg):
+class G1ArmLeftPPORunnerCfg(G1ArmPPORunnerCfg):
     def __post_init__(self):
         super().__post_init__()
-        self.experiment_name = "arms/g1_arm_ik_left"
-
-
-# ---------------------------------------------------------------------------
-# Overnight sweep (2026-07-07): 3 isolated arm-policy experiments vs. the baseline
-# above, each changing exactly one thing. Distinct experiment_name per variant so
-# each lands in its own logs/rsl_rl/arms/<name>/ subfolder — identifiable by path
-# alone, not by timestamp. See known_issues.md for the plateau this targets and
-# g1_arm_env.py for the matching env cfg variant (where one exists).
-# ---------------------------------------------------------------------------
+        # "arms/..." not the package name — parallel to "walking/..." (see the
+        # locomotion task's identical rename, 2026-07-21 user request), so
+        # logs/rsl_rl/ branches by mode (walking/ vs arms/), not by package name.
+        self.experiment_name = "arms/left"
 
 
 @configclass
-class G1ArmIKLeftRewardShapePPORunnerCfg(G1ArmIKPPORunnerCfg):
-    """Experiment 1/4: exponential proximity bonus (env cfg change only, see g1_arm_env.py).
+class G1ArmLeftLockedWristPPORunnerCfg(G1ArmPPORunnerCfg):
+    """Same as G1ArmLeftPPORunnerCfg, except symmetry augmentation is disabled.
 
-    entropy_coef and network size stay at baseline — only pair with
-    G1ArmIKLeftRewardShapeEnvCfg.
+    Found via a live sanity-check run (2026-07-24) that mdp/symmetry.py's
+    mirror_arm_obs hard-codes an assumption that observations are 32-dim (one arm)
+    or 64-dim (both) — it doesn't know about this variant's 28-dim (5 controlled
+    joints, not 7) layout, and throws a RuntimeError rather than silently producing
+    wrong mirrored data (a safe failure, not a bug in the check itself). Properly
+    extending the mirroring math for the reduced joint set is real work not done
+    under the time pressure of getting tonight's run started safely — disabling
+    augmentation for this variant is the correct tradeoff here (a real but
+    non-critical sample-efficiency cost) versus risking a rushed, wrong fix to the
+    mirror math that wouldn't loudly fail the way this did.
     """
+
     def __post_init__(self):
         super().__post_init__()
-        self.experiment_name = "arms/g1_arm_ik_left_reward_shape"
+        self.experiment_name = "arms/left_locked_wrist"
+        self.algorithm.symmetry_cfg = None
 
 
 @configclass
-class G1ArmIKLeftGoalCurriculumPPORunnerCfg(G1ArmIKPPORunnerCfg):
-    """Experiment 2/4: goal-difficulty curriculum (env cfg change only, see g1_arm_env.py).
+class G1ArmLeftAblationEntropyCoefPPORunnerCfg(G1ArmPPORunnerCfg):
+    """2026-07-24 ablation: entropy_coef=0.01 in isolation (position_reward_exp_scale
+    stays at baseline 0.0 — see G1ArmLeftAblationExpScaleEnvCfg for that one tested
+    alone). See the algorithm cfg's own comment above for the full rationale."""
 
-    entropy_coef and network size stay at baseline — only pair with
-    G1ArmIKLeftGoalCurriculumEnvCfg.
-    """
     def __post_init__(self):
         super().__post_init__()
-        self.experiment_name = "arms/g1_arm_ik_left_goal_curriculum"
-
-
-@configclass
-class G1ArmIKLeftStressRegionPPORunnerCfg(G1ArmIKPPORunnerCfg):
-    """1b: isolated diagnostic on the elbow-extension stress region (env cfg change
-    only, see g1_arm_env.py). Only pair with G1ArmIKLeftStressRegionEnvCfg.
-    """
-    def __post_init__(self):
-        super().__post_init__()
-        self.experiment_name = "arms/g1_arm_ik_left_stress_region"
-
-
-@configclass
-class G1ArmIKLeftWideNetPPORunnerCfg(G1ArmIKPPORunnerCfg):
-    """Experiment 3/4: wider actor/critic network, isolated (pairs with the baseline env
-    cfg — no env changes here, just more capacity to see if the plateau is a capacity
-    limit rather than an exploration one).
-    """
-    def __post_init__(self):
-        super().__post_init__()
-        self.experiment_name = "arms/g1_arm_ik_left_wide_net"
-        self.policy.actor_hidden_dims = [512, 256, 128]
-        self.policy.critic_hidden_dims = [512, 256, 128]
-
-
-@configclass
-class G1ArmIKLeftEntropyPPORunnerCfg(G1ArmIKPPORunnerCfg):
-    """Experiment 4/4: higher entropy_coef, isolated (pairs with the baseline env cfg).
-
-    Targets the leading plateau theory directly: entropy_coef=0.0 gives no exploration
-    incentive, consistent with the observed early-and-flat training curve (see
-    known_issues.md). A prior attempt at entropy_coef=0.005 was bundled with the reward-
-    shaping change and regressed, but the two were never isolated from each other — this
-    is the first time entropy alone is tested. 0.01 (not 0.005) to give this a clearly
-    differentiated, less ambiguous test against that prior attempt.
-    """
-    def __post_init__(self):
-        super().__post_init__()
-        self.experiment_name = "arms/g1_arm_ik_left_entropy"
+        self.experiment_name = "arms/ablation_entropy_coef"
         self.algorithm.entropy_coef = 0.01
 
 
 @configclass
-class G1ArmIKLeftPPOTuningPPORunnerCfg(G1ArmIKPPORunnerCfg):
-    """PPO hyperparameter tuning (2026-07-08, isolated, pairs with the baseline env cfg —
-    no env changes here). Lowest-confidence of the three remaining experiments — no prior
-    evidence points at this specifically, unlike the other two (entropy has a direct
-    theory, wide-net has capacity reasoning); this is exploratory.
+class G1ArmLeftAblationExpScalePPORunnerCfg(G1ArmPPORunnerCfg):
+    """Runner cfg for the exp_scale ablation — same as G1ArmLeftPPORunnerCfg except
+    experiment_name, so its logs land separately. entropy_coef stays at baseline 0.0;
+    the actual change (position_reward_exp_scale) lives in the env cfg
+    (G1ArmLeftAblationExpScaleEnvCfg), not here."""
 
-    num_learning_epochs 5->8: more thorough optimization per collected rollout. Given the
-    training curve consistently shows fast early convergence into a hard plateau, this
-    tests whether the plateau is partly an under-optimization artifact within each PPO
-    update (not extracting enough signal from each rollout before moving on) rather than
-    purely an exploration (entropy) or capacity (network size) limit — orthogonal to both
-    of the other two experiments, safe to combine results with if it helps.
-    """
     def __post_init__(self):
         super().__post_init__()
-        self.experiment_name = "arms/g1_arm_ik_left_ppo_tuning"
-        self.algorithm.num_learning_epochs = 8
+        self.experiment_name = "arms/ablation_exp_scale"
 
 
 @configclass
-class G1ArmIKRightPPORunnerCfg(G1ArmIKPPORunnerCfg):
+class G1ArmRightPPORunnerCfg(G1ArmPPORunnerCfg):
     def __post_init__(self):
         super().__post_init__()
-        self.experiment_name = "arms/g1_arm_ik_right"
+        self.experiment_name = "arms/right"
 
 
 @configclass
-class G1ArmIKBothPPORunnerCfg(G1ArmIKPPORunnerCfg):
-    """Both arms: 34-D obs, 10-D actions. Needs training from scratch."""
+class G1ArmBothPPORunnerCfg(G1ArmPPORunnerCfg):
+    """Both arms: 64-D obs, 14-D actions."""
 
     def __post_init__(self):
         super().__post_init__()
-        self.experiment_name = "arms/g1_arm_ik_both"
-        # Slightly wider network to handle the larger input/output
-        self.policy.actor_hidden_dims = [256, 128, 128]
-        self.policy.critic_hidden_dims = [256, 128, 128]
+        self.experiment_name = "arms/both"

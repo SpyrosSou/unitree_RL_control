@@ -201,6 +201,104 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             run_dir_name += f"_{agent_cfg.run_name}"
         log_dir = os.path.join(log_root_path, run_dir_name)
 
+    # mdp.ArmMotionDisturbance's difficulty phase is keyed on env.common_step_counter, a
+    # plain in-memory attribute (isaaclab ManagerBasedRLEnv.__init__ sets it to 0, never
+    # restored from a checkpoint — RSL-RL's checkpoint only has model/optimizer state).
+    # Left alone, every --resume silently restarts the disturbance curriculum from phase 0
+    # instead of continuing from where the resumed checkpoint's training had reached (found
+    # 2026-07-22 investigating why the standing-focus resume's disturbance behavior looked
+    # off). Fix: peek at the resumed checkpoint's saved iteration count and convert it to an
+    # equivalent step count (iterations * num_steps_per_env, matching how common_step_counter
+    # itself accumulates — one increment per env.step() call, num_steps_per_env calls per
+    # training iteration), then feed it in via the same phase_step_offset param the _PLAY
+    # configs already use for a different purpose (jumping ahead for quick visual checks).
+    # `iter` is the absolute iteration count since the lineage's true start (RSL-RL keeps
+    # numbering checkpoints absolutely across resumes), so this is correct even for a resume
+    # of a resume.
+    if resume_path is not None and hasattr(env_cfg, "events") and hasattr(env_cfg.events, "arm_motion_disturbance"):
+        resumed_iter = int(torch.load(resume_path, map_location="cpu", weights_only=False).get("iter", 0))
+        step_offset = resumed_iter * agent_cfg.num_steps_per_env
+        env_cfg.events.arm_motion_disturbance.params["phase_step_offset"] = step_offset
+        print(
+            f"[INFO] --resume: carrying arm-disturbance curriculum forward — resumed at iteration "
+            f"{resumed_iter}, phase_step_offset={step_offset}"
+        )
+
+    # mdp.lin_vel_cmd_levels's current command range lives only in the same kind of
+    # mutable, never-checkpointed object as arm_motion_disturbance's phase above (see
+    # that fix's own comment) — found 2026-07-24 when a resumed run's curriculum
+    # visibly dropped from its grown range back to the narrow (-0.1, 0.1) starting
+    # point. Unlike the phase curriculum, this one isn't a pure function of step count
+    # (it grows empirically, gated on reward exceeding a threshold each check), so it
+    # can't be replayed the same way — but the only value it ever logs,
+    # Curriculum/lin_vel_cmd_levels (= env.commands.base_velocity.ranges.lin_vel_x[1],
+    # see mdp/curriculums.py's own return statement), is enough to exactly reconstruct
+    # the full state: both lin_vel_x bounds and lin_vel_y's bounds all grow by the same
+    # +/-0.1 step in lockstep on every promotion, from the same symmetric starting
+    # point, each independently clamped to its own limit_ranges — so the shared
+    # promotion count derived from lin_vel_x's logged upper bound is enough to
+    # reconstruct every other bound exactly.
+    if (
+        resume_path is not None
+        and hasattr(env_cfg, "curriculum")
+        and getattr(env_cfg.curriculum, "lin_vel_cmd_levels", None) is not None
+    ):
+        from tensorboard.backend.event_processing import event_accumulator
+
+        # FIXED 2026-07-24: was reading from `log_dir`, which is only the SOURCE run's
+        # directory for a same-task, in-place resume (no --resume_new_dir) — the case
+        # this was originally written and tested against. For a cross-task warm start
+        # (--resume --resume_new_dir, e.g. loading a plain-recipe walking checkpoint
+        # into a fresh arm-disturbance run), log_dir is a brand-new, EMPTY directory
+        # with no tensorboard log at all — EventAccumulator.Reload() raised an
+        # uncaught DirectoryDeletedError there, crashing the whole training process
+        # instantly (confirmed the hard way: killed an overnight run within 5 seconds
+        # of starting). The actual curriculum history always lives alongside the
+        # checkpoint being resumed, i.e. os.path.dirname(resume_path) — which is
+        # identical to log_dir in the in-place-resume case anyway, so this is a
+        # strictly more correct fix, not just a narrower one. Also now wrapped in
+        # try/except so any other unreadable-log edge case degrades to "skip this
+        # optimization" instead of taking the whole run down with it.
+        source_log_dir = os.path.dirname(resume_path)
+        try:
+            ea = event_accumulator.EventAccumulator(source_log_dir, size_guidance={"scalars": 0})
+            ea.Reload()
+            has_curriculum_log = "Curriculum/lin_vel_cmd_levels" in ea.Tags()["scalars"]
+        except Exception as e:
+            print(f"[WARN] --resume: couldn't read lin_vel_cmd_levels history from {source_log_dir} ({e}) — "
+                  f"leaving the command-range curriculum at its default starting range.")
+            has_curriculum_log = False
+        if has_curriculum_log:
+            last_upper_x = ea.Scalars("Curriculum/lin_vel_cmd_levels")[-1].value
+            ranges = env_cfg.commands.base_velocity.ranges
+            limit_ranges = env_cfg.commands.base_velocity.limit_ranges
+            initial_upper_x = ranges.lin_vel_x[1]  # env_cfg's own fresh default, e.g. 0.1
+
+            if last_upper_x >= limit_ranges.lin_vel_x[1] - 1e-6:
+                # Fully promoted (upper pinned at its limit) — x's own recorded upper
+                # can't reveal how many promotions actually happened past that point,
+                # but every other axis caps at a smaller promotion count than x does
+                # (x has the widest limit_ranges of the three), so "x is capped" alone
+                # guarantees every axis is also fully capped — just use limits directly.
+                new_x = (limit_ranges.lin_vel_x[0], limit_ranges.lin_vel_x[1])
+                new_y = (limit_ranges.lin_vel_y[0], limit_ranges.lin_vel_y[1])
+            else:
+                num_promotions = round((last_upper_x - initial_upper_x) / 0.1)
+
+                def _reconstruct(initial_upper: float, limits) -> tuple[float, float]:
+                    raw = initial_upper + 0.1 * num_promotions
+                    return (max(-raw, limits[0]), min(raw, limits[1]))
+
+                new_x = _reconstruct(initial_upper_x, limit_ranges.lin_vel_x)
+                new_y = _reconstruct(ranges.lin_vel_y[1], limit_ranges.lin_vel_y)
+
+            ranges.lin_vel_x = list(new_x)
+            ranges.lin_vel_y = list(new_y)
+            print(
+                f"[INFO] --resume: carrying lin_vel_cmd_levels forward — logged upper was "
+                f"{last_upper_x:.3f}, reconstructed ranges.lin_vel_x={new_x}, ranges.lin_vel_y={new_y}"
+            )
+
     # set the IO descriptors export flag if requested
     if isinstance(env_cfg, ManagerBasedRLEnvCfg):
         env_cfg.export_io_descriptors = args_cli.export_io_descriptors
@@ -219,7 +317,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         env = StandingMetricsCsvWrapper(env, log_dir)
     elif "Locomotion" in args_cli.task:
         env = WalkingMetricsCsvWrapper(env, log_dir)
-    elif "Arm-IK" in args_cli.task:
+    elif "Arm" in args_cli.task:
+        # "G1-Arm-*" (2026-07-21 — deliberately not named "IK": the deployed policy is
+        # pure RL joint-space deltas, no inverse kinematics involved at all; "IK" is
+        # reserved for the actual analytic-IK-based training disturbance generator
+        # elsewhere (g1_locomotion/mdp/events.py's StandingArmIKReachDisturbance-
+        # equivalent, not yet ported — see 29dof_implementation_plan.md).
         env = ArmMetricsCsvWrapper(env, log_dir)
 
     # convert to single-agent instance if required by the RL algorithm

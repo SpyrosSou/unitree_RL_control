@@ -1,18 +1,23 @@
-# General testing — integrated stand/walk + arm control.
+# General testing — integrated unified stand+walk policy + arm control.
 # Paste checkpoint paths here. The demo loads from this file automatically;
 # you can still override via CLI flags.
 #
 # Algorithm is inferred from the path: "logs/rsl_rl/..." → rsl_rl
+#
+# Rewritten 2026-07-21 for the 29dof pivot: one "loco" checkpoint now, not separate
+# walking/standing ones — the unified policy covers both (see
+# 29dof_implementation_plan.md Phase 1). Fill in the fields below once you have real
+# checkpoints from training (see logs/rsl_rl/walking/{base,arm_disturbance}/... and
+# logs/rsl_rl/arms/{left,right,both}/...).
 
-# ----- Locomotion -----
+# ----- Locomotion (unified stand+walk) -----
 
-walking:
-  # Flat-terrain walking policy.
+loco:
+  # Either logs/rsl_rl/walking/base/... (Unitree's ported recipe, no arm disturbance)
+  # or logs/rsl_rl/walking/arm_disturbance/... (the variant trained to tolerate the
+  # arm-motion curriculum — this is the one that should actually hold up once a real
+  # reaching arm is active, per 29dof_implementation_plan.md's Phase-0.3 resolution).
   checkpoint: chosen_checkpoints/walking_latest.pt
-
-standing:
-  # Zero-command standing stabiliser with arm-disturbance curriculum.
-  checkpoint: chosen_checkpoints/standing_latest.pt
 
 # ----- Arm control -----
 # arm_mode can be "left", "right", or "both".
@@ -25,7 +30,9 @@ arm:
   left:
     checkpoint: chosen_checkpoints/arm_left_latest.pt
   right:
-    # Fill in after training a right-arm policy (or use the mirror demo instead).
+    # Fill in after training a right-arm policy (or use the mirror demo instead — Y/U
+    # keys in g1_full_demo.py drive the right arm by mirroring the left-trained policy,
+    # no separate checkpoint needed for that path).
     checkpoint: ~
   both:
     # Fill in after training a both-arm policy and curating a checkpoint.
