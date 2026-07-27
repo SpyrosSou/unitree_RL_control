@@ -229,7 +229,7 @@ def _yaml_value(keys: list[str], default=None):
 def _resolve_checkpoint(cli_val: str | None, yaml_keys: list[str], hardcoded: str) -> str:
     path = cli_val or _yaml_value(yaml_keys, hardcoded)
     if path and not os.path.isabs(path):
-        path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(_YAML_PATH))), path)
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(_YAML_PATH)))), path)
     return path
 
 
