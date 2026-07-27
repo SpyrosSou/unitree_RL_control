@@ -10,7 +10,7 @@ forced a blocking input() prompt at a fixed step count regardless of whether the
 had actually converged yet, freezing the sim mid-attempt for anything slower than the
 default 150 steps/5s). Instead: press R at any time for a new target — this only sets a
 flag from an async keyboard callback (isaaclab.devices.keyboard.Se2Keyboard, same pattern
-testing/general_testing/g1_full_demo.py already uses), so the sim keeps stepping and
+testing/visual_testing/full_demo/g1_full_demo.py already uses), so the sim keeps stepping and
 rendering continuously until you actually decide to stop and type, not on a forced
 schedule. A REACHED message prints when the goal is hit, but the arm keeps holding it —
 watch as long as you want. The episode's own natural boundary (300 steps/10s) still
@@ -25,19 +25,19 @@ Usage:
     cd ~/Elm/Code/g1_locomotion
 
     # Single arm
-    python testing/arm_testing/g1_arm_reach_test.py \\
+    python testing/visual_testing/arms/g1_arm_reach_test.py \\
         --arm left \\
         --checkpoint logs/rsl_rl/arms/left/<run>/model_5000.pt \\
         --targets 0.3 0.2 1.0
 
     # Cycle through multiple targets
-    python testing/arm_testing/g1_arm_reach_test.py \\
+    python testing/visual_testing/arms/g1_arm_reach_test.py \\
         --arm left \\
         --checkpoint logs/rsl_rl/arms/left/<run>/model_5000.pt \\
         --targets 0.3 0.2 1.0  0.4 0.3 1.1  0.2 0.15 0.95
 
     # Both arms (y is auto-mirrored for right arm)
-    python testing/arm_testing/g1_arm_reach_test.py \\
+    python testing/visual_testing/arms/g1_arm_reach_test.py \\
         --arm both \\
         --checkpoint logs/rsl_rl/arms/both/<run>/model_5000.pt \\
         --targets 0.3 0.2 1.0  0.4 0.3 1.1
@@ -67,6 +67,28 @@ parser.add_argument("--locked_wrist", action="store_true",
                     help="Load a G1-Arm-Left-LockedWrist-v0 checkpoint (5 controlled joints, "
                     "wrist_pitch/wrist_yaw held at default) instead of the standard 7-DOF arm. "
                     "--arm left only.")
+parser.add_argument("--legacy32", action="store_true",
+                    help="Evaluate a checkpoint trained before 2026-07-26's action_fb observation "
+                    "addition (32-D obs) — e.g. the 200/20-gain reference. Required or the policy "
+                    "load fails with a strict shape-mismatch error. --arm left only. Same flag as "
+                    "validation/eval_arm.py's.")
+parser.add_argument("--log_std", action="store_true",
+                    help="Evaluate a checkpoint trained with noise_std_type='log' instead of the "
+                    "default 'scalar' (e.g. best_combined). Required or the policy load fails with "
+                    "a strict key-mismatch error ('std' missing, 'log_std' unexpected). --arm left "
+                    "only. Same flag as validation/eval_arm.py's.")
+parser.add_argument("--debug_passive_joints", action="store_true",
+                    help="Print the current joint-angle deviation from default (degrees) for the "
+                    "UNCONTROLLED opposite arm and the 3 waist joints every ~1s, alongside the "
+                    "usual distance readout. Added 2026-07-25 to get hard numbers on visually "
+                    "observed right-arm/waist motion during a left-arm-only test — none of these "
+                    "joints are ever given a policy or code-driven target in this env (confirmed "
+                    "via direct code read: _apply_action only writes arm_joint_indices_tensor and "
+                    "the locked wrist joints, _reset_idx writes everything else straight to "
+                    "default_joint_pos), so any visible motion here is real physics (gravity sag / "
+                    "dynamic coupling through each joint's own finite PD stiffness), not an "
+                    "action-routing bug — this flag lets you see the actual magnitude and time "
+                    "shape (one-time settle vs. continuous) instead of just the visual impression.")
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 
@@ -90,12 +112,14 @@ import g1_locomotion.tasks  # noqa: F401 — registers gym envs
 from g1_locomotion.tasks.manager_based.g1_arm.g1_arm_env import (
     _GOAL_BOUNDS,
     G1ArmEnv,
+    G1ArmLeftEnvCfg_Legacy32,
     G1ArmLeftEnvCfg_PLAY,
     G1ArmLeftLockedWristEnvCfg,
     G1ArmRightEnvCfg_PLAY,
     G1ArmBothEnvCfg_PLAY,
 )
 from g1_locomotion.tasks.manager_based.g1_arm.agents.rsl_rl_ppo_cfg import (
+    G1ArmLeftAblationLogStdPPORunnerCfg,
     G1ArmLeftLockedWristPPORunnerCfg,
     G1ArmLeftPPORunnerCfg,
     G1ArmRightPPORunnerCfg,
@@ -235,9 +259,12 @@ def main():
     if arm == "left" and args_cli.locked_wrist:
         env_cfg = G1ArmLeftLockedWristEnvCfg()
         agent_cfg = G1ArmLeftLockedWristPPORunnerCfg()
+    elif arm == "left" and args_cli.legacy32:
+        env_cfg = G1ArmLeftEnvCfg_Legacy32()
+        agent_cfg = G1ArmLeftAblationLogStdPPORunnerCfg() if args_cli.log_std else G1ArmLeftPPORunnerCfg()
     elif arm == "left":
         env_cfg = G1ArmLeftEnvCfg_PLAY()
-        agent_cfg = G1ArmLeftPPORunnerCfg()
+        agent_cfg = G1ArmLeftAblationLogStdPPORunnerCfg() if args_cli.log_std else G1ArmLeftPPORunnerCfg()
     elif arm == "right":
         env_cfg = G1ArmRightEnvCfg_PLAY()
         agent_cfg = G1ArmRightPPORunnerCfg()
@@ -250,6 +277,23 @@ def main():
     inner_env = G1ArmEnv(env_cfg, render_mode=None)
     env = RslRlVecEnvWrapper(inner_env)
     device = inner_env.device
+
+    # --debug_passive_joints bookkeeping: joints this env's own code never targets.
+    passive_names = None
+    if args_cli.debug_passive_joints:
+        opposite_prefix = {"left": "right", "right": "left"}.get(arm)
+        passive_names = ["waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint"]
+        if opposite_prefix is not None:
+            passive_names += [
+                f"{opposite_prefix}_shoulder_pitch_joint", f"{opposite_prefix}_shoulder_roll_joint",
+                f"{opposite_prefix}_shoulder_yaw_joint", f"{opposite_prefix}_elbow_joint",
+                f"{opposite_prefix}_wrist_roll_joint", f"{opposite_prefix}_wrist_pitch_joint",
+                f"{opposite_prefix}_wrist_yaw_joint",
+            ]
+        passive_ids, passive_resolved_names = inner_env.robot.find_joints(passive_names)
+        passive_ids_t = torch.tensor(passive_ids, dtype=torch.long, device=device)
+        passive_default = inner_env.robot.data.default_joint_pos[0:1, passive_ids_t].clone()
+        print(f"[ArmTest] --debug_passive_joints tracking: {passive_resolved_names}")
 
     # Move local targets to device
     targets_local = [t.to(device) for t in targets_local]
@@ -346,6 +390,14 @@ def main():
         label = ["left", "right"] if arm == "both" else [arm]
         status = "  ".join(f"{name}: {d * 100:.1f} cm" for name, d in zip(label, dists))
         print(f"\r  step {step_count:5d}  |  {status}   ", end="", flush=True)
+
+        if args_cli.debug_passive_joints and step_count % 30 == 0:
+            current = inner_env.robot.data.joint_pos[0:1, passive_ids_t]
+            delta_deg = ((current - passive_default) * 180.0 / torch.pi).squeeze(0)
+            deltas_str = "  ".join(
+                f"{n}: {d:+.2f}deg" for n, d in zip(passive_resolved_names, delta_deg.tolist())
+            )
+            print(f"\n  [passive] step {step_count:5d} | {deltas_str}")
 
         reached = all(d < inner_env.cfg.goal_threshold for d in dists)
         if reached and not already_reported_reached:

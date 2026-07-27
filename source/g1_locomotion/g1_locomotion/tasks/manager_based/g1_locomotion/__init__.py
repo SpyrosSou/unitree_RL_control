@@ -99,6 +99,20 @@ gym.register(
     },
 )
 
+# 2026-07-25: starts the velocity command range at its full target instead of letting
+# the curriculum climb there — see G1LocomotionArmDisturbanceStartFullCmdRangeEnvCfg's
+# own docstring (a stalled curriculum invalidated the previous drift-reward test run).
+gym.register(
+    id="G1-Locomotion-Velocity-ArmDisturbance-StartFullCmdRange-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.g1_locomotion_env_cfg:G1LocomotionArmDisturbanceStartFullCmdRangeEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.g1_locomotion_env_cfg:G1LocomotionArmDisturbanceEnvCfg_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1LocomotionArmDisturbancePPORunnerCfg",
+    },
+)
+
 gym.register(
     id="G1-Locomotion-Velocity-ArmDisturbance-Play-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",

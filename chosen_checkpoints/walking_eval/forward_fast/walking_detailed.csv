@@ -1,0 +1,1 @@
+episode_index,env_id,env_step,episode_steps,episode_return,mean_reward,outcome,fell,timed_out,max_tilt_deg,mean_lin_vel_track_err_m_s,mean_ang_vel_track_err_rad_s,mean_foot_slip_speed_m_s,heading_drift_deg,lateral_drift_m

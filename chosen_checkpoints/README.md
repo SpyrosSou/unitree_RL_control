@@ -2,15 +2,32 @@
 
 This folder contains the curated deployable checkpoints that are intentionally kept in-repo.
 
-**Empty as of 2026-07-21** — the 23dof-era checkpoints (`standing_latest.pt`,
-`walking_latest.pt`, `arm_left_latest.pt`, `standing_2026-07-09_prev.pt`, and the
-`exported/` ONNX artifacts) were removed from `main` as part of the pivot to the G1's
-real 29dof hardware layout — they're built against the wrong action space
-(1-DOF waist, 5-DOF arms, no wrists) and would need retraining regardless. They're not
-gone: the full checkpoint set, with a curated best/archive breakdown and a
-`validation/history/` of every eval this project ever ran, lives on the `23_dof` branch.
-See `lessons_learned.md` (repo root) for the findings from that phase worth carrying
-into this one.
+**Current state (2026-07-27), 29dof pivot — see `policy_status.md` (repo root) for the
+full, living status writeup this summary is kept in sync with:**
+
+- `walking_latest.pt` — **working, ready for initial real-robot testing**, but has a
+  known, actively-being-fixed drift gap (see `policy_status.md`). From
+  `logs/rsl_rl/walking/arm_disturbance/2026-07-24_15-47-18/model_15998.pt`. Three
+  drift-fix attempts since (2026-07-25/26/27) have all made drift worse, not better —
+  none promoted; this checkpoint is untouched by any of them.
+- `walking_2026-07-24_base_only_prev.pt` — the pure base-recipe checkpoint
+  `walking_latest.pt` was warm-started from (no arm-disturbance training), kept for
+  reference/rollback. From
+  `logs/rsl_rl/walking/ablation_reward_weights/2026-07-24_03-13-16/model_5999.pt`.
+- `arm_left_latest.pt` — **stale, not working, do not treat as current.** Predates the
+  real-hardware-gain fix and every finding since. **The actual current-best arm
+  candidate has NOT been promoted here yet** — it's `best_combined`
+  (`logs/rsl_rl/arms/best_combined/2026-07-26_13-09-32/model_1999.pt`), still sitting
+  in `logs/`. Not promoted because arm reaching's real single-shot reliability is only
+  ~30% even for the best checkpoint (see `policy_status.md`'s "Critical finding") — not
+  yet at a bar worth promoting to a curated default. See `policy_status.md` for the
+  current plan (a pivot toward IK for precision grasping).
+
+23dof-era checkpoints (1-DOF waist, 5-DOF arms, no wrists — wrong action space for this
+hardware layout regardless) were removed from `main` as part of the pivot; the full
+checkpoint set from that phase lives on the `23_dof` branch. See `policy_status.md`'s
+"Lessons learned" section (repo root) for findings from that phase worth carrying into
+this one.
 
 Recommended update workflow once new checkpoints exist:
 

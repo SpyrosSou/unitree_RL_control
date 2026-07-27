@@ -309,6 +309,12 @@ class RewardsCfg:
     # gap and just added an untested confound. See the termination_penalty/curriculum/
     # action_rate changes in the Ablation*EnvCfg classes below for the properly evidenced
     # candidates, each tested in isolation against this same, original Unitree baseline.
+    # REVERTED 2026-07-26 back to stock track_lin_vel_xy_yaw_frame_exp — the 2026-07-25
+    # TrackLinVelXYExpectedYawFrameExp replacement made heading drift WORSE (63.6-136.4
+    # deg vs. 24-27 deg baseline): it only constrains world-frame VELOCITY DIRECTION,
+    # never actual BODY ORIENTATION, and removed the stock version's accidental (but
+    # real) side effect of tying heading to direction of travel. See mdp/rewards.py's
+    # module comment above HeadingDriftPenalty for the full round-1/round-2 history.
     track_lin_vel_xy = RewTerm(
         func=mdp.track_lin_vel_xy_yaw_frame_exp,
         weight=1.0,
@@ -316,6 +322,16 @@ class RewardsCfg:
     )
     track_ang_vel_z = RewTerm(
         func=mdp.track_ang_vel_z_exp, weight=0.5, params={"command_name": "base_velocity", "std": math.sqrt(0.25)}
+    )
+
+    # ADDED 2026-07-26, round 2 (round 1's two additive terms, weight -1.0 each, are
+    # gone — see mdp/rewards.py's module comment for the full history of what went
+    # wrong and why this round is different: one term not two, -0.1 not -1.0, and this
+    # is meant to be trained from FRESH weights, not warm-started, to avoid the
+    # critic-mismatch risk entirely rather than hope a changed reward composition is
+    # small enough for a stale critic to still be valid).
+    heading_drift = RewTerm(
+        func=mdp.HeadingDriftPenalty, weight=-0.1, params={"command_name": "base_velocity"}
     )
 
     alive = RewTerm(func=mdp.is_alive, weight=0.15)
@@ -602,6 +618,33 @@ class G1LocomotionArmDisturbanceEnvCfg(G1LocomotionEnvCfg):
             mode="reset",
             params={"asset_cfg": SceneEntityCfg("robot")},
         )
+
+
+@configclass
+class G1LocomotionArmDisturbanceStartFullCmdRangeEnvCfg(G1LocomotionArmDisturbanceEnvCfg):
+    """2026-07-25: starts the velocity command range at its full target (ranges =
+    limit_ranges) instead of the curriculum's usual (-0.1, 0.1) starting tier — same
+    override G1LocomotionArmDisturbanceEnvCfg_PLAY already uses for visualization
+    (line below), just applied to a real training run instead.
+
+    Built after discovering Curriculum/lin_vel_cmd_levels got stuck at its minimum tier
+    for an entire 2000-iteration run testing the new TrackLinVelXYExpectedYawFrameExp
+    reward (see mdp/rewards.py) — meaning that run never actually practiced 0.3-0.6 m/s
+    walking at all, so its bad forward-bucket eval numbers said nothing about whether the
+    drift fix works. Leading theory: the new reward is genuinely stricter (penalizes real
+    drift the old current-yaw-frame version was blind to), so the SAME hardcoded
+    promotion threshold (mdp/curriculums.py: reward > term.weight * 0.8) that the old
+    reward cleared quickly may now take much longer or never clear during the transient
+    re-adaptation period right after warm-starting into the changed reward. Bypassing the
+    climb entirely sidesteps that interaction and guarantees this run is an actual test of
+    the reward fix at real speeds, not an accidental test of curriculum-promotion timing.
+    The curriculum terms themselves are untouched — mdp.lin_vel_cmd_levels/
+    ang_vel_cmd_levels still run every step, they just have no further room to expand
+    since ranges already equals limit_ranges (clamped there regardless)."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.commands.base_velocity.ranges = self.commands.base_velocity.limit_ranges
 
 
 @configclass

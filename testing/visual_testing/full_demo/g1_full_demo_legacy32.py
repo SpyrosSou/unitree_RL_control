@@ -55,17 +55,17 @@ Usage:
     cd ~/Elm/Code/g1_locomotion
 
     # Auto-load from testing/general_testing/checkpoints.yaml
-    python3 testing/general_testing/g1_full_demo.py
+    python3 testing/visual_testing/full_demo/g1_full_demo_legacy32.py
 
     # Explicit checkpoints + initial arm target
-    python3 testing/general_testing/g1_full_demo.py \\
+    python3 testing/visual_testing/full_demo/g1_full_demo_legacy32.py \\
         --loco_checkpoint logs/rsl_rl/walking/base/.../model_5999.pt \\
         --arm_checkpoint  logs/rsl_rl/arms/left/.../model_5999.pt \\
         --arm left \\
         --target 0.3 0.2 1.0
 
     # Both arms
-    python3 testing/general_testing/g1_full_demo.py \\
+    python3 testing/visual_testing/full_demo/g1_full_demo_legacy32.py \\
         --arm both \\
         --target 0.3 0.2 1.0
 """

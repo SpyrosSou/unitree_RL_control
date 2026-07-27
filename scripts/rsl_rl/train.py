@@ -43,6 +43,22 @@ parser.add_argument(
         "(continue writing checkpoints/CSV/TensorBoard into the resumed run's existing folder)."
     ),
 )
+parser.add_argument(
+    "--resume_reset_iteration",
+    action="store_true",
+    default=False,
+    help=(
+        "When used with --resume, warm-start the model/optimizer weights as usual but reset "
+        "the learning-iteration counter to 0 afterward, so --max_iterations is an absolute "
+        "range (not additive) and checkpoint filenames (model_<iter>.pt) look like a normal "
+        "fresh run instead of continuing the source checkpoint's absolute iteration count. "
+        "Curriculum carry-forward (arm_motion_disturbance phase offset, lin_vel_cmd_levels) "
+        "still reads the source checkpoint's true iteration directly from its 'iter' field, "
+        "so that state is unaffected by this reset — only the runner's own counter is reset. "
+        "Combine with --resume_new_dir for a run that is fully self-contained: warm-started "
+        "weights, its own fresh directory, and iteration numbers starting near 0."
+    ),
+)
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -360,6 +376,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
         # load previously trained model
         runner.load(resume_path)
+        if args_cli.resume_reset_iteration:
+            print(
+                f"[INFO] --resume_reset_iteration: weights/optimizer warm-started from iteration "
+                f"{runner.current_learning_iteration}, resetting counter to 0 — checkpoints in this "
+                f"run will be numbered model_0.pt onward, --max_iterations={agent_cfg.max_iterations} "
+                "is an absolute range."
+            )
+            runner.current_learning_iteration = 0
 
     # dump the configuration into log-directory. When continuing an existing run
     # directory (resume without --resume_new_dir), the previous params files describe

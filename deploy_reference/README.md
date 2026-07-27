@@ -1,9 +1,9 @@
 # Deploy reference (from `unitree_rl_lab`)
 
 Copied 2026-07-21 from `~/Elm/Code/unitree_rl_lab/deploy/` as **inert reference
-material** — see `29dof_implementation_plan.md` (repo root, Phase 6). Not wired into
-this repo's build or run in any way. Real integration is scoped for later (no physical
-robot access for another week, per the user).
+material**, for real sim2real integration once there's physical robot access. Not
+wired into this repo's build or run in any way — nothing here has been adapted,
+tested, or built inside this repo.
 
 This is the real, hardware-validated sim2real vehicle for whenever this project is ready
 for it: a C++ FSM (`include/FSM/` — Passive/FixStand/Velocity states, `CtrlFSM.h`) driving
@@ -16,8 +16,8 @@ runs in sim runs on hardware.
 - `include/` — shared FSM + `isaaclab`-port headers (robot-agnostic).
 - `robots/g1_29dof/` — the G1 29dof-specific FSM states, `main.cpp`, `CMakeLists.txt`,
   and `config/` (`config.yaml`, and the velocity-task `deploy.yaml` + exported
-  `policy.onnx` — the ground-truth joint order/gain/scale spec referenced throughout
-  `29dof_implementation_plan.md`).
+  `policy.onnx` — the ground-truth joint order/gain/scale spec this repo's own asset
+  config was ported from, see `source/g1_locomotion/g1_locomotion/assets/robots/unitree.py`).
 
 ## What's deliberately NOT here (and why)
 
@@ -26,8 +26,7 @@ runs in sim runs on hardware.
   page](https://github.com/microsoft/onnxruntime/releases) (v1.22.0, linux-x64) when
   actually building this.
 - **`config/policy/mimic/`** (dance-motion policies, ~3.2MB of `.onnx`/`.bvh` motion
-  data) — unrelated to this project's locomotion/arm goals, per
-  `29dof_implementation_plan.md`'s "what gets ported" list. `src/State_Mimic.cpp` /
+  data) — unrelated to this project's locomotion/arm goals. `src/State_Mimic.cpp` /
   `include/State_Mimic.h` are kept (small, and `main.cpp` references the FSM state) even
   though their data dependency isn't.
 

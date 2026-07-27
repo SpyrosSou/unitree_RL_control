@@ -1,13 +1,22 @@
 """
-G1 rough-terrain locomotion demo with keyboard control.
+G1 flat-terrain locomotion demo with keyboard control (simplest setup).
 
-Uses the pre-trained RSL-RL checkpoint for Isaac-Velocity-Rough-G1-v0.
-The checkpoint is downloaded automatically from NVIDIA Nucleus on first run.
+One robot, flat ground, no height scan.
 
-Usage:
+By default uses the pre-trained RSL-RL checkpoint for Isaac-Velocity-Flat-G1-v0,
+downloaded automatically from NVIDIA Nucleus on first run.
+
+Pass --checkpoint to use a locally trained checkpoint from this repo instead.
+
+Usage (from project root):
+    # Pre-trained Isaac Lab checkpoint (default)
     conda activate isaac_g1_control
     cd ~/Elm/Code/g1_locomotion
-    python testing/walking_testing/g1_rough_terrain.py
+    python testing/visual_testing/walk/g1_locomotion_demo.py
+
+    # Locally trained checkpoint
+    python testing/visual_testing/walk/g1_locomotion_demo.py \\
+        --checkpoint logs/rsl_rl/g1_locomotion_flat/YYYY-MM-DD_HH-MM-SS/model_1500.pt
 
 Controls:
     W  -- walk forward
@@ -36,8 +45,29 @@ _spec.loader.exec_module(cli_args)
 
 from isaaclab.app import AppLauncher
 
+import yaml
+
+_YAML_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkpoints.yaml")
+
+
+def _yaml_walking_checkpoint() -> str | None:
+    """Return the 'walking' checkpoint from checkpoints.yaml, or None."""
+    if not os.path.isfile(_YAML_PATH):
+        return None
+    with open(_YAML_PATH) as f:
+        cfg = yaml.safe_load(f) or {}
+    entry = cfg.get("walking", {}) or {}
+    ckpt = entry.get("checkpoint")
+    if not ckpt:
+        return None
+    if not os.path.isabs(ckpt):
+        repo_root = os.path.dirname(os.path.dirname(os.path.dirname(_YAML_PATH)))
+        ckpt = os.path.join(repo_root, ckpt)
+    return ckpt
+
+
 parser = argparse.ArgumentParser(
-    description="Interactive G1 locomotion demo with keyboard teleoperation."
+    description="Interactive G1 flat-terrain locomotion demo with keyboard teleoperation."
 )
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
@@ -60,35 +90,45 @@ from isaaclab.utils.math import quat_apply
 
 from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper
 from isaaclab_rl.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
-from isaaclab_tasks.manager_based.locomotion.velocity.config.g1.rough_env_cfg import (
-    G1RoughEnvCfg_PLAY,
+from isaaclab_tasks.manager_based.locomotion.velocity.config.g1.flat_env_cfg import (
+    G1FlatEnvCfg_PLAY,
 )
 
-TASK = "Isaac-Velocity-Rough-G1-v0"
+TASK = "Isaac-Velocity-Flat-G1-v0"
 RL_LIBRARY = "rsl_rl"
+
 LIN_VEL = 1.0   # m/s  forward / strafe speed
 ANG_VEL = 0.5   # rad/s turn rate
 
 
-class G1LocomotionDemo:
-    """Single-robot G1 locomotion demo with WASD keyboard control."""
+class G1FlatDemo:
+    """Single-robot G1 flat-terrain demo with WASD keyboard control."""
 
     def __init__(self):
         agent_cfg: RslRlOnPolicyRunnerCfg = cli_args.parse_rsl_rl_cfg(TASK, args_cli)
 
-        checkpoint = get_published_pretrained_checkpoint(RL_LIBRARY, TASK)
-        if checkpoint is None:
-            raise RuntimeError(
-                f"Could not fetch pre-trained checkpoint for {TASK}. "
-                "Check your internet / Nucleus connection."
-            )
+        # Resolution order: --checkpoint CLI > checkpoints.yaml > pretrained download
+        if getattr(args_cli, "checkpoint", None):
+            checkpoint = args_cli.checkpoint
+            if not os.path.isfile(checkpoint):
+                raise FileNotFoundError(f"Checkpoint not found: {checkpoint}")
+            print(f"[G1Demo] Using local checkpoint: {checkpoint}")
+        elif (yaml_ckpt := _yaml_walking_checkpoint()) and os.path.isfile(yaml_ckpt):
+            checkpoint = yaml_ckpt
+            print(f"[G1Demo] Using YAML checkpoint: {checkpoint}")
+        else:
+            checkpoint = get_published_pretrained_checkpoint(RL_LIBRARY, TASK)
+            if checkpoint is None:
+                raise RuntimeError(
+                    f"Could not fetch pre-trained checkpoint for {TASK}. "
+                    "Check your internet / Nucleus connection."
+                )
+            print(f"[G1Demo] Using pre-trained Isaac Lab checkpoint: {checkpoint}")
 
-        env_cfg = G1RoughEnvCfg_PLAY()
+        env_cfg = G1FlatEnvCfg_PLAY()
         env_cfg.scene.num_envs = 1
         env_cfg.episode_length_s = 1_000_000
         env_cfg.curriculum = None
-        env_cfg.commands.base_velocity.ranges.lin_vel_x = (0.0, LIN_VEL)
-        env_cfg.commands.base_velocity.ranges.heading = (-1.0, 1.0)
 
         self.env = RslRlVecEnvWrapper(ManagerBasedRLEnv(cfg=env_cfg))
         self.device = self.env.unwrapped.device
@@ -96,9 +136,6 @@ class G1LocomotionDemo:
         runner = OnPolicyRunner(self.env, agent_cfg.to_dict(), log_dir=None, device=self.device)
         runner.load(checkpoint)
         self.policy = runner.get_inference_policy(device=self.device)
-
-        # [lin_vel_x, lin_vel_y, ang_vel_z]
-        self.commands = torch.zeros(1, 3, device=self.device)
 
         self._create_camera()
         self._setup_keyboard()
@@ -124,6 +161,7 @@ class G1LocomotionDemo:
         self.viewport.set_active_camera(self.camera_path)
 
     def update_camera(self):
+        """Keep third-person camera behind the robot."""
         base_pos = self.env.unwrapped.scene["robot"].data.root_pos_w[0]
         base_quat = self.env.unwrapped.scene["robot"].data.root_quat_w[0]
         offset = torch.tensor([-2.5, 0.0, 0.8], device=self.device)
@@ -138,6 +176,8 @@ class G1LocomotionDemo:
         )
 
     # -- Keyboard (via Isaac Lab's Se2Keyboard device) -------------------------
+    # Se2Keyboard handles the carb API correctly and is the proven Isaac Lab way.
+    # We override the key bindings to use WASD instead of arrow/numpad keys.
 
     def _setup_keyboard(self):
         from isaaclab.devices.keyboard import Se2Keyboard, Se2KeyboardCfg
@@ -145,6 +185,8 @@ class G1LocomotionDemo:
 
         kb_cfg = Se2KeyboardCfg(sim_device=str(self.device))
         self._keyboard = Se2Keyboard(kb_cfg)
+
+        # WASD bindings: press accumulates, release subtracts (Se2Keyboard style)
         self._keyboard._INPUT_KEY_MAPPING = {
             "W": np.array([ LIN_VEL,  0.0,     0.0]),
             "A": np.array([ 0.0,      0.0,  ANG_VEL]),
@@ -152,7 +194,9 @@ class G1LocomotionDemo:
             "Q": np.array([ 0.0,  LIN_VEL,     0.0]),
             "E": np.array([ 0.0, -LIN_VEL,     0.0]),
         }
+        # S stops: reset accumulated command to zero
         self._keyboard.add_callback("S", self._keyboard.reset)
+        # C toggles camera
         self._keyboard.add_callback("C", self._toggle_camera)
 
     def _toggle_camera(self):
@@ -163,7 +207,7 @@ class G1LocomotionDemo:
 
 
 def main():
-    demo = G1LocomotionDemo()
+    demo = G1FlatDemo()
     obs, _ = demo.env.reset()
     step = 0
 
@@ -172,8 +216,10 @@ def main():
         with torch.inference_mode():
             action = demo.policy(obs)
             obs, _, _, _ = demo.env.step(action)
+            # Pull velocity command from keyboard device [vx, vy, wz]
             vel_cmd = demo._keyboard.advance()
             obs[:, 9:12] = vel_cmd.unsqueeze(0)
+            # Debug: print command every 60 steps so you can see WASD is working
             if step % 60 == 0:
                 print(f"[G1] cmd: vx={vel_cmd[0]:.2f}  vy={vel_cmd[1]:.2f}  wz={vel_cmd[2]:.2f}")
             step += 1

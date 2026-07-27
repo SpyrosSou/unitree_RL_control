@@ -3,52 +3,49 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Deterministic, command-conditioned evaluation for a G1 29dof unified stand+walk
-checkpoint — the "training-only" metrics eval (as opposed to
-``validation/integration_validation/eval_full_demo.py``-style testing with a separate
-arm policy layered on top, which doesn't exist for the 29dof arm yet anyway).
+"""Single, comprehensive evaluation for a G1 29dof unified stand+walk checkpoint — one
+command, one `summary.md`, everything we actually check for a walking checkpoint in one
+place, mirroring how `eval_arm.py` works for arms. Replaces having to separately run
+this script for command-tracking/drift, `check_real_displacement.py` for a raw
+world-frame sanity check, and eval_walking.py --pin_disturbance_phase four times for the
+per-phase disturbance fall-rate sweep — those were three separate Isaac Sim launches and
+manual copy-pasted terminal output; this is one launch, one file on disk.
 
-Rewritten 2026-07-21 for the 29dof pivot — replaces the 23dof-era version that used to
-live at this exact path (preserved on the ``23_dof`` git branch, not carried forward
-here) — see ``29dof_implementation_plan.md``. Structurally close to a straight port:
-same command-bucket sweep, same drift-check methodology, same
-``WalkingMetricsCsvWrapper`` reuse (so these numbers are directly comparable to a run's
-own ``walking_detailed.csv`` — see that wrapper's docstring). Two real differences from
-the 23dof version:
+Rewritten 2026-07-27 to consolidate all three (previously: `eval_walking.py`'s own
+command-bucket/drift sweep, `testing/general_testing/check_real_displacement.py`'s raw
+`root_pos_w` sanity check, and repeated `--pin_disturbance_phase` runs for the 4-phase
+arm-disturbance fall-rate check). All three reuse ONE `ManagerBasedRLEnv` instance
+(rebuilding Isaac Sim's simulation context repeatedly within one process is unreliable —
+see `_run_command_bucket`'s docstring) instead of three separate script invocations.
 
-1. This project's 23dof phase had separate standing and walking checkpoints/tasks;
-   the 29dof recipe is one unified policy (``rel_standing_envs`` covers near-zero-
-   velocity "standing" as an edge case of the same command distribution) — so this one
-   script covers what used to need two (``eval_standing.py`` + ``eval_walking.py``). The
-   ``stand_still`` bucket already in ``_BUCKETS`` below exercises exactly that regime.
-2. ``--arm_disturbance`` — if the checkpoint was trained on
-   ``G1-Locomotion-Velocity-ArmDisturbance-v0`` (the arm-motion-disturbance
-   curriculum, see Phase 2 of the plan), pass this to build the eval env from
-   ``G1LocomotionArmDisturbanceEnvCfg_PLAY`` instead of the plain ``G1LocomotionEnvCfg_PLAY`` — forces
-   the disturbance curriculum fully on (matching that _PLAY cfg's own phase-boundary
-   override) instead of leaving arms scripted-static, so the command-tracking numbers
-   reflect what the checkpoint actually has to cope with. Omit for a base-recipe
-   checkpoint (``G1-Locomotion-Velocity-v0``) — arms just sit at default the whole
-   time either way for that one.
+Sections run, in order:
+1. Command-bucket sweep (tracking error, foot slip, fall rate, and — for the
+   zero-lateral/zero-yaw "straight" buckets — heading/lateral drift).
+2. Arm-disturbance phase sweep (fall rate under each of the 4 disturbance phases while
+   standing still) — only if `--arm_disturbance` is set; skip with `--skip_phases`.
+3. Raw world-frame displacement sanity check (does actual `root_pos_w` displacement over
+   a fixed-speed rollout match what the commanded speed implies) — guards against a real
+   past bug in this project where a reward-derived tracking-error metric was misread as
+   achieved velocity (see git history 2026-07-23/24). Skip with `--skip_displacement`.
 
 Usage:
     conda activate isaac_g1_control
     cd ~/Elm/Code/g1_locomotion
 
     python validation/eval_walking.py \\
-        --checkpoint logs/rsl_rl/walking/base/<run>/model_2998.pt \\
-        --headless
-
-    python validation/eval_walking.py \\
-        --checkpoint logs/rsl_rl/walking/arm_disturbance/<run>/model_2998.pt \\
+        --checkpoint logs/rsl_rl/walking/arm_disturbance/<run>/model_7999.pt \\
         --arm_disturbance \\
         --headless
 
+    python validation/eval_walking.py \\
+        --checkpoint logs/rsl_rl/walking/base/<run>/model_2998.pt \\
+        --headless
+
 Output:
-    Prints a per-bucket summary table (tracking error, foot slip, fall rate, and — for
-    the straight-line buckets — heading/lateral drift) and writes the same summary, plus
-    the raw per-episode rows (reusing ``WalkingMetricsCsvWrapper``), under
-    <checkpoint_dir>/command_eval/.
+    <checkpoint_dir>/walking_eval/summary.md — all three sections above, plus the raw
+    per-episode CSVs per bucket/phase under their own subdirectories (reusing
+    ``WalkingMetricsCsvWrapper``, so these numbers are directly comparable to a run's own
+    ``walking_detailed.csv``).
 """
 
 # ---------------------------------------------------------------------------
@@ -73,34 +70,39 @@ _BUCKETS = {
     "forward_turn_combo": (0.5, 0.0, 0.4),
 }
 _STRAIGHT_BUCKETS = {"forward_slow", "forward_medium", "forward_fast", "backward"}
+_PHASES = [0, 1, 2, 3]
 
-parser = argparse.ArgumentParser(description="Command-conditioned eval for a G1 29dof stand+walk checkpoint.")
+parser = argparse.ArgumentParser(description="Comprehensive eval for a G1 29dof stand+walk checkpoint.")
 parser.add_argument("--checkpoint", type=str, required=True, help="Path to a trained checkpoint (.pt).")
 parser.add_argument(
     "--arm_disturbance", action="store_true",
     help="Build the eval env from G1LocomotionArmDisturbanceEnvCfg_PLAY (disturbance forced on) "
     "instead of the plain G1LocomotionEnvCfg_PLAY — pass this for a checkpoint trained on "
-    "G1-Locomotion-Velocity-ArmDisturbance-v0.",
+    "G1-Locomotion-Velocity-ArmDisturbance-v0. Also gates whether the disturbance-phase sweep "
+    "(section 2) runs at all — meaningless without the disturbance event in the first place.",
 )
 parser.add_argument(
     "--buckets", type=str, nargs="+", default=list(_BUCKETS.keys()), choices=list(_BUCKETS.keys()),
-    help="Which command buckets to evaluate.",
+    help="Which command buckets to evaluate in section 1.",
 )
 parser.add_argument(
-    "--pin_disturbance_phase", type=int, default=None, choices=[0, 1, 2, 3],
-    help="Pin mdp.ArmMotionDisturbance at exactly this phase for the whole eval, instead of letting "
-    "it cycle through phases over elapsed eval time (the default _PLAY phase_step_boundaries are "
-    "tuned for a quick play.py look, not a clean per-phase measurement — a stand_still bucket run "
-    "with this unset blends whatever mix of phases happened to occur during the eval window into "
-    "one fall-rate number, dominated by whichever phase produced the most short/failing episodes). "
-    "Works by setting phase_step_boundaries to N copies of 0, which makes the phase-index lookup "
-    "fall through immediately to phase N regardless of step count — no new logic, just forces the "
-    "existing one. Only meaningful with --arm_disturbance. Ignored otherwise.",
+    "--phases", type=int, nargs="+", default=_PHASES, choices=_PHASES,
+    help="Which arm-disturbance phases to evaluate in section 2 (only with --arm_disturbance).",
 )
-parser.add_argument("--num_envs", type=int, default=256, help="Parallel envs per bucket.")
+parser.add_argument("--skip_phases", action="store_true", help="Skip section 2 entirely.")
+parser.add_argument("--skip_displacement", action="store_true", help="Skip section 3 entirely.")
+parser.add_argument(
+    "--displacement_speed", type=float, default=0.6,
+    help="Commanded forward speed (m/s) for the section-3 raw displacement check.",
+)
+parser.add_argument(
+    "--displacement_steps", type=int, default=500,
+    help="Control steps for the section-3 raw displacement check (500 @ 50Hz = 10s).",
+)
+parser.add_argument("--num_envs", type=int, default=256, help="Parallel envs per bucket/phase.")
 parser.add_argument(
     "--steps_per_bucket", type=int, default=1500,
-    help="Control steps to run per bucket (at 50 Hz; 1500 steps ~= 30 s, several episodes per env).",
+    help="Control steps per bucket/phase (at 50 Hz; 1500 steps ~= 30 s, several episodes per env).",
 )
 parser.add_argument("--seed", type=int, default=42, help="Fixed seed for reproducible rollouts.")
 AppLauncher.add_app_launcher_args(parser)
@@ -129,11 +131,22 @@ from g1_locomotion.tasks.manager_based.g1_locomotion.g1_locomotion_env_cfg impor
     G1LocomotionEnvCfg_PLAY,
 )
 # Reuse the exact same per-episode metrics wrapper training runs use — keeps the eval's
-# numbers directly comparable to what you'd see in a run's walking_detailed.csv. No
-# 29dof-specific wrapper needed: WalkingMetricsCsvWrapper has no DOF-count assumptions
-# (unlike StandingMetricsCsvWrapper, not used here — see 29dof_implementation_plan.md).
+# numbers directly comparable to what you'd see in a run's walking_detailed.csv.
 from g1_locomotion.utils.eval_meta import write_eval_meta
 from g1_locomotion.utils.metrics_wrappers import WalkingMetricsCsvWrapper
+
+
+def _pearson(xs: list[float], ys: list[float]) -> float:
+    n = len(xs)
+    if n < 2:
+        return float("nan")
+    mean_x, mean_y = sum(xs) / n, sum(ys) / n
+    cov = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys))
+    var_x = sum((x - mean_x) ** 2 for x in xs)
+    var_y = sum((y - mean_y) ** 2 for y in ys)
+    if var_x == 0 or var_y == 0:
+        return float("nan")
+    return cov / (var_x * var_y) ** 0.5
 
 
 def _summarize(csv_path: str, is_straight: bool) -> dict:
@@ -152,6 +165,15 @@ def _summarize(csv_path: str, is_straight: bool) -> dict:
         "mean_ang_vel_track_err_rad_s": sum(float(r["mean_ang_vel_track_err_rad_s"]) for r in rows) / n,
         "mean_foot_slip_speed_m_s": sum(float(r["mean_foot_slip_speed_m_s"]) for r in rows) / n,
     }
+    # Knee-angle tracking (2026-07-27, see deferred_items_2026-07-21.md item 8): checks a
+    # visually-observed hypothesis that near-extended knees correlate with the
+    # asymmetric-step corrections that precede bad heading drift — computed for every
+    # bucket (not just straight ones) since knee behavior itself isn't drift-specific,
+    # only the correlation-with-drift check below is.
+    mean_knee_angles = [float(r["mean_knee_angle_deg"]) for r in rows]
+    min_knee_angles = [float(r["min_knee_angle_deg"]) for r in rows]
+    stats["mean_knee_angle_deg"] = sum(mean_knee_angles) / n
+    stats["mean_min_knee_angle_deg"] = sum(min_knee_angles) / n
     if is_straight:
         heading_drifts = [float(r["heading_drift_deg"]) for r in rows]
         lateral_drifts = [float(r["lateral_drift_m"]) for r in rows]
@@ -159,6 +181,10 @@ def _summarize(csv_path: str, is_straight: bool) -> dict:
         stats["max_abs_heading_drift_deg"] = max(abs(x) for x in heading_drifts)
         stats["mean_abs_lateral_drift_m"] = sum(abs(x) for x in lateral_drifts) / n
         stats["max_abs_lateral_drift_m"] = max(abs(x) for x in lateral_drifts)
+        # Negative correlation = episodes that stay more extended (lower min knee angle)
+        # tend to drift more — supports the hypothesis. Near zero = no relationship found.
+        abs_heading = [abs(x) for x in heading_drifts]
+        stats["knee_vs_heading_drift_corr"] = _pearson(min_knee_angles, abs_heading)
     return stats
 
 
@@ -195,37 +221,35 @@ def _build_base_env() -> ManagerBasedRLEnv:
     # (confirmed 2026-07-24 — see check_arm_disturbance_magnitude.py's identical fix).
     base_velocity.debug_vis = False
 
-    if args_cli.pin_disturbance_phase is not None and hasattr(env_cfg.events, "arm_motion_disturbance"):
-        n = args_cli.pin_disturbance_phase
-        env_cfg.events.arm_motion_disturbance.params["phase_step_boundaries"] = tuple([0] * n)
-        env_cfg.events.arm_motion_disturbance.params["phase_step_offset"] = 0
-
     return ManagerBasedRLEnv(cfg=env_cfg)
 
 
-def _run_bucket(base_env: ManagerBasedRLEnv, name: str, eval_root: str) -> dict:
-    """Run one command bucket's rollout on the shared, already-constructed base_env.
-
-    Deliberately reuses one ManagerBasedRLEnv across all buckets instead of building a
-    fresh one per bucket — repeatedly constructing/tearing down Isaac Sim's simulation
-    context within a single process is unreliable. The velocity command term reads its
-    cfg.ranges fresh on every resample, so mutating the live term's ranges and calling
-    reset() is enough to switch buckets — no rebuild needed.
-    """
-    vx, vy, wz = _BUCKETS[name]
-    print(f"\n[Eval] --- Bucket '{name}' (vx={vx}, vy={vy}, wz={wz}) ---")
-
+def _set_command(base_env: ManagerBasedRLEnv, vx: float, vy: float, wz: float):
     command_term = base_env.command_manager.get_term("base_velocity")
     command_term.cfg.ranges.lin_vel_x = (vx, vx)
     command_term.cfg.ranges.lin_vel_y = (vy, vy)
     command_term.cfg.ranges.ang_vel_z = (wz, wz)
+    return command_term
 
-    bucket_dir = os.path.join(eval_root, name)
+
+def _run_command_bucket(base_env: ManagerBasedRLEnv, name: str, vx: float, vy: float, wz: float, out_dir: str) -> dict:
+    """Run one fixed-command rollout on the shared, already-constructed base_env.
+
+    Deliberately reuses one ManagerBasedRLEnv across every bucket/phase in this script
+    instead of building a fresh one per section — repeatedly constructing/tearing down
+    Isaac Sim's simulation context within a single process is unreliable. The velocity
+    command term reads its cfg.ranges fresh on every resample, so mutating the live
+    term's ranges and calling reset() is enough to switch commands — no rebuild needed.
+    """
+    print(f"\n[Eval] --- '{name}' (vx={vx}, vy={vy}, wz={wz}) ---")
+    command_term = _set_command(base_env, vx, vy, wz)
+
+    bucket_dir = os.path.join(out_dir, name)
     os.makedirs(bucket_dir, exist_ok=True)
 
-    # Everything below touches base_env's live state tensors. From the second bucket
-    # onward those tensors get written to while already tagged as PyTorch "inference
-    # tensors" (the first bucket's rollout ran inside inference_mode) — in-place writes
+    # Everything below touches base_env's live state tensors. From the second
+    # bucket/phase onward those tensors get written to while already tagged as PyTorch
+    # "inference tensors" (the first rollout ran inside inference_mode) — in-place writes
     # to an inference tensor are only legal from *inside* inference_mode, so
     # construction/reset must be in this block too, not just the stepping loop.
     torch.manual_seed(args_cli.seed)
@@ -247,54 +271,93 @@ def _run_bucket(base_env: ManagerBasedRLEnv, name: str, eval_root: str) -> dict:
         # UniformVelocityCommand._update_command() force-zeroes vel_command_b every
         # step for any env still flagged — silently overriding the fixed (vx,vy,wz)
         # this bucket is supposed to be testing for whichever ~2% of envs get unlucky.
-        # Small-scale here (num_envs is large, so only a handful of episodes per bucket
-        # are affected, not the near-total corruption a 1-env demo saw) but still a
-        # real, unnecessary contamination of buckets that are supposed to be a fixed,
-        # pinned command for every env.
         command_term.is_standing_env[:] = False
         for _ in range(args_cli.steps_per_bucket):
             action = policy(obs)
             obs, _, _, _ = wrapped_env.step(action)
 
     # Close only this bucket's CSV file handles — not wrapped_env.close(), which would
-    # cascade down and tear down base_env, breaking the next bucket.
+    # cascade down and tear down base_env, breaking the next bucket/phase.
     env._csv.close()
     return _summarize(env.csv_path, is_straight=name in _STRAIGHT_BUCKETS)
 
 
+def _run_displacement_check(base_env: ManagerBasedRLEnv) -> dict:
+    """Raw root_pos_w displacement over a fixed-speed rollout — independent of the
+    reward-derived tracking-error metric section 1 already reports. Guards against a
+    real past bug (2026-07-23/24) where that metric was misread as achieved velocity;
+    this reads world-frame position directly, no ambiguity possible."""
+    print(f"\n[Eval] --- Displacement check (forward {args_cli.displacement_speed} m/s, "
+          f"{args_cli.displacement_steps} steps) ---")
+    command_term = _set_command(base_env, args_cli.displacement_speed, 0.0, 0.0)
+
+    torch.manual_seed(args_cli.seed)
+    with torch.inference_mode():
+        wrapped_env = RslRlVecEnvWrapper(base_env)
+        device = base_env.device
+        agent_cfg = BasePPORunnerCfg()
+        runner = OnPolicyRunner(wrapped_env, agent_cfg.to_dict(), log_dir=None, device=device)
+        runner.load(args_cli.checkpoint)
+        policy = runner.get_inference_policy(device=device)
+
+        obs, _ = wrapped_env.reset()
+        command_term.is_standing_env[:] = False
+        start_pos = base_env.scene["robot"].data.root_pos_w[:, :2].clone()
+
+        for _ in range(args_cli.displacement_steps):
+            command_term.is_standing_env[:] = False
+            action = policy(obs)
+            obs, _, _, _ = wrapped_env.step(action)
+
+        final_pos = base_env.scene["robot"].data.root_pos_w[:, :2]
+        total_disp = (final_pos - start_pos).norm(dim=-1)
+
+    expected_disp = args_cli.displacement_speed * (args_cli.displacement_steps / 50.0)
+    return {
+        "expected_disp_m": expected_disp,
+        "mean_disp_m": total_disp.mean().item(),
+        "min_disp_m": total_disp.min().item(),
+        "max_disp_m": total_disp.max().item(),
+        "frac_of_expected": total_disp.mean().item() / expected_disp if expected_disp > 0 else float("nan"),
+    }
+
+
 def main():
     checkpoint_dir = os.path.dirname(os.path.abspath(args_cli.checkpoint))
-    eval_dir_name = "command_eval"
-    if args_cli.pin_disturbance_phase is not None:
-        # Namespaced separately per phase — otherwise repeated per-phase runs against the
-        # same checkpoint would overwrite each other's summary.md/CSVs in "command_eval/".
-        eval_dir_name = f"command_eval_phase{args_cli.pin_disturbance_phase}"
-    eval_root = os.path.join(checkpoint_dir, eval_dir_name)
+    eval_root = os.path.join(checkpoint_dir, "walking_eval")
     os.makedirs(eval_root, exist_ok=True)
     write_eval_meta(eval_root, args_cli, __file__)
+
+    run_phases = args_cli.arm_disturbance and not args_cli.skip_phases
 
     print(f"[Eval] Checkpoint     : {args_cli.checkpoint}")
     print(f"[Eval] Arm disturbance: {args_cli.arm_disturbance}")
     print(f"[Eval] Buckets        : {args_cli.buckets}")
+    print(f"[Eval] Phase sweep    : {args_cli.phases if run_phases else 'skipped'}")
+    print(f"[Eval] Displacement   : {'skipped' if args_cli.skip_displacement else 'yes'}")
     print(f"[Eval] num_envs       : {args_cli.num_envs}   steps_per_bucket: {args_cli.steps_per_bucket}")
 
-    print("[Eval] Building simulation (once, reused across all buckets)...")
+    print("[Eval] Building simulation (once, reused across every section)...")
     base_env = _build_base_env()
 
     summary_lines = [
-        "# G1 29dof Locomotion Command-Conditioned Eval",
+        "# G1 29dof Walking Eval",
         "",
         f"Checkpoint: `{args_cli.checkpoint}`",
         f"Arm disturbance forced on: {args_cli.arm_disturbance}",
+        "",
+        "## 1. Command-bucket sweep",
         "",
         "| Bucket | vx, vy, wz | Episodes | Fall rate | Lin. track err (m/s) | Ang. track err (rad/s) "
         "| Foot slip (m/s) | Mean\\|heading drift\\| (deg) | Mean\\|lateral drift\\| (m) |",
         "|---|---|---|---|---|---|---|---|---|",
     ]
 
+    command_bucket_stats: dict[str, dict] = {}
     for name in args_cli.buckets:
-        stats = _run_bucket(base_env, name, eval_root)
         vx, vy, wz = _BUCKETS[name]
+        stats = _run_command_bucket(base_env, name, vx, vy, wz, eval_root)
+        command_bucket_stats[name] = stats
         if stats["episodes"] == 0:
             print(f"[Eval] Bucket '{name}': no completed episodes — increase --steps_per_bucket.")
             summary_lines.append(f"| {name} | {vx}, {vy}, {wz} | 0 | — | — | — | — | — | — |")
@@ -320,6 +383,103 @@ def main():
             f"| {name} | {vx}, {vy}, {wz} | {stats['episodes']} | {stats['fall_rate']:.2%} "
             f"| {stats['mean_lin_vel_track_err_m_s']:.3f} | {stats['mean_ang_vel_track_err_rad_s']:.3f} "
             f"| {stats['mean_foot_slip_speed_m_s']:.3f} | {heading_col} | {lateral_col} |"
+        )
+
+    summary_lines += [
+        "",
+        "## 2. Arm-disturbance phase sweep (standing still, fall rate per phase)",
+        "",
+    ]
+    if not run_phases:
+        summary_lines.append("Skipped (`--arm_disturbance` not set, or `--skip_phases` passed).")
+    else:
+        summary_lines += [
+            "| Phase | Episodes | Fall rate | Lin. track err (m/s) | Ang. track err (rad/s) | Foot slip (m/s) |",
+            "|---|---|---|---|---|---|",
+        ]
+        for phase in args_cli.phases:
+            term_cfg = base_env.event_manager.get_term_cfg("arm_motion_disturbance")
+            # Pins the phase for the whole rollout instead of letting it cycle over
+            # elapsed eval time — see the old --pin_disturbance_phase flag's docstring
+            # (now folded into this always-on sweep): sets phase_step_boundaries to N
+            # copies of 0, which makes the phase-index lookup fall through immediately
+            # to phase N regardless of step count. Mutating term_cfg.params in place
+            # (not rebuilding the env) picks up live on this term's next "interval" call.
+            term_cfg.params["phase_step_boundaries"] = tuple([0] * phase)
+            term_cfg.params["phase_step_offset"] = 0
+
+            name = f"disturbance_phase_{phase}"
+            stats = _run_command_bucket(base_env, name, 0.0, 0.0, 0.0, eval_root)
+            if stats["episodes"] == 0:
+                print(f"[Eval] Phase {phase}: no completed episodes — increase --steps_per_bucket.")
+                summary_lines.append(f"| {phase} | 0 | — | — | — | — |")
+                continue
+            print(
+                f"[Eval] Phase {phase}: episodes={stats['episodes']} fall_rate={stats['fall_rate']:.2%} "
+                f"lin_track_err={stats['mean_lin_vel_track_err_m_s']:.3f} "
+                f"ang_track_err={stats['mean_ang_vel_track_err_rad_s']:.3f} "
+                f"foot_slip={stats['mean_foot_slip_speed_m_s']:.3f}"
+            )
+            summary_lines.append(
+                f"| {phase} | {stats['episodes']} | {stats['fall_rate']:.2%} "
+                f"| {stats['mean_lin_vel_track_err_m_s']:.3f} | {stats['mean_ang_vel_track_err_rad_s']:.3f} "
+                f"| {stats['mean_foot_slip_speed_m_s']:.3f} |"
+            )
+
+    summary_lines += [
+        "",
+        "## 3. Raw world-frame displacement check",
+        "",
+        "Reads `root_pos_w` directly — independent of section 1's reward-derived tracking "
+        "error, guarding against misreading a tracking metric as achieved velocity "
+        "(a real past bug in this project, 2026-07-23/24).",
+        "",
+    ]
+    if args_cli.skip_displacement:
+        summary_lines.append("Skipped (`--skip_displacement` passed).")
+    else:
+        d = _run_displacement_check(base_env)
+        print(
+            f"[Eval] Displacement: expected={d['expected_disp_m']:.2f}m "
+            f"mean={d['mean_disp_m']:.3f}m ({d['frac_of_expected']:.1%} of expected) "
+            f"min={d['min_disp_m']:.3f}m max={d['max_disp_m']:.3f}m"
+        )
+        summary_lines += [
+            f"- Commanded {args_cli.displacement_speed} m/s for {args_cli.displacement_steps} steps "
+            f"({args_cli.displacement_steps / 50:.1f}s @ 50Hz)",
+            f"- Expected displacement if tracking perfectly: {d['expected_disp_m']:.2f}m",
+            f"- Actual mean displacement across {args_cli.num_envs} envs: {d['mean_disp_m']:.3f}m "
+            f"({d['frac_of_expected']:.1%} of expected)",
+            f"- Range: {d['min_disp_m']:.3f}m - {d['max_disp_m']:.3f}m",
+        ]
+
+    summary_lines += [
+        "",
+        "## 4. Knee-angle tracking",
+        "",
+        "Checks a visually-observed hypothesis (round-2 drift checkpoint, 2026-07-27) "
+        "that near-extended knees during straight-line walking correlate with the "
+        "asymmetric-step corrections that precede bad heading drift — see "
+        "`deferred_items_2026-07-21.md` item 8. Knee angle: 0 rad = fully extended, "
+        "default pose is 0.3 rad (~17 deg), larger = more bent. `min_knee_angle_deg` is "
+        "the most-extended moment reached per episode. Correlation is Pearson's r between "
+        "each episode's `min_knee_angle_deg` and its `|heading_drift_deg|` — negative "
+        "means episodes that stay more extended tend to drift more (supports the "
+        "hypothesis); near zero means no relationship found in this data.",
+        "",
+        "| Bucket | Mean knee angle (deg) | Mean most-extended angle (deg) | Corr. vs \\|heading drift\\| |",
+        "|---|---|---|---|",
+    ]
+    for name in args_cli.buckets:
+        stats = command_bucket_stats.get(name, {})
+        if stats.get("episodes", 0) == 0:
+            summary_lines.append(f"| {name} | — | — | — |")
+            continue
+        corr = stats.get("knee_vs_heading_drift_corr")
+        corr_col = f"{corr:.2f}" if corr is not None and corr == corr else "—"  # nan check
+        summary_lines.append(
+            f"| {name} | {stats['mean_knee_angle_deg']:.2f} | {stats['mean_min_knee_angle_deg']:.2f} "
+            f"| {corr_col} |"
         )
 
     base_env.close()

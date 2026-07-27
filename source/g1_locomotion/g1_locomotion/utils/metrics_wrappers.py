@@ -492,6 +492,19 @@ class WalkingMetricsCsvWrapper(gym.Wrapper):
         self._foot_body_ids_robot: list[int] | None = None
         self._foot_body_ids_sensor: list[int] | None = None
 
+        # 2026-07-27: knee-angle tracking, added to check a visually-observed hypothesis
+        # (round-2 drift checkpoint) that near-extended knees during straight-line walking
+        # correlate with the asymmetric-step/foot-crossing corrections that precede bad
+        # heading drift — see deferred_items_2026-07-21.md item 8. Knee joint angle
+        # convention: 0 rad = fully extended/straight leg, larger = more bent (default
+        # pose is 0.3 rad, see UNITREE_G1_29DOF_CFG). min_knee_angle_deg is the single
+        # most-extended moment reached during the episode (both knees, whole episode).
+        self._knee_joint_ids: list[int] | None = None
+        self._episode_sum_knee_angle = torch.zeros(self._num_envs, dtype=torch.float32, device=self._device)
+        self._episode_min_knee_angle = torch.full(
+            (self._num_envs,), float("inf"), dtype=torch.float32, device=self._device
+        )
+
     @staticmethod
     def _fieldnames() -> list[str]:
         return [
@@ -510,6 +523,8 @@ class WalkingMetricsCsvWrapper(gym.Wrapper):
             "mean_foot_slip_speed_m_s",
             "heading_drift_deg",
             "lateral_drift_m",
+            "mean_knee_angle_deg",
+            "min_knee_angle_deg",
         ]
 
     def reset(self, **kwargs):
@@ -544,6 +559,8 @@ class WalkingMetricsCsvWrapper(gym.Wrapper):
         self._episode_sum_ang_err[env_ids] = 0.0
         self._episode_max_tilt[env_ids] = 0.0
         self._episode_sum_foot_slip[env_ids] = 0.0
+        self._episode_sum_knee_angle[env_ids] = 0.0
+        self._episode_min_knee_angle[env_ids] = float("inf")
 
         # self.unwrapped's robot state here already reflects the *new* episode's initial
         # pose: reset_buffers is only ever called right after the underlying env has
@@ -581,6 +598,14 @@ class WalkingMetricsCsvWrapper(gym.Wrapper):
         self._episode_sum_ang_err += ang_err.detach().float()
         self._episode_sum_foot_slip += self._foot_slip_speed(env, robot).detach().float()
         self._update_drift_metrics(env, robot, command)
+        self._update_knee_metrics(robot)
+
+    def _update_knee_metrics(self, robot):
+        if self._knee_joint_ids is None:
+            self._knee_joint_ids, _ = robot.find_joints([".*_knee_joint"])
+        knee_pos = robot.data.joint_pos[:, self._knee_joint_ids].detach().float()
+        self._episode_sum_knee_angle += knee_pos.mean(dim=-1)
+        self._episode_min_knee_angle = torch.minimum(self._episode_min_knee_angle, knee_pos.amin(dim=-1))
 
     def _update_drift_metrics(self, env, robot, command: torch.Tensor):
         dt = env.step_dt
@@ -659,6 +684,8 @@ class WalkingMetricsCsvWrapper(gym.Wrapper):
                 "mean_foot_slip_speed_m_s": float(self._episode_sum_foot_slip[env_id].item() / steps),
                 "heading_drift_deg": heading_drift_deg,
                 "lateral_drift_m": lateral_drift_m,
+                "mean_knee_angle_deg": math.degrees(self._episode_sum_knee_angle[env_id].item() / steps),
+                "min_knee_angle_deg": math.degrees(self._episode_min_knee_angle[env_id].item()),
             }
             self._csv.write_row(row)
             self._episode_index[env_id] += 1

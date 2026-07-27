@@ -12,21 +12,21 @@ may be slightly lower than a natively trained policy for the same arm.
 Usage (from project root, conda activate isaac_g1_control):
 
     # Run a left-trained policy on the RIGHT arm (mirrored)
-    python testing/arm_testing/g1_arm_mirror_test.py \\
+    python testing/visual_testing/arms/g1_arm_mirror_test.py \\
         --trained_arm left \\
         --active_arm right \\
         --checkpoint logs/rsl_rl/arms/left/<run>/model_5000.pt \\
         --targets 0.3 -0.2 1.0
 
     # Run a left-trained policy on the LEFT arm (no mirror, same as g1_arm_reach_test.py)
-    python testing/arm_testing/g1_arm_mirror_test.py \\
+    python testing/visual_testing/arms/g1_arm_mirror_test.py \\
         --trained_arm left \\
         --active_arm left \\
         --checkpoint logs/rsl_rl/arms/left/<run>/model_5000.pt \\
         --targets 0.3 0.2 1.0
 
     # Run a right-trained policy on the LEFT arm (mirrored)
-    python testing/arm_testing/g1_arm_mirror_test.py \\
+    python testing/visual_testing/arms/g1_arm_mirror_test.py \\
         --trained_arm right \\
         --active_arm left \\
         --checkpoint logs/rsl_rl/arms/right/<run>/model_5000.pt \\

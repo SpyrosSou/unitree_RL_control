@@ -1,0 +1,13 @@
+Checkpoint: chosen_checkpoints/walking_latest.pt
+Forced common_step_counter before reset: 624000
+phase_step_boundaries in use: (3000, 15000, 40000)
+num_envs: 64  steps measured: 1000
+
+Sampled phase distribution: {0: 2, 1: 11, 2: 11, 3: 40} ({0: '3.1%', 1: '17.2%', 2: '17.2%', 3: '62.5%'})
+Theoretical expected (frontier=3): {0: '6.7%', 1: '13.3%', 2: '26.7%', 3: '53.3%'}
+
+Actual simulated max |joint_pos - default| reached, by sampled phase (expected amplitude ceiling per phase: 0.00 / 0.24 / 0.45 / 0.70 rad):
+  phase 0 (n=2): mean_across_joints_max=0.0103 rad, max_across_joints_max=0.0106 rad | BEST SINGLE JOINT (any env, any joint): 0.0570 rad | mean of each env's own single-best joint: 0.0556 rad
+  phase 1 (n=11): mean_across_joints_max=0.1054 rad, max_across_joints_max=0.1344 rad | BEST SINGLE JOINT (any env, any joint): 0.2242 rad | mean of each env's own single-best joint: 0.2139 rad
+  phase 2 (n=11): mean_across_joints_max=0.1969 rad, max_across_joints_max=0.2303 rad | BEST SINGLE JOINT (any env, any joint): 0.4106 rad | mean of each env's own single-best joint: 0.3968 rad
+  phase 3 (n=40): mean_across_joints_max=0.3032 rad, max_across_joints_max=0.3385 rad | BEST SINGLE JOINT (any env, any joint): 0.7432 rad | mean of each env's own single-best joint: 0.6270 rad

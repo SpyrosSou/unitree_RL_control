@@ -9,10 +9,10 @@ Usage:
     cd ~/Elm/Code/g1_locomotion
 
     # Auto-pick latest standing checkpoint
-    python testing/walking_testing/g1_standing_demo.py
+    python testing/visual_testing/walk/g1_standing_demo.py
 
     # Explicit checkpoint
-    python testing/walking_testing/g1_standing_demo.py \
+    python testing/visual_testing/walk/g1_standing_demo.py \
         --checkpoint logs/rsl_rl/standing/g1_locomotion_flat/<run>/model_1500.pt
 """
 

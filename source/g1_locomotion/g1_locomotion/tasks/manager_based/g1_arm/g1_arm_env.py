@@ -152,9 +152,10 @@ class G1ArmEnvCfg(DirectRLEnvCfg):
     decimation: int = 2  # 30 Hz control
 
     # Observation / action / state dims
-    # 9-D base-state prefix (base_lin_vel, base_ang_vel, projected_gravity) + 23-D per arm
-    # (joint_pos(7) + joint_vel(7) + ee_pos(3) + goal(3) + error(3)) = 32-D per arm.
-    observation_space: int = 32
+    # 9-D base-state prefix (base_lin_vel, base_ang_vel, projected_gravity) + 30-D per arm
+    # (joint_pos(7) + joint_vel(7) + ee_pos(3) + goal(3) + error(3) + action_fb(7)) =
+    # 39-D per arm. action_fb ADDED 2026-07-26 — see _get_observations' own comment.
+    observation_space: int = 39
     action_space: int = 7
     state_space: int = 0  # no separate critic state; must be set (None crashes serialization)
 
@@ -183,6 +184,29 @@ class G1ArmEnvCfg(DirectRLEnvCfg):
     joint_limit_penalty_scale: float = 1.0
     goal_reached_bonus: float = 50.0
     goal_threshold: float = 0.02  # 2 cm
+
+    # 2026-07-26: goal-distance curriculum. When enabled, _sample_goal_positions shrinks
+    # each bounds box around its own center to goal_curriculum_start_frac of its full
+    # half-span at common_step_counter=0, linearly expanding to 100% by
+    # goal_curriculum_end_step (30_000 steps matches root_wobble_enable_step's existing
+    # step-based-schedule convention, ~1250 iterations at num_steps_per_env=24). Motivated
+    # by 2026-07-26 diagnostics: holding is solved (96%+ conversion from ever-within-2cm
+    # to actual success across every checkpoint tested this session), but reaching itself
+    # plateaus at ~30-40% ever-within-2cm and the plateau is genuine — frac_envs_reached/
+    # position_dist go flat by ~step 500 through 2000 iterations for best_combined, not
+    # still climbing — with no goal-space clustering (success/failure goal-position
+    # distributions nearly identical on x/y/z). A uniform capability shortfall across the
+    # whole box is the textbook case for easy-to-hard curriculum, not more iterations at
+    # fixed difficulty. Off by default — every existing task is unaffected.
+    goal_curriculum_enabled: bool = False
+    goal_curriculum_start_frac: float = 0.15
+    goal_curriculum_end_step: int = 30_000
+
+    # 2026-07-26: lets an eval-only cfg (G1ArmLeftEnvCfg_LongHold200) disable the
+    # early-termination-on-success behavior so an episode keeps running well past the
+    # goal_hold_steps threshold, to check whether the hold is actually sustained rather
+    # than just momentarily satisfied. True (stock behavior) everywhere else.
+    terminate_on_success: bool = True
     # FIXED 2026-07-23 (user request): previously "success" meant the hand's distance to
     # goal dropped under goal_threshold on ANY single step — the episode terminated that
     # exact instant, so a hand swinging past the target mid-oscillation counted exactly
@@ -243,6 +267,30 @@ class G1ArmEnvCfg(DirectRLEnvCfg):
     # branch-selection role here).
     null_space_penalty_scale: float = 0.05
 
+    # ADDED 2026-07-26: settle/braking penalty — see _get_rewards' own comment for the
+    # full rationale (comparative reward-breakdown data confirmed this is a
+    # holding-stability problem, not a reaching problem: every 40/10-gain variant
+    # touches goal_threshold at least as often per step as the 99.98%-success 200/20
+    # reference, yet succeeds an order of magnitude less often). settle_proximity_m is
+    # deliberately looser than goal_threshold (2cm) so the penalty can encourage braking
+    # INTO the success zone, not just once already inside it. Weight is a first,
+    # unvalidated estimate — comparable order of magnitude to null_space_penalty_scale,
+    # not yet ablated in isolation.
+    settle_proximity_m: float = 0.05
+    settle_velocity_penalty_scale: float = 0.05
+
+    # ADDED 2026-07-26: made configurable so a subclass can test a different gain
+    # cleanly (see G1ArmLeftEnvCfg_Gain60Kd1p5 below) — was hardcoded 40.0/10.0 inline
+    # in __post_init__ before. Default (40/10) unchanged — see __post_init__'s own long
+    # comment for why that value was chosen and its provenance. 2026-07-26: found that
+    # Unitree's own dedicated arm-control SDK examples (g1_arm7_sdk_dds_example.py,
+    # g1_arm5_sdk_dds_example.py — the actual gesture/reaching interface, not the
+    # locomotion/whole-body one) use kp=60, kd=1.5 for all arm joints, not 40/10 — the
+    # 40/10 value's damping component in particular traces to one historical commit in
+    # unitree_rl_lab (a research repo), not the deployment SDK. Worth testing directly.
+    arm_actuator_stiffness: float = 40.0
+    arm_actuator_damping: float = 10.0
+
     # Goal workspace x-range override — None = use _GOAL_BOUNDS as-is. Kept for parity
     # with the 23dof-era task's stress-testing pattern; unused by default.
     goal_bounds_x_override: tuple[float, float] | None = None
@@ -259,6 +307,16 @@ class G1ArmEnvCfg(DirectRLEnvCfg):
     # — see g1_arm_env.py git history 2026-07-24), not a replacement for fixing those,
     # but untested and not contraindicated by anything found so far.
     lock_wrist_pitch_yaw: bool = False
+
+    # ADDED 2026-07-26: append the action-filter's current internal state (self.
+    # filtered_actions) to the observation — see _get_observations' own comment for the
+    # full POMDP-gap rationale. Default True for all NEW training. False only exists so
+    # pre-2026-07-26 checkpoints (32/28/64-D obs, e.g. the 200/20-gain reference and the
+    # 4-way ablation sweep's baseline/privileged_critic/log_std runs) can still be
+    # loaded and evaluated — the observation_space field must ALSO be set back to its
+    # pre-change value on any cfg used this way (see G1ArmLeftEnvCfg_Legacy32 below),
+    # since this flag alone does not resize the tensor the network expects.
+    include_action_feedback: bool = True
 
     # Robot — G1 29dof asset, fixed base (this task doesn't need locomotion-grade
     # ground-contact fidelity; only arm joints are RL-actuated, everything else held
@@ -301,22 +359,40 @@ class G1ArmEnvCfg(DirectRLEnvCfg):
         # about what the actual hardware will need too (a plain PD drive has no gravity
         # feedforward regardless of sim vs. real), not a training inconvenience to dodge
         # by training against an easier gain than deployment will ever provide.
+        # FIXED 2026-07-25: joint_names_expr used a bare ".*_" prefix, which matches
+        # BOTH left_*/right_* joints regardless of self.arm — so a "left"-only task
+        # was also softening the RIGHT arm's gain from its stock value to 40/10, even
+        # though the right arm is never given a policy-driven target here (only
+        # G1ArmEnv.arm_joint_indices_tensor, built from self.arm, gets
+        # set_joint_position_target calls). An uncontrolled limb with a softened gain
+        # and no active driving just settles once toward a new gravity/dynamics
+        # equilibrium and holds there — confirmed via direct visual test (--arm left)
+        # showing the right elbow "move once and lock," which this explains without
+        # any action-routing bug (reward/obs code only ever reads self._arm_groups,
+        # scoped correctly to self.arm the whole time). Scope the regex prefix(es) to
+        # the side(s) this task actually controls; the other side (if any) keeps
+        # whatever gain UNITREE_G1_29DOF_CFG's stock config already gives it.
+        side_prefixes = {"left": ["left"], "right": ["right"], "both": ["left", "right"]}[self.arm]
         self.robot.actuators["arms"] = ImplicitActuatorCfg(
             joint_names_expr=[
-                ".*_shoulder_pitch_joint",
-                ".*_shoulder_roll_joint",
-                ".*_shoulder_yaw_joint",
-                ".*_elbow_joint",
-                ".*_wrist_roll_joint",
-                ".*_wrist_pitch_joint",
-                ".*_wrist_yaw_joint",
+                f"{side}_{suffix}"
+                for side in side_prefixes
+                for suffix in (
+                    "shoulder_pitch_joint",
+                    "shoulder_roll_joint",
+                    "shoulder_yaw_joint",
+                    "elbow_joint",
+                    "wrist_roll_joint",
+                    "wrist_pitch_joint",
+                    "wrist_yaw_joint",
+                )
             ],
-            stiffness=40.0,
-            damping=10.0,
+            stiffness=self.arm_actuator_stiffness,
+            damping=self.arm_actuator_damping,
         )
-        # Legs/waist/feet stay at UNITREE_G1_29DOF_CFG's own stock gains (see
-        # g1_locomotion.assets.robots.unitree) — already reasonably strong for a
-        # "stay put" role, not overridden here.
+        # Legs/waist/feet (and the uncontrolled arm, if any) stay at
+        # UNITREE_G1_29DOF_CFG's own stock gains (see g1_locomotion.assets.robots.unitree)
+        # — already reasonably strong for a "stay put" role, not overridden here.
 
         # Contact sensors not needed for this task.
         self.robot.spawn.activate_contact_sensors = False
@@ -325,8 +401,86 @@ class G1ArmEnvCfg(DirectRLEnvCfg):
 @configclass
 class G1ArmLeftEnvCfg(G1ArmEnvCfg):
     arm: str = "left"
-    observation_space: int = 32
+    observation_space: int = 39
     action_space: int = 7
+
+
+@configclass
+class G1ArmLeftEnvCfg_Gain60Kd1p5(G1ArmLeftEnvCfg):
+    """2026-07-26: tests kp=60, kd=1.5 — the gain Unitree's own dedicated arm-control
+    SDK examples actually use (g1_arm7_sdk_dds_example.py, g1_arm5_sdk_dds_example.py),
+    as opposed to the 40/10 this task inherited from a locomotion-context historical
+    commit in unitree_rl_lab. Motivated by: (1) direct SDK evidence this is the real
+    value for arm-control specifically, not just a doubt, and (2) real-world
+    observation that the physical robot holds arm gestures/positions reliably, which
+    is hard to reconcile with 40/10 if that's genuinely what governs arm-holding on
+    hardware. Includes the settle-reward fix automatically (baked into the shared base
+    reward code, not gated behind a flag) — this is not a gain-only isolated test."""
+
+    arm_actuator_stiffness: float = 60.0
+    arm_actuator_damping: float = 1.5
+
+
+@configclass
+class G1ArmLeftEnvCfg_Gain15Kd1(G1ArmLeftEnvCfg):
+    """2026-07-26: tests kp=15, kd=1 — matches unitreerobotics/unitree_rl_mjlab's actual
+    RL-policy deploy config (deploy/robots/g1/config/policy/velocity/v0/params/deploy.yaml),
+    where arm joints run at kp=14.3-16.8, kd=0.9-1.1. This supersedes Gain60Kd1p5 as the
+    better real-hardware candidate: 60/1.5 was the *scripted-motion* SDK example's gain
+    (g1_arm7/g1_arm5_sdk_dds_example.py), which caused ~86-90% mean_joints_at_limit in eval
+    (underdamped oscillation, high kp with low kd). A deployed RL policy is expected to
+    supply its own corrective effort each step rather than lean on a stiff PD controller,
+    so real RL deployments run low kp *and* low kd together, not just low kd. Note the
+    kp/kd ratio here (~15) is close to the working 200/20 reference's ratio (10) — both
+    are much closer to each other than to 40/10's ratio (4), which may be the more
+    relevant similarity. Includes the settle-reward fix automatically (baked into the
+    shared base reward code, not gated behind a flag) — not a gain-only isolated test."""
+
+    arm_actuator_stiffness: float = 15.0
+    arm_actuator_damping: float = 1.0
+
+
+@configclass
+class G1ArmLeftEnvCfg_GoalCurriculum(G1ArmLeftEnvCfg):
+    """2026-07-26: goal-distance curriculum — see goal_curriculum_enabled's own field
+    comment on G1ArmEnvCfg for the full motivation. Includes the settle-reward fix
+    automatically (baked into shared base reward code, not gated behind a flag)."""
+
+    goal_curriculum_enabled: bool = True
+
+
+@configclass
+class G1ArmLeftEnvCfg_Legacy32(G1ArmLeftEnvCfg):
+    """For evaluating checkpoints trained before 2026-07-26's action_fb observation
+    addition (32-D obs) — e.g. the 200/20-gain reference and the 4-way ablation sweep's
+    baseline/privileged_critic/log_std runs, all of which predate it. Not for new
+    training — include_action_feedback should stay True there so future checkpoints get
+    the (likely helpful) action feedback by default. episode_length_s=20.0 matches
+    G1ArmLeftEnvCfg_PLAY (used for every other eval path) for a fair comparison."""
+
+    include_action_feedback: bool = False
+    observation_space: int = 32
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.episode_length_s = 20.0
+
+
+@configclass
+class G1ArmLeftEnvCfg_LongHold200(G1ArmLeftEnvCfg_Legacy32):
+    """2026-07-26: long-hold verification for the 200/20-gain reference checkpoint.
+    goal_hold_steps=15 (0.5s at 30Hz) only proves the arm can touch-and-briefly-hold a
+    target long enough to trigger early termination; it says nothing about whether
+    that hold is *sustained*. Disables early termination on success and extends
+    episode_length_s to 45s so a fixed goal can be observed for much longer than the
+    minimum hold window. Eval-only — not for training (see validation/
+    eval_arm_long_hold.py)."""
+
+    terminate_on_success: bool = False
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.episode_length_s = 45.0
 
 
 @configclass
@@ -334,11 +488,11 @@ class G1ArmLeftLockedWristEnvCfg(G1ArmLeftEnvCfg):
     """2026-07-24: wrist_pitch/wrist_yaw excluded from RL control, held rigidly at
     default instead — see G1ArmEnvCfg.lock_wrist_pitch_yaw's own docstring. 5
     controlled joints (shoulder x3, elbow, wrist_roll), not 7 — observation/action
-    dims shrink accordingly: 32 -> 28 (joint_pos/joint_vel each drop from 7 to 5
-    elements), 7 -> 5."""
+    dims shrink accordingly: 39 -> 33 (joint_pos/joint_vel/action_fb each drop from 7
+    to 5 elements), 7 -> 5."""
 
     lock_wrist_pitch_yaw: bool = True
-    observation_space: int = 28
+    observation_space: int = 33
     action_space: int = 5
 
 
@@ -352,17 +506,75 @@ class G1ArmLeftAblationExpScaleEnvCfg(G1ArmLeftEnvCfg):
 
 
 @configclass
+class G1ArmLeftAblationRateLimitEnvCfg(G1ArmLeftEnvCfg):
+    """2026-07-25 ablation: relax the action-filtering/rate-limiting that gates how fast
+    the commanded joint target can move, in isolation from anything RL-hyperparameter-
+    related (entropy_coef, exp_scale — both already ruled out, see this task's own
+    conversation history / policy_status.md).
+
+    Motivation: at the real hardware gain (40/10, no gravity feedforward — confirmed via
+    unitree_rl_lab/deploy/include/FSM/State_RLBase.h, tau()=0 on real hardware too),
+    Train/mean_episode_length sits at ~285-297 (out of a 300-step max) across EVERY 40/10
+    variant tried so far (baseline, exp_scale=3.0, entropy_coef=0.003/0.01) — meaning
+    episodes almost never trigger the early-success termination (hold goal 15 consecutive
+    steps), regardless of any RL-side tuning. The working 200/20-gain checkpoint converges
+    to ~60 steps. Three different RL-hyperparameter interventions, zero effect on this
+    number — strong evidence the bottleneck isn't exploration or reward shape.
+
+    action_filter_alpha (0.25, heavy EMA smoothing of each new action against the
+    previous one) and max_action_delta_per_step (0.06 rad, hard per-control-step cap) are
+    both unchanged since the very first commit (confirmed via git log) — not a confound
+    with the 200/20-vs-40/10 comparison. Both gate the SAME mechanism (how fast the
+    effective commanded target can move) — testing them together is one coherent
+    hypothesis ("rate-limiting prevents settling"), not an uncontrolled multi-variable
+    bundle like the earlier entropy_coef+exp_scale mistake. At the softer 40/10 gain the
+    joint's own physical response is already slower than at 200/20; layering heavy
+    smoothing and a tight delta cap on top may mean the effective target never actually
+    catches up and holds still long enough to satisfy goal_hold_steps, independent of
+    what the policy has learned. Relaxed here (not removed — still bounded/safe):
+    action_filter_alpha 0.25 -> 0.6 (much less lag), max_action_delta_per_step 0.06 -> 0.15
+    rad (2.5x higher cap). If Train/mean_episode_length starts dropping meaningfully below
+    ~290 within a short run, this is the mechanism; if it doesn't, this is ruled out too."""
+
+    action_filter_alpha: float = 0.6
+    max_action_delta_per_step: float = 0.15
+
+
+@configclass
+class G1ArmLeftAblationLowVelNoiseEnvCfg(G1ArmLeftEnvCfg):
+    """2026-07-25 ablation: joint_vel_noise reduced from 1.5 rad/s to 0.1 rad/s, in
+    isolation (no other change — same gain, same reward, symmetry intact).
+
+    1.5 rad/s was never derived for this task — it's borrowed wholesale from
+    G1FlatEnvCfg-family/Unitree's own 29dof LOCOMOTION recipe (see the field's own
+    comment), where leg joints swing at several rad/s during a stride, so that much
+    noise is proportionally reasonable there. Arm-reaching's useful velocity signal
+    during fine settling (the exact regime goal_hold_steps=15 needs to succeed in) is on
+    the order of 0.05-0.3 rad/s — a factor of 5-30x smaller than the noise band itself,
+    meaning the policy may not be able to reliably perceive "am I still moving, should I
+    decelerate" through that much noise. 0.1 rad/s is a first, defensible estimate (still
+    real, nonzero sensor noise, just no longer larger than the signal it's supposed to
+    accompany) — not derived from an actual encoder spec, revisit if this direction pans
+    out. This has never been touched; every previous arm experiment used 1.5 rad/s
+    unchanged, including the 200/20-gain reference that got 99.98% (so this alone isn't
+    sufficient to explain that gap — but it may be a real, compounding contributor at the
+    much-more-precision-sensitive 40/10 gain)."""
+
+    joint_vel_noise: float = 0.1
+
+
+@configclass
 class G1ArmRightEnvCfg(G1ArmEnvCfg):
     arm: str = "right"
-    observation_space: int = 32
+    observation_space: int = 39
     action_space: int = 7
 
 
 @configclass
 class G1ArmBothEnvCfg(G1ArmEnvCfg):
-    """Both arms trained simultaneously (64-D obs, 14-D actions)."""
+    """Both arms trained simultaneously (78-D obs, 14-D actions)."""
     arm: str = "both"
-    observation_space: int = 64
+    observation_space: int = 78
     action_space: int = 14
 
 
@@ -523,6 +735,15 @@ class G1ArmEnv(DirectRLEnv):
             [g["joint_tensor"] for g in self._arm_groups]
         )
         self.arm_joint_indices = self.arm_joint_indices_tensor.tolist()
+
+        # Per-arm slice into the flat action/filtered_actions vector (which is ordered
+        # the same way arm_joint_indices_tensor is — concatenated in _arm_groups order)
+        # — used by _get_observations to feed each arm's own action-feedback slice.
+        _offset = 0
+        for arm in self._arm_groups:
+            n = len(arm["joint_tensor"])
+            arm["action_slice"] = slice(_offset, _offset + n)
+            _offset += n
 
         # Uniform per-joint null-space weight — see cfg.null_space_penalty_scale's
         # docstring for why this is uniform (not per-joint-weighted like the 23dof-era
@@ -695,22 +916,54 @@ class G1ArmEnv(DirectRLEnv):
             UniformNoiseCfg(n_min=-self.cfg.projected_gravity_noise, n_max=self.cfg.projected_gravity_noise),
         )
 
+        # ADDED 2026-07-25: clean (noise-free) counterparts for a privileged/asymmetric
+        # critic — see G1ArmLeftAblationPrivilegedCriticPPORunnerCfg's own docstring.
+        # Always computed (cheap) but only USED when a runner cfg's obs_groups actually
+        # points "critic" at this "critic" key instead of the default "policy" key — the
+        # default behavior (obs_groups critic -> ["policy"]) is completely unaffected by
+        # this addition.
+        clean_base_lin_vel = self._synthetic_lin_vel
+        clean_base_ang_vel = self._synthetic_ang_vel
+        clean_projected_gravity = self._synthetic_projected_gravity
+
         parts = []
+        critic_parts = []
         for i, arm in enumerate(self._arm_groups):
             jt = arm["joint_tensor"]
+            joint_pos_raw = self.robot.data.joint_pos[:, jt]
+            joint_vel_raw = self.robot.data.joint_vel[:, jt]
             joint_pos = uniform_noise(
-                self.robot.data.joint_pos[:, jt],
+                joint_pos_raw,
                 UniformNoiseCfg(n_min=-self.cfg.joint_pos_noise, n_max=self.cfg.joint_pos_noise),
             )  # (N, 7)
             joint_vel = uniform_noise(
-                self.robot.data.joint_vel[:, jt],
+                joint_vel_raw,
                 UniformNoiseCfg(n_min=-self.cfg.joint_vel_noise, n_max=self.cfg.joint_vel_noise),
             )  # (N, 7)
             ee_pos = self.robot.data.body_pos_w[:, arm["ee_idx"], :]  # (N, 3)
             goal = self.goal_positions[:, i, :]                        # (N, 3)
             error = goal - ee_pos                                       # (N, 3)
+            # ADDED 2026-07-26: the policy previously had NO way to observe its own
+            # action-filter's internal state (self.filtered_actions — an EMA of past
+            # actions, action_filter_alpha=0.25, i.e. ~75% memory of history each step).
+            # _apply_action's actual commanded delta depends on this hidden state, not
+            # just the current raw action, but a memoryless feedforward policy (no
+            # recurrence) was never given it as an observation — a real POMDP-vs-MDP
+            # gap: the policy couldn't know how heavily a new action would actually be
+            # blended in, making it harder to plan precise, well-calibrated corrections
+            # during exactly the fine-settling phase goal_hold_steps needs. No noise
+            # added — this is the policy's own exact internal state, not a sensor
+            # reading, nothing to simulate imprecision on.
             parts.extend([base_lin_vel, base_ang_vel, projected_gravity, joint_pos, joint_vel, ee_pos, goal, error])
-        return {"policy": torch.cat(parts, dim=-1)}
+            critic_parts.extend([
+                clean_base_lin_vel, clean_base_ang_vel, clean_projected_gravity,
+                joint_pos_raw, joint_vel_raw, ee_pos, goal, error,
+            ])
+            if self.cfg.include_action_feedback:
+                action_fb = self.filtered_actions[:, arm["action_slice"]]  # (N, 7)
+                parts.append(action_fb)
+                critic_parts.append(action_fb)
+        return {"policy": torch.cat(parts, dim=-1), "critic": torch.cat(critic_parts, dim=-1)}
 
     # ------------------------------------------------------------------
     # Rewards
@@ -720,39 +973,98 @@ class G1ArmEnv(DirectRLEnv):
         total = torch.zeros(self.num_envs, device=self.device)
         all_reached = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
 
+        # ADDED 2026-07-26: per-component reward breakdown — this task (DirectRLEnv) had
+        # ZERO per-term visibility before this, unlike the walking task (ManagerBasedRLEnv,
+        # which logs every RewTerm to tensorboard automatically). Every piece of reasoning
+        # this session about whether e.g. joint_limit_penalty or torso_proximity_penalty
+        # might be disproportionately large was pure guesswork — there was no data to
+        # check it against. Logged via self.extras["log"] (the key rsl_rl's own
+        # OnPolicyRunner reads — see on_policy_runner.py's rollout loop), same
+        # "Episode_Reward/<name>" naming convention the walking task's RewardManager
+        # already uses, so tensorboard shows both tasks' reward breakdowns consistently.
+        position_dist_term = torch.zeros(self.num_envs, device=self.device)
+        position_exp_term = torch.zeros(self.num_envs, device=self.device)
+        goal_bonus_term = torch.zeros(self.num_envs, device=self.device)
+        torso_proximity_term = torch.zeros(self.num_envs, device=self.device)
+        null_space_term = torch.zeros(self.num_envs, device=self.device)
+        settle_term = torch.zeros(self.num_envs, device=self.device)
+        mean_dist_to_goal = torch.zeros(self.num_envs, device=self.device)
+
         torso_pos = self.robot.data.body_pos_w[:, self._torso_body_idx, :]  # (N, 3)
         margin = self.cfg.torso_proximity_margin_m
 
         for i, arm in enumerate(self._arm_groups):
             ee_pos = self.robot.data.body_pos_w[:, arm["ee_idx"], :]  # (N, 3)
             dist = torch.norm(self.goal_positions[:, i, :] - ee_pos, dim=-1)
-            total += -dist * self.cfg.position_reward_scale
-            total += torch.exp(-dist / self.cfg.position_reward_exp_sigma) * self.cfg.position_reward_exp_scale
+            mean_dist_to_goal += dist
+            position_dist_term += -dist * self.cfg.position_reward_scale
+            position_exp_term += torch.exp(-dist / self.cfg.position_reward_exp_sigma) * self.cfg.position_reward_exp_scale
             reached = dist < self.cfg.goal_threshold
-            total += reached.float() * self.cfg.goal_reached_bonus
+            goal_bonus_term += reached.float() * self.cfg.goal_reached_bonus
             all_reached &= reached
 
             torso_dist = torch.norm(ee_pos - torso_pos, dim=-1)
-            total += -torch.clamp(margin - torso_dist, min=0.0) * self.cfg.torso_proximity_penalty_scale
+            torso_proximity_term += -torch.clamp(margin - torso_dist, min=0.0) * self.cfg.torso_proximity_penalty_scale
 
             jt = arm["joint_tensor"]
             ref_pose = self.robot.data.default_joint_pos[:, jt]
             pose_deviation = torch.norm(
                 (self.robot.data.joint_pos[:, jt] - ref_pose) * arm["null_space_weight"], dim=-1
             )
-            total += -pose_deviation * self.cfg.null_space_penalty_scale
+            null_space_term += -pose_deviation * self.cfg.null_space_penalty_scale
 
-        total += -torch.norm(self.previous_actions, dim=-1) * self.cfg.action_smoothness_scale
+            # ADDED 2026-07-26: settle/braking penalty. Real data (comparative
+            # Episode_Reward breakdown across the 200/20-gain reference and every
+            # 40/10-gain variant tried) confirmed this isn't a reaching problem — every
+            # 40/10 variant touches goal_threshold at least as often per step as the
+            # 99.98%-success reference, some MORE often, yet succeeds (15 CONSECUTIVE
+            # steps held) an order of magnitude less. It reaches the zone fine and
+            # can't stabilize there. Nothing in the reward before this rewarded actually
+            # slowing down near the goal — position_dist/position_exp_bonus reward being
+            # close, not being STILL while close. Penalize joint velocity, but ONLY once
+            # within settle_proximity_m of the goal (a looser radius than goal_threshold
+            # itself, so it can brake INTO the success zone rather than only once
+            # already inside it) — gated, not applied everywhere, so it can't discourage
+            # the initial approach motion.
+            joint_vel_norm = torch.norm(self.robot.data.joint_vel[:, jt], dim=-1)
+            within_settle_zone = (dist < self.cfg.settle_proximity_m).float()
+            settle_term += -joint_vel_norm * within_settle_zone * self.cfg.settle_velocity_penalty_scale
+
+        mean_dist_to_goal /= self.n_arms
+
+        action_smoothness_term = -torch.norm(self.previous_actions, dim=-1) * self.cfg.action_smoothness_scale
 
         joint_pos = self.robot.data.joint_pos[:, self.arm_joint_indices_tensor]
         limits = self._arm_hw_limits
         span = limits[:, 1] - limits[:, 0]
         margin_lo = self._joint_limit_margin_fraction[:, 0] * span
         margin_hi = self._joint_limit_margin_fraction[:, 1] * span
-        at_limit = (
-            (joint_pos < limits[:, 0] + margin_lo) | (joint_pos > limits[:, 1] - margin_hi)
-        ).float().sum(-1)
-        total += -at_limit * self.cfg.joint_limit_penalty_scale
+        at_limit_mask = (joint_pos < limits[:, 0] + margin_lo) | (joint_pos > limits[:, 1] - margin_hi)
+        at_limit = at_limit_mask.float().sum(-1)
+        joint_limit_term = -at_limit * self.cfg.joint_limit_penalty_scale
+
+        total = (
+            position_dist_term + position_exp_term + goal_bonus_term + torso_proximity_term
+            + null_space_term + action_smoothness_term + joint_limit_term + settle_term
+        )
+
+        self.extras["log"] = {
+            "Episode_Reward/position_dist": position_dist_term.mean(),
+            "Episode_Reward/position_exp_bonus": position_exp_term.mean(),
+            "Episode_Reward/goal_reached_bonus": goal_bonus_term.mean(),
+            "Episode_Reward/torso_proximity": torso_proximity_term.mean(),
+            "Episode_Reward/null_space": null_space_term.mean(),
+            "Episode_Reward/action_smoothness": action_smoothness_term.mean(),
+            "Episode_Reward/joint_limit": joint_limit_term.mean(),
+            "Episode_Reward/settle": settle_term.mean(),
+            # Raw (non-reward-scaled) diagnostics — interpretable units, not just reward contribution.
+            "Metrics/mean_dist_to_goal_cm": mean_dist_to_goal.mean() * 100.0,
+            "Metrics/mean_joints_at_limit": at_limit.mean(),
+            "Metrics/frac_envs_reached": all_reached.float().mean(),
+            "Curriculum/goal_bounds_frac": torch.tensor(
+                getattr(self, "_last_goal_curriculum_frac", 1.0), device=self.device
+            ),
+        }
 
         # Success requires holding all_reached for goal_hold_steps CONSECUTIVE steps, not
         # just touching it once — see goal_hold_steps' own comment for the full rationale.
@@ -767,7 +1079,10 @@ class G1ArmEnv(DirectRLEnv):
     # ------------------------------------------------------------------
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
-        terminated = self.successes.clone()
+        if self.cfg.terminate_on_success:
+            terminated = self.successes.clone()
+        else:
+            terminated = torch.zeros_like(self.successes)
         truncated = self.episode_length_buf >= self.max_episode_length - 1
         return terminated, truncated
 
@@ -842,11 +1157,19 @@ class G1ArmEnv(DirectRLEnv):
 
     def _sample_goal_positions(self, num_goals: int, bounds: dict) -> torch.Tensor:
         """Sample goals in the robot's local frame for one arm."""
+        if self.cfg.goal_curriculum_enabled:
+            end_step = max(1, self.cfg.goal_curriculum_end_step)
+            progress = min(1.0, max(0.0, self.common_step_counter / end_step))
+            frac = self.cfg.goal_curriculum_start_frac + (1.0 - self.cfg.goal_curriculum_start_frac) * progress
+        else:
+            frac = 1.0
+        self._last_goal_curriculum_frac = frac
+
         goals = torch.zeros((num_goals, 3), device=self.device)
         for i, key in enumerate(("x", "y", "z")):
             lo, hi = bounds[key]
             centre = (lo + hi) * 0.5
-            half_span = (hi - lo) * 0.5
+            half_span = (hi - lo) * 0.5 * frac
             goals[:, i] = centre + (torch.rand(num_goals, device=self.device) * 2 - 1) * half_span
         return goals
 

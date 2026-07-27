@@ -33,7 +33,7 @@ if TYPE_CHECKING:
 
 __all__ = ["compute_symmetric_arm_states", "mirror_arm_obs", "mirror_arm_actions"]
 
-# Per-arm observation block (32-D, see g1_arm_env.py's module docstring):
+# Per-arm observation block (39-D, see g1_arm_env.py's module docstring):
 #   [0:3]   base_lin_vel        — lateral (y) component flips
 #   [3:6]   base_ang_vel        — roll-rate (x) and yaw-rate (z) flip, pitch-rate (y) doesn't
 #   [6:9]   projected_gravity   — lateral (y) component flips
@@ -43,9 +43,12 @@ __all__ = ["compute_symmetric_arm_states", "mirror_arm_obs", "mirror_arm_actions
 #   [23:26] ee_pos              — y flips
 #   [26:29] goal                — y flips
 #   [29:32] error               — y flips (= goal - ee_pos, consistent with both flipping)
+#   [32:39] action_fb  (7): ADDED 2026-07-26 — same order/sign convention as joint_pos/
+#                            joint_vel (it's a joint-position-target delta, same per-joint
+#                            semantic), see g1_arm_env.py's _get_observations comment.
 # Roll/yaw joints flip sign under a left-right mirror, pitch joints (and the single-hinge
 # elbow) don't — same convention as g1_locomotion/mdp/symmetry.py.
-_PER_ARM_OBS_DIM = 32
+_PER_ARM_OBS_DIM = 39
 _PER_ARM_ACTION_DIM = 7
 
 _OBS_SIGN = torch.tensor(
@@ -61,6 +64,8 @@ _OBS_SIGN = torch.tensor(
         1.0, -1.0, 1.0,        # ee_pos
         1.0, -1.0, 1.0,        # goal
         1.0, -1.0, 1.0,        # error
+        # action_fb: same order/signs as joint_pos/joint_vel
+        1.0, -1.0, -1.0, 1.0, -1.0, 1.0, -1.0,
     ],
     dtype=torch.float32,
 )

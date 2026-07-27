@@ -76,11 +76,27 @@ parser.add_argument(
     ),
 )
 parser.add_argument(
+    "--legacy32", action="store_true",
+    help="Evaluate a checkpoint trained before 2026-07-26's action_fb observation "
+    "addition (32-D obs) — e.g. the 200/20-gain reference or the 4-way ablation "
+    "sweep's baseline/privileged_critic/log_std runs. Required or runner.load() fails "
+    "with a strict shape-mismatch error (safe failure, not silent corruption). Not "
+    "compatible with --locked_wrist (locked-wrist's own legacy dim isn't wired up).",
+)
+parser.add_argument(
     "--locked_wrist", action="store_true",
     help="Evaluate a G1-Arm-Left-LockedWrist-v0 checkpoint (5 controlled joints, "
     "28-D obs) instead of the standard 7-DOF/32-D one. Required or runner.load() "
     "fails with a strict shape-mismatch error (safe failure, not silent corruption — "
     "confirmed 2026-07-24 trying to load a locked-wrist checkpoint without this flag).",
+)
+parser.add_argument(
+    "--log_std", action="store_true",
+    help="Evaluate a checkpoint trained with noise_std_type='log' (e.g. the "
+    "ablation_log_std run) instead of the default 'scalar' parameterization. "
+    "Required or runner.load() fails with a strict key-mismatch error (missing "
+    "'std', unexpected 'log_std' — safe failure, not silent corruption; confirmed "
+    "2026-07-26 trying to load a log_std checkpoint without this flag).",
 )
 parser.add_argument(
     "--hidden_dims", type=int, nargs="+", default=None,
@@ -109,17 +125,30 @@ import os
 import g1_locomotion.tasks  # noqa: F401 — registers gym envs
 import torch
 from g1_locomotion.tasks.manager_based.g1_arm.agents.rsl_rl_ppo_cfg import (
+    G1ArmLeftAblationLogStdPPORunnerCfg,
     G1ArmLeftLockedWristPPORunnerCfg,
     G1ArmLeftPPORunnerCfg,
 )
 from g1_locomotion.tasks.manager_based.g1_arm.g1_arm_env import (
     G1ArmEnv,
+    G1ArmLeftEnvCfg_Legacy32,
     G1ArmLeftEnvCfg_PLAY,
     G1ArmLeftLockedWristEnvCfg,
 )
 
-_EnvCfgCls = G1ArmLeftLockedWristEnvCfg if args_cli.locked_wrist else G1ArmLeftEnvCfg_PLAY
-_PPORunnerCfgCls = G1ArmLeftLockedWristPPORunnerCfg if args_cli.locked_wrist else G1ArmLeftPPORunnerCfg
+if args_cli.locked_wrist:
+    _EnvCfgCls = G1ArmLeftLockedWristEnvCfg
+elif args_cli.legacy32:
+    _EnvCfgCls = G1ArmLeftEnvCfg_Legacy32
+else:
+    _EnvCfgCls = G1ArmLeftEnvCfg_PLAY
+
+if args_cli.locked_wrist:
+    _PPORunnerCfgCls = G1ArmLeftLockedWristPPORunnerCfg
+elif args_cli.log_std:
+    _PPORunnerCfgCls = G1ArmLeftAblationLogStdPPORunnerCfg
+else:
+    _PPORunnerCfgCls = G1ArmLeftPPORunnerCfg
 
 # Reuse the exact same per-episode metrics wrapper training runs use — keeps the eval's
 # numbers directly comparable to what you'd see in a run's arm_detailed.csv.
@@ -218,6 +247,13 @@ def _run_bucket(base_env: G1ArmEnv, name: str, eval_root: str) -> tuple[dict, li
         min_pos = torch.full((n_joints,), float("inf"), device=device)
         max_pos = torch.full((n_joints,), float("-inf"), device=device)
 
+        # ADDED 2026-07-26: retroactive reward-component breakdown for ANY checkpoint —
+        # base_env.extras["log"] (see g1_arm_env.py's _get_rewards) is populated every
+        # step regardless of train/eval mode, so this works on old checkpoints too, not
+        # just new training runs — averaged here the same way rsl_rl's own runner would.
+        reward_breakdown_sums: dict[str, float] = {}
+        reward_breakdown_count = 0
+
         obs, _ = wrapped_env.reset()
         for _ in range(args_cli.steps_per_bucket):
             action = policy(obs)
@@ -225,13 +261,19 @@ def _run_bucket(base_env: G1ArmEnv, name: str, eval_root: str) -> tuple[dict, li
             joint_pos = base_env.robot.data.joint_pos[:, base_env.arm_joint_indices_tensor]
             min_pos = torch.minimum(min_pos, joint_pos.amin(dim=0))
             max_pos = torch.maximum(max_pos, joint_pos.amax(dim=0))
+            for key, value in base_env.extras.get("log", {}).items():
+                reward_breakdown_sums[key] = reward_breakdown_sums.get(key, 0.0) + float(value)
+            reward_breakdown_count += 1
 
     joint_ranges = _joint_range_utilization(base_env, min_pos.cpu(), max_pos.cpu())
+    reward_breakdown = {
+        k: v / reward_breakdown_count for k, v in reward_breakdown_sums.items()
+    } if reward_breakdown_count > 0 else {}
 
     # Close only this bucket's CSV file handles — not wrapped_env.close(), which would
     # cascade down and tear down base_env, breaking the next bucket.
     env._csv.close()
-    return _summarize(env.csv_path), joint_ranges
+    return _summarize(env.csv_path), joint_ranges, reward_breakdown
 
 
 def main():
@@ -272,8 +314,23 @@ def main():
         "|---|---|---|---|---|",
     ]
 
+    reward_breakdown_lines = [
+        "",
+        "## Reward component breakdown",
+        "",
+        "Per-step mean of each reward term (not per-episode sum) — added 2026-07-26 "
+        "since this task previously had zero per-term visibility (unlike the walking "
+        "task's automatic RewardManager logging), making it impossible to check e.g. "
+        "whether joint_limit or torso_proximity penalties were disproportionately "
+        "large without guessing. Works retroactively on any checkpoint, not just new "
+        "training runs.",
+        "",
+        "| Bucket | Component | Mean value |",
+        "|---|---|---|",
+    ]
+
     for name in args_cli.buckets:
-        stats, joint_ranges = _run_bucket(base_env, name, eval_root)
+        stats, joint_ranges, reward_breakdown = _run_bucket(base_env, name, eval_root)
         if stats["episodes"] == 0:
             print(f"[Eval] Bucket '{name}': no completed episodes — increase --steps_per_bucket.")
             summary_lines.append(f"| {name} | 0 | — | — | — | — | — |")
@@ -302,11 +359,17 @@ def main():
                 f"| {jr['pct_of_hw_range_used']:.1f}% |"
             )
 
+        if reward_breakdown:
+            print(f"[Eval]   --- reward breakdown ({name}) ---")
+            for key, value in sorted(reward_breakdown.items()):
+                print(f"[Eval]   {key:35s} {value:+.4f}")
+                reward_breakdown_lines.append(f"| {name} | {key} | {value:+.4f} |")
+
     base_env.close()
 
     summary_path = os.path.join(eval_root, "summary.md")
     with open(summary_path, "w") as f:
-        f.write("\n".join(summary_lines + joint_range_lines) + "\n")
+        f.write("\n".join(summary_lines + joint_range_lines + reward_breakdown_lines) + "\n")
     print(f"\n[Eval] Summary written to: {summary_path}")
 
 

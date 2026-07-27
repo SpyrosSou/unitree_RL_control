@@ -81,6 +81,17 @@ _build
 !chosen_checkpoints/exported/
 !chosen_checkpoints/exported/*
 
+# Index of what's in logs/rsl_rl/ and why — everything else under logs/ stays ignored.
+# Checkpoints (**/*.pt) were already blocked above, but the !logs/rsl_rl/ negation below
+# also unignores non-.pt files directly inside run directories (tfevents, eval CSVs,
+# params/*.yaml, git diffs) since nothing else matched them — found 2026-07-27 while
+# about to stage several MB of local-only eval output by accident. The explicit
+# re-ignore below restores the comment's original intent: only this README is tracked.
+!logs/
+!logs/rsl_rl/
+!logs/rsl_rl/README.md
+logs/rsl_rl/*/
+
 # Pre-Trained Checkpoints
 /.pretrained_checkpoints/
 

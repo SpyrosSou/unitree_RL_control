@@ -15,8 +15,9 @@ try:
 except ImportError:
     from isaaclab.utils.math import quat_rotate_inverse as quat_apply_inverse
 from isaaclab.assets import Articulation, RigidObject
-from isaaclab.managers import SceneEntityCfg
+from isaaclab.managers import ManagerTermBase, RewardTermCfg, SceneEntityCfg
 from isaaclab.sensors import ContactSensor
+from isaaclab.utils.math import euler_xyz_from_quat
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -230,3 +231,81 @@ def joint_mirror(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, mirror_joint
         )
     reward *= 1 / len(mirror_joints) if len(mirror_joints) > 0 else 0
     return reward
+
+
+"""
+Drift penalty — round 2 (2026-07-26).
+"""
+
+# ROUND 1 (2026-07-25, ABANDONED, see git history): tried replacing
+# track_lin_vel_xy_yaw_frame_exp with a version rotating into the EXPECTED yaw frame
+# instead of the robot's current one. This made heading drift WORSE than ever (24-27 deg
+# baseline -> 63.6/136.4 deg), while lateral drift and track error stayed roughly normal.
+# Root cause understood: track_lin_vel_xy_yaw_frame_exp rotates world-frame velocity into
+# the robot's CURRENT frame before comparing to command — this is blind to absolute
+# drift, but it has an ACCIDENTAL side effect that matters: it implicitly requires the
+# body's forward axis to align with its actual direction of travel (you can't get a good
+# reward translating one way while facing another). The expected-yaw-frame replacement
+# only constrains the DIRECTION OF WORLD-FRAME VELOCITY, never the robot's actual BODY
+# ORIENTATION — so it satisfied the reward via correct translation while heading drifted
+# freely, having removed the one thing that was accidentally keeping it in check.
+#
+# ROUND 1's EARLIER attempt (HeadingDriftPenalty/LateralDriftPenalty, two new additive
+# terms) also made drift worse, plus caused broad regression across unrelated reward
+# terms (action_rate, base_angular_velocity, flat_orientation_l2, joint_deviation_legs,
+# and the raw Metrics/base_velocity/error_vel_yaw tracking-error metric). Two
+# non-exclusive causes suspected: two new competing terms disturbing an already-converged
+# ~20-term balance, and/or warm-starting into a changed reward composition with a critic
+# that had never seen the new terms (its value estimates are wrong from step one,
+# plausibly compounding with the adaptive-KL learning-rate schedule — same mechanism
+# investigated for entropy_coef's instability on the arm side).
+#
+# ROUND 2 (this one): track_lin_vel_xy_yaw_frame_exp is REVERTED back to stock in
+# RewardsCfg (restores the accidental body-orientation coupling round 1 removed).
+# HeadingDriftPenalty (heading only — lateral was never actually the problem, see the
+# eval numbers above; keeping this to one new term, not two) is reintroduced as an
+# ADDITIVE term again, but with two changes addressing round 1's actual failure modes:
+# weight is -0.1, not -1.0 (a nudge, not something that can dominate/destabilize an
+# already-balanced 20-term sum), and it is meant to be trained from FRESH weights, not
+# warm-started (sidesteps the critic-mismatch risk entirely rather than hoping the
+# reward composition changed little enough for a stale critic to still be valid).
+
+
+class HeadingDriftPenalty(ManagerTermBase):
+    """Penalizes accumulated heading drift beyond what the ang_vel_z command implied.
+
+    expected_yaw = yaw at episode start + integral of commanded ang_vel_z since then.
+    Penalizes |actual_yaw - expected_yaw|, wrapped to [-pi, pi] — zero for a policy that
+    only rotates when and how much the command asks for, growing under a "go straight"
+    (wz=0) command the robot silently fails to hold. Directly checks BODY ORIENTATION
+    (unlike round 1's frame-correction attempt, which only checked velocity direction —
+    see module comment above)."""
+
+    def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+        asset_cfg: SceneEntityCfg = cfg.params.get("asset_cfg", SceneEntityCfg("robot"))
+        self._robot: Articulation = env.scene[asset_cfg.name]
+        self._start_yaw = torch.zeros(env.num_envs, device=self.device)
+        self._cmd_yaw_integral = torch.zeros(env.num_envs, device=self.device)
+
+    def reset(self, env_ids: torch.Tensor | None = None) -> None:
+        if env_ids is None:
+            env_ids = slice(None)
+        _, _, yaw = euler_xyz_from_quat(self._robot.data.root_quat_w[env_ids])
+        self._start_yaw[env_ids] = yaw
+        self._cmd_yaw_integral[env_ids] = 0.0
+
+    def __call__(
+        self,
+        env: ManagerBasedRLEnv,
+        command_name: str = "base_velocity",
+        asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    ) -> torch.Tensor:
+        _, _, yaw = euler_xyz_from_quat(self._robot.data.root_quat_w)
+        expected_yaw = self._start_yaw + self._cmd_yaw_integral
+        heading_drift = torch.atan2(torch.sin(yaw - expected_yaw), torch.cos(yaw - expected_yaw))
+
+        command = env.command_manager.get_command(command_name)
+        self._cmd_yaw_integral += command[:, 2] * env.step_dt
+
+        return heading_drift.abs()
