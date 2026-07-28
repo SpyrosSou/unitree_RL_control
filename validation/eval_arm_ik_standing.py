@@ -401,9 +401,26 @@ def main():
 
     print(f"[EvalArmIK] Settling ({args_cli.settle_steps} steps, no arm target)...")
     any_fall = False
+    # Diagnostic (2026-07-28): does the loco policy's OWN standing behavior -- zero
+    # arm interaction at all -- already show large pelvis motion under this harness's
+    # command regime (zero velocity, is_standing_env=False), or does sway only appear
+    # once IK-driven arm reaching starts? Settles the question of whether a checkpoint
+    # swap's worse eval numbers reflect the checkpoint's real standing behavior here,
+    # or an arm-disturbance interaction specific to this eval's IK-driven reaching.
+    settle_root_x, settle_root_y, settle_tilt = [], [], []
     for _ in range(args_cli.settle_steps):
         _, _, done, _, _ = step_sim(None)
         any_fall |= done
+        rp = robot.data.root_pos_w[0]
+        settle_root_x.append(rp[0].item())
+        settle_root_y.append(rp[1].item())
+        settle_tilt.append(tilt_deg(robot.data.root_quat_w[0]))
+    settle_root_x, settle_root_y, settle_tilt = np.array(settle_root_x), np.array(settle_root_y), np.array(settle_tilt)
+    settle_sway_cm = 100.0 * math.hypot(settle_root_x.max() - settle_root_x.min(),
+                                        settle_root_y.max() - settle_root_y.min())
+    print(f"[EvalArmIK] Pure-standing settle phase (NO arm target, NO arm interaction): "
+          f"xy_sway={settle_sway_cm:.1f}cm  tilt_range={settle_tilt.max() - settle_tilt.min():.1f}deg  "
+          f"fell={any_fall}")
 
     bounds = dict(_GOAL_BOUNDS[side])
     if args_cli.x_max is not None:

@@ -1,0 +1,26 @@
+script: /home/spyros/Elm/Code/g1_locomotion/validation/eval_arm_ik_fixed_base.py
+git_commit: f60f097
+started_at: '2026-07-28T18:50:44'
+args:
+  active_gpu: 0
+  anim_recording_enabled: false
+  anim_recording_start_time: 0
+  anim_recording_stop_time: 10
+  arm: left
+  cpu: false
+  create_new_stage: false
+  device: cuda:0
+  enable_cameras: false
+  headless: true
+  hide_ui: true
+  hold_steps: 350
+  info: false
+  kit_args: ''
+  num_targets: 15
+  physics_gpu: 0
+  rendering_mode: null
+  seed: 42
+  settle_steps: 20
+  verbose: false
+  x_max: 0.31
+  xr: false

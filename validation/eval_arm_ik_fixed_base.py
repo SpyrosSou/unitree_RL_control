@@ -44,6 +44,12 @@ parser.add_argument("--num_targets", type=int, default=15)
 parser.add_argument("--hold_steps", type=int, default=350)
 parser.add_argument("--settle_steps", type=int, default=20, help="No walking policy to settle -- just a few steps for physics to init.")
 parser.add_argument("--seed", type=int, default=42)
+parser.add_argument(
+    "--x_max", type=float, default=None,
+    help="Override the goal box's x upper bound (default: None = full box, x in "
+    "(0.20, 0.42)) -- matches eval_arm_ik_standing.py's --x_max, for a direct "
+    "apples-to-apples comparison against the walking-integrated trimmed-box runs.",
+)
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 
@@ -196,7 +202,10 @@ def main():
     for _ in range(args_cli.settle_steps):
         step_sim(None)
 
-    bounds = _GOAL_BOUNDS[side]
+    bounds = dict(_GOAL_BOUNDS[side])
+    if args_cli.x_max is not None:
+        bounds["x"] = (bounds["x"][0], args_cli.x_max)
+        print(f"[FixedBase] Trimmed goal box: x in {bounds['x']} (was {_GOAL_BOUNDS[side]['x']})")
     rng = np.random.default_rng(args_cli.seed)
     targets_ground = np.stack([
         rng.uniform(*bounds["x"], args_cli.num_targets),

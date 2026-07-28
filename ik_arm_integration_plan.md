@@ -384,21 +384,208 @@ single frame once a solve has converged) and (2) a PD/gravity tracking ceiling
 independent of walking (candidate fixes: better feedforward modeling, higher gain if
 deployment allows it, or the RL residual as originally planned). Neither is fully solved
 yet; next step is deciding which to tackle first.
-- Build/adapt a `validation/eval_arm_ik.py` mirroring `eval_arm_long_hold.py`'s
-  definition of success (**one fresh attempt, one fixed goal, strict hold**) — that is
-  THE metric this pivot exists to fix. Compare directly against the RL numbers
-  (~30% single-shot for 200/20, ~28-33% aggregate for `best_combined`).
-- **Gate**: single-shot success (2cm, hold) dramatically above the RL baseline —
-  the working target is >90%; if sim-side PD tracking is the limiter, quantify the gap
-  between kinematic solution and achieved pose before tuning anything.
-- Update `policy_status.md` + `chosen_checkpoints/README.md` with the outcome either way.
 
-### Phase 4 — the "residuals" part (later; design before building)
-- Only after Phase 3 passes: RL residual policy on top of IK targets (small bounded
-  corrections) for disturbance robustness / smoother motion / eventually
-  arms-while-walking (deferred item #6). This keeps an RL arm deliverable in the final
-  architecture. Scope deliberately not designed yet — do that as its own planning pass
-  with the user, informed by Phase 2/3 findings.
+**PHASE 2 MARKED COMPLETE (2026-07-28)** — full resolution below, superseding
+everything above this point about "which to tackle first" and the Phase 3 plan that
+followed it. Read this block, not the two "distinct problems" framing above, for the
+current status.
+
+Across the rest of 2026-07-27 night and into 2026-07-28, both remaining problems
+named above were fully resolved, not just further characterized:
+
+1. **The frame-conversion leak (root cause, not a walking-specific issue).** The
+   ground-referenced-target-to-world conversion (`target_world = quat_apply(root_quat,
+   local) + root_pos`, in both `eval_arm_ik_standing.py` and `g1_full_demo.py`'s
+   `_goal_positions_world`) used the robot's *full* orientation, including whatever
+   real roll/pitch tilt it had at that instant, to rotate a target whose z-component is
+   a large *absolute* ground-referenced height (~0.9-1.15m) — not a small pelvis-relative
+   offset. Any nonzero tilt leaked that height into world x/y through the rotation
+   matrix's off-diagonal terms (~`sin(tilt) * height`, e.g. ~14-20cm at a modest 8-10°
+   tilt). The fix (confirmed correct via direct measurement — two targets showing
+   23-30cm kinematic error live solved to 1-2cm with identical coordinates in a clean,
+   static frame): rotate by `yaw_quat(root_quat)` (IsaacLab's own yaw-only extraction
+   utility) instead of the full quaternion — "ground-referenced" is supposed to mean
+   height-from-gravity + xy-from-facing-direction, regardless of how much the robot is
+   leaning at that exact instant. This was a real, previously-undiscovered bug, present
+   since this convention was first written — not something introduced by walking
+   integration, just mostly invisible on a genuinely fixed base (near-zero tilt by
+   construction) and only exposed once real tilt entered the picture.
+2. **Walking-induced solver/tracking instability, isolated definitively.** A second,
+   independently-verified checkpoint swap (2026-07-28, a retrained `walking_latest.pt`
+   with confirmed-reduced standing oscillation) still produced *worse* eval numbers
+   under the walking-integrated harness (mean achieved error 41.67cm vs. 29.92cm) —
+   traced to the training curriculum's disturbance model being random/bounded/
+   mean-reverting (`ArmMotionDisturbance`, blends 10% toward default every update),
+   while this integration's IK-driven reaching is the opposite: a sustained, directed,
+   held deviation from default for a full 7-second hold. Different regimes; a
+   checkpoint tuned for one doesn't automatically transfer to the other. This confirmed
+   walking-integration is a genuinely separate problem from the IK/frame layer, not
+   something the frame fix or further IK tuning was ever going to resolve — **decision:
+   defer walking integration entirely for now** and validate/build the arm+residual
+   system on a genuinely fixed base first (see below), matching how `xr_teleoperate`'s
+   own arm-only usage actually works. Revisit walking integration once both the
+   arm+residual system and the walking policy are independently mature.
+3. **Clean fixed-base result, with the frame fix applied and walking removed from the
+   loop entirely** (`validation/eval_arm_ik_fixed_base.py`, `--x_max 0.31`, 15 targets,
+   2026-07-28): kinematic error mean **0.79cm**, max **2.95cm**, 86.7% within 2cm —
+   matching or beating Phase 1's own static-sweep ceiling (mean 2.89cm). Achieved (real,
+   PD-tracked) error: mean **16.65cm**, range 9.6-21.6cm, correlated with target height
+   (r=0.77) — narrow, systematic, fully explained by a static (RNEA-at-rest) gravity
+   feedforward plus the real hardware's soft 40 N·m/rad gain, not by any remaining bug
+   (target delivery, actuator gains, and torque headroom were all directly verified
+   correct along the way — see `personal_development/residual_rl.md` section 1 for the
+   full chain of ruled-out hypotheses). **This is the actual Phase 2 gate**: the IK
+   solver and frame-conversion layer are confirmed correct; the remaining gap is
+   exactly the real-world/dynamics gap this architecture always planned to hand to an
+   RL residual layer, not evidence of an unsolved bug. Phase 3 (below) is effectively
+   superseded by this result — its stated gate ("single-shot success dramatically
+   above the RL baseline") is a Phase-4-and-beyond question now, not a prerequisite to
+   starting Phase 4.
+
+### Phase 3 — single-shot IK-vs-RL eval (superseded, see the 2026-07-28 status block above)
+- Originally scoped: build `validation/eval_arm_ik.py` mirroring `eval_arm_long_hold.py`'s
+  definition of success (one fresh attempt, one fixed goal, strict hold), compare
+  directly against the RL numbers (~30% single-shot for 200/20, ~28-33% aggregate for
+  `best_combined`).
+- **Not built as its own script** — `eval_arm_ik_fixed_base.py`'s 2026-07-28 run
+  (above) already answers the question this phase existed to ask (does IK clear the RL
+  baseline by a wide margin, kinematically) more thoroughly than the original plan
+  called for, and the decision to defer walking integration makes a direct
+  walking-integrated single-shot comparison premature anyway. Not revisited unless a
+  specific need for this exact eval format comes up later.
+
+### Phase 4 — the "residuals" part — DESIGNED AND IMPLEMENTED (2026-07-28)
+
+Full design writeup: `personal_development/residual_rl.md` (theory + why residual RL,
+concrete implementation walkthrough, comparison table against the pure-RL arm policy).
+
+**What's built**, under
+`source/g1_locomotion/g1_locomotion/tasks/manager_based/g1_arm_residual/`:
+- `g1_arm_residual_env.py` — `G1ArmResidualEnv`, subclassing `g1_arm_env.py`'s
+  `G1ArmEnv`. Per episode, solves the IK baseline once (goal is fixed for the whole
+  episode on a genuinely fixed base, so the correct pelvis-relative target never
+  changes mid-episode — no need to re-solve every control step, which would be
+  impractical for CasADi/IPOPT's single-instance, ~1-2ms-per-call solve at any
+  meaningful `num_envs`) and caches it per-environment. The action is a small, bounded
+  residual (`residual_action_scale`, default 0.15 rad) added to that cached baseline,
+  not an accumulated delta from the current pose — `commanded_target = q_ik +
+  residual`, with the IK's own gravity feedforward (`tau_ik`) applied via
+  `set_joint_effort_target`, same mechanism the tau_ff fix used throughout this
+  session. Observation adds one new 7-D feature (`q_ik - current_joint_pos`) on top of
+  the existing 39-D arm-reaching observation. Reward is **unchanged** from
+  `g1_arm_env.py` — it already rewards real, physically-simulated end-effector
+  position against the goal, exactly the accuracy the residual needs to improve.
+- `agents/rsl_rl_ppo_cfg.py` — same PPO hyperparameters/network size as the base arm
+  task, symmetry augmentation disabled (the existing `mirror_arm_obs` doesn't know
+  about the new observation feature).
+- `__init__.py` — registers `G1-Arm-Residual-Left-v0` / `-Right-v0` (+ `-Play-v0`
+  variants), auto-discovered by the existing `tasks/__init__.py`'s `import_packages`
+  call, no manual registration needed elsewhere.
+- Scoped to a single controlled arm (not "both") and the trimmed goal box (`x` in
+  `0.20-0.31`, matching every eval this session used) — see the module docstring's
+  "scope decisions" section for the reasoning on both.
+
+**Not yet done — needs a live Isaac Sim smoke test (user's turn, per this branch's own
+"never run Isaac Sim yourself" convention)**: the code is written and syntax-verified,
+but has not been run. First thing to check: does `G1-Arm-Residual-Left-v0` even
+construct and step without error (a short, small-`num_envs` training smoke test), since
+the IK-baseline-caching mechanism (looping a CPU/single-instance solver over resetting
+envs) is new code that's never executed inside a real Isaac Sim session yet.
+
+**Gate for this phase**: train `G1-Arm-Residual-Left-v0`, then re-run a held-out sweep
+(mirroring `eval_arm_ik_fixed_base.py`'s format) and check whether achieved error drops
+from the ~16.65cm baseline toward the ~1-3cm kinematic ceiling — confirming the
+residual actually learned to close the gap, not just added noise on top of an
+already-working baseline.
+
+**Training results so far (2026-07-28, first two runs, same log dir
+`logs/rsl_rl/arms/residual_left/2026-07-28_19-38-04`, resumed across both):**
+Decoupling "reached" from "reached AND held" (added to `eval_arm_residual.py` as
+`reach_rate_no_hold`, derived from the already-logged `min_dist_to_goal_cm` column, no
+env/wrapper change needed) revealed reach is essentially solved
+(`reach_rate_no_hold` 99.5%+ by 6000 iterations) while hold (`success_rate`, requires
+`goal_hold_steps` CONSECUTIVE steps under threshold) actually **dropped** with more
+training (21%→13%, 2000→6000 iterations). Root cause confirmed via direct TensorBoard
+inspection across the full run, not inferred: `Episode_Reward/goal_reached_bonus`
+climbed steadily (~22→39) while `Episode_Reward/settle` stayed essentially flat
+(~-0.09) the entire 6000 iterations, and `Train/mean_episode_length` stayed near the
+300-step cap instead of dropping toward early-success termination — `goal_reached_bonus`
+(paid every step reached=True, no stillness/consecutiveness required) was ~400x larger
+in typical per-step contribution than the settle penalty, making "oscillate through the
+2cm zone repeatedly" reward-optimal over genuinely settling, and more training only
+sharpened that exploit. Not a code bug — the settle mechanism was confirmed correctly
+wired and contributing, just far too weakly to compete. `settle_velocity_penalty_scale`
+bumped 20x (0.05→1.0) as an isolated, single-variable fix (`G1ArmResidualLeftEnvCfg`/
+`G1ArmResidualRightEnvCfg`); a resumed run to test it was in progress at the time of
+this note. If this doesn't close enough of the gap, the next-tier fix is more
+structural (couple `goal_reached_bonus` to low velocity too, or pay it only on actual
+hold completion rather than per qualifying step).
+
+**Scale bump alone confirmed NOT sufficient (2026-07-28, resumed run monitored live
+via TensorBoard, not just the final numbers):** `Episode_Reward/settle` jumped
+immediately at the resume point (arithmetic — the 20x multiplier), then stayed flat
+(~-1.7) for a further ~1900 iterations with zero directional improvement, while
+`goal_reached_bonus` kept climbing (38.7→39.9) — the bigger penalty changed the
+number, not the underlying velocity behavior. Run stopped at ~7850/14000 iterations
+(further iterations under the same settings were very unlikely to help, given the
+flat trend over an already-substantial window).
+
+**Structural fix implemented (2026-07-28):** `G1ArmResidualEnv._get_rewards` now
+overrides the base task's reward function (full copy with one change, documented
+in-line — Python has no clean way to patch a single line out of a parent method) so
+that `goal_reached_bonus` requires low joint velocity too (`goal_reached_max_vel`,
+new cfg field, 0.5 rad/s L2-norm over the 7 controlled joints, a first estimate not
+yet tuned), not just proximity. This removes the oscillate-through-the-zone exploit
+directly rather than trying to out-weigh it with a bigger separate penalty.
+`success`/`_hold_counter` is unchanged (still pure proximity, keeping it comparable
+to every number reported so far) — only the reward term that created the exploit
+changed. `settle_velocity_penalty_scale` stays at 1.0 (harmless, complementary — a
+looser 5cm-zone velocity penalty alongside the 2cm-zone bonus gate, not conflicting).
+Training this from a **fresh run** (not resumed) — the reward's *structure* changed,
+not just a weight, and the previous checkpoint's weights are shaped around exploiting
+the pattern that's now removed; re-learning reach is cheap (hit ~50% within the first
+1000 iterations from a cold start previously) versus the risk of carrying over a
+policy biased toward the old exploit.
+
+**Structural fix confirmed working (2026-07-28, fresh run
+`logs/rsl_rl/arms/residual_left/2026-07-28_22-17-21`) — then a real regression
+past 2500 iterations, not yet understood.** At 2500 iterations:
+`success_rate` 64.11%/74.62% (no_wobble/with_wobble), `reach_rate_no_hold`
+99.29%/99.85% — a dramatic improvement over the old exploit run's 12.88%/15.54% at a
+comparable iteration count, confirming the reward-structure fix (not just more
+training) was the right call. Continuing the SAME run to ~5000 iterations then showed
+`success_rate` **drop** to 44.97%/56.26% (reach_rate stayed high, 98.3-98.9%) — real,
+not noise (894-1015 episodes per bucket). `Train/mean_episode_length` explains the
+mechanism: climbed from 176 (81% of the 176/300 window, actually 59%) to 244 (81% of
+the 300-step cap) across exactly this window, while `frac_envs_reached` and
+`goal_reached_bonus`'s per-step average KEPT climbing the whole time (not flat like
+the original exploit) — meaning the policy is still improving by the continuous
+reward (spending more total time reached+still across a WIDER, presumably harder,
+goal population) while the strict, zero-tolerance `goal_hold_steps` (15 CONSECUTIVE
+steps, any single miss resets to 0) is satisfied less often on this now-harder mix.
+Hypothesis, not confirmed: a real tension between "reward keeps rewarding broader
+coverage" and "success metric has zero tolerance for even one bad step" — distinct
+from the original bug (reward fully decoupled from stillness). **Not yet known
+whether this is a transient dip that more training resolves, or close to the actual
+success-rate peak for this reward under current settings** — only two points on the
+curve (2500, ~5000) have been measured. `model_2499.pt` is the best-measured
+checkpoint so far; use it for anything downstream (e.g. the visual reach test) until
+this is resolved. Cheap next step, no new training needed: eval the intermediate
+checkpoints already on disk (model_3000/3500/4000.pt) to see the actual shape of the
+decline before deciding whether to keep training past 5000 or address
+`goal_hold_steps`/the reward directly.
+
+**Deferred idea (2026-07-28, user's own suggestion, explicitly parked for later —
+"one change at a time"):** scale `residual_action_scale` down as distance-to-goal
+shrinks (large correction budget far away, tight budget close in), forcing precision
+exactly where hold-stability matters. Distinct from "speed up the arm while far,"
+which doesn't map onto this architecture (the residual doesn't drive the large-scale
+approach — the fixed IK baseline + PD dynamics do, and gains are explicitly off-limits
+to retune) — this is instead about shrinking the residual's own action budget near the
+goal. Plausibly complementary to the settle-reward fix above (reward teaches wanting
+stillness; a tighter budget makes wobbling harder even before that's learned). Not
+implemented yet — revisit as its own isolated test once the settle-reward fix's own
+effect is clear, not bundled into the same run.
 
 ## Working conventions on this branch (non-negotiable, carried from `main`)
 
@@ -417,6 +604,9 @@ yet; next step is deciding which to tackle first.
 | What | Where |
 |---|---|
 | Current arm RL env (goal box, palm frame, action filter, override action) | `source/.../tasks/manager_based/g1_arm/g1_arm_env.py` |
+| Residual-RL env + theory writeup (Phase 4) | `source/.../tasks/manager_based/g1_arm_residual/g1_arm_residual_env.py`, `personal_development/residual_rl.md` |
+| Vendored numerical IK solver | `source/.../controllers/arm_ik.py` |
+| Fixed-base IK-only eval (the Phase 2 gate) | `validation/eval_arm_ik_fixed_base.py` |
 | Walking env cfg + reward recipe | `source/.../tasks/manager_based/g1_locomotion/g1_locomotion_env_cfg.py` |
 | Joint order / gains ground truth | `source/.../assets/robots/unitree.py`, `deploy_reference/robots/g1_29dof/config/` |
 | Interactive combined demo (integration seam for Phase 2) | `testing/visual_testing/full_demo/g1_full_demo.py` (+ its README) |
