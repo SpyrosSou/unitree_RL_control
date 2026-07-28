@@ -1,23 +1,33 @@
 # Unitree RL Control — G1 29dof
 
-Reinforcement-learning-based locomotion and arm control for the Unitree G1 (29-DOF: 3-DOF
-waist, 7-DOF arms with wrists) using Isaac Sim, Isaac Lab, and RSL-RL.
+Reinforcement-learning-based locomotion, with IK-plus-RL-residual arm control, for the
+Unitree G1 (29-DOF: 3-DOF waist, 7-DOF arms with wrists) using Isaac Sim, Isaac Lab, and
+RSL-RL.
+
+**This is the `ik_residuals` branch.** A prior week of pure-RL arm-reaching training
+(`main` branch) plateaued at real single-shot reliability of ~30% even for the
+best-looking checkpoint (see `retrospective.md`) — root cause never found. Active work
+here replaces that arm-reaching approach with numerical IK for precise reach targets,
+with a trained RL residual planned on top for compliance/robustness. **The full build
+plan is `ik_arm_integration_plan.md` (repo root) — read that first if you're picking up
+this branch.** `main` is untouched and stays available as the pure-RL fallback.
 
 This repository contains:
 
 - a unified walking+standing locomotion policy (one policy covers both — standing is
-  just the near-zero-velocity edge of the command distribution),
-- arm-reaching tasks for left, right, or both arms (pure RL joint-space control, not
-  IK — see `policy_status.md` for the current strategic pivot toward IK for precision
-  grasping specifically),
+  just the near-zero-velocity edge of the command distribution), unaffected by the IK
+  pivot,
+- the previous arm-reaching RL tasks (left/right/both, pure joint-space control) — kept
+  as the historical/comparison baseline `ik_arm_integration_plan.md`'s Phase 3 validates
+  against, being superseded as the deployed arm approach on this branch,
 - integration demos combining locomotion and arm control on one robot,
 - curated deployable checkpoints under `chosen_checkpoints/`.
 
 **Start here if you're new to this repo (human or a fresh Claude chat): read the
 "Overview / up to speed" section near the bottom of this file, then `policy_status.md`
-for full current status and findings, then `retrospective.md` for a narrative summary
-of what was tried this week and why (including why walking is one combined policy
-instead of two decoupled ones).**
+for the full pre-pivot status/findings, then `retrospective.md` for the narrative of
+what was tried and why the pivot happened, then `ik_arm_integration_plan.md` for the
+actual current work.**
 
 ## What Is In This Repo
 
@@ -51,8 +61,10 @@ This repo ignores large training logs (`logs/`) and intermediate checkpoints, bu
 a small curated set of deployable models in `chosen_checkpoints/` — see that directory's
 own `README.md` for exactly which checkpoint is current and its provenance. As of
 2026-07-27: `walking_latest.pt` is the deployable walking+standing checkpoint;
-`arm_left_latest.pt` is stale — the actual current-best arm checkpoint (`best_combined`)
-hasn't been promoted there yet, see `chosen_checkpoints/README.md`.
+`arm_left_latest.pt` is stale and `best_combined` (RL) was never promoted — on this
+branch the arm entry will become an IK-backed component instead, per
+`ik_arm_integration_plan.md`; `chosen_checkpoints/README.md` will be updated as that
+work lands.
 
 ## Quick Start
 
@@ -101,9 +113,12 @@ See `testing/visual_testing/full_demo/README.md` for controls, keybindings, and 
   script's own docstring/`--help` is the usage reference
 - `chosen_checkpoints/` — curated deployable checkpoints (see its own `README.md` for
   provenance)
-- `policy_status.md` — **the maintained living status document**: what's working, what's
-  been tried and ruled out, current findings, deferred/future items, lessons learned.
-  This is the first thing to read for current state.
+- `policy_status.md` — **the maintained living status document** for the pre-pivot
+  (pure-RL) state: what's working, what's been tried and ruled out, deferred/future
+  items, lessons learned.
+- `retrospective.md` — narrative summary of what was tried and why the IK pivot happened.
+- `ik_arm_integration_plan.md` — **the current work on this branch**: phased plan,
+  landmines, file map. Read this to know what to actually do next.
 
 ## Notes On Ignored Files
 
@@ -118,16 +133,16 @@ This keeps the repo small while still shipping usable models.
 
 ## Overview / up to speed
 
-*Read this section (and then `policy_status.md`) to get full context on this repo
-without needing a long introduction from the user.*
+*Read this section, then `policy_status.md`, then `retrospective.md`, then
+`ik_arm_integration_plan.md` (in that order) to get full context on this repo and this
+branch without needing a long introduction from the user.*
 
 **What this is:** RL control (Isaac Lab + RSL-RL, PPO) for a Unitree G1 humanoid,
 29-DOF variant (3-DOF waist, 7-DOF arms with wrists — matches the physical EDU robot).
-Three things are being built: a unified walk+stand locomotion policy, an arm-reaching
-policy, and integration of the two on one robot. Deployment target is genuine RL
-joint-space control, not classical IK — arm-IK is currently only being explored as a
-possible *replacement* for the reaching policy specifically (see "current direction"
-below), not as a training-time tool.
+Two things are being built: a unified walk+stand locomotion policy (done, working), and
+arm control — originally pure RL joint-space reaching, now (on this `ik_residuals`
+branch) numerical IK for the precise reach target plus a planned RL residual on top for
+compliance/robustness. Integration combines both on one robot.
 
 **Why 29dof specifically:** the physical robot doesn't match Isaac Lab's default
 `G1_MINIMAL_CFG` asset (1-DOF waist, 5-DOF arms, no wrists) — everything here was
@@ -137,25 +152,26 @@ project's own validation/testing methodology was kept, only the underlying asset
 changed). Older 23-DOF-era work lives on the `23_dof` git branch and an external backup
 at `~/Elm/Backups/g1_locomotion/23_dof/` if ever needed — not deleted, just superseded.
 
-**Current status (2026-07-27):**
+**Current status (2026-07-27, at the start of this branch):**
 - **Walking/standing**: working, `chosen_checkpoints/walking_latest.pt` — 0% fall rate,
   real verified translation, but a known ~24-27° heading drift over a straight 20s walk.
   Three rounds of drift-fix attempts all made heading drift *worse*, not better —
   treated as a real pattern, not bad luck, and currently on hold. A live hypothesis
   (`base_height`'s reward weight forcing near-locked knees, reducing balance-recovery
-  margin) is flagged but not yet acted on.
-- **Arms**: no single checkpoint is fully trustworthy yet. The training-time success
-  metric (up to 99.98% for one reference checkpoint) does NOT reflect true single-shot
-  reliability (~30%, confirmed via a dedicated long-hold/single-attempt test) — a real,
-  hard-won methodology finding, not just a tuning gap. `best_combined`
-  (`logs/rsl_rl/arms/best_combined/2026-07-26_13-09-32/model_1999.pt`) is the current
-  best RL candidate under every eval method tried so far.
-- **Current direction**: given RL alone hasn't reliably solved precise single-shot
-  reaching, the plan is to use `unitreerobotics/xr_teleoperate`'s `G1_29_ArmIK`
-  (Pinocchio+CasADi, official Unitree code, matches this exact robot) for precise
-  grasp targets, keeping the RL policy for compliant continuous-gesture motion. This is
-  being implemented on a new branch (proposed: `29dof_IK`) — `main` stays exactly as-is
-  as the fallback if the IK approach doesn't pan out.
+  margin) is flagged but not yet acted on. **Unaffected by the arm pivot below.**
+- **Arms (pre-pivot, `main`-branch history)**: no RL checkpoint was ever fully
+  trustworthy. The training-time success metric (up to 99.98% for one reference
+  checkpoint) did NOT reflect true single-shot reliability (~30%, confirmed via a
+  dedicated long-hold/single-attempt test) — a real, hard-won methodology finding, not
+  just a tuning gap. `best_combined`
+  (`logs/rsl_rl/arms/best_combined/2026-07-26_13-09-32/model_1999.pt`) was the best RL
+  candidate found and is this branch's baseline to beat.
+- **Current direction (this branch)**: replace RL-only arm reaching with
+  `unitreerobotics/xr_teleoperate`'s `G1_29_ArmIK` (Pinocchio+CasADi, official Unitree
+  code, matches this exact robot) for precise grasp targets, with a later-phase RL
+  residual on top for compliance/robustness — see `ik_arm_integration_plan.md` for the
+  full phased plan, landmines, and file map. `main` stays exactly as-is as the pure-RL
+  fallback if this doesn't pan out.
 
 **Working conventions worth knowing before touching anything:**
 - Verify before concluding — this project has repeatedly found that plausible-sounding

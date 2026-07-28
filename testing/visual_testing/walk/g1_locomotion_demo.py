@@ -61,7 +61,7 @@ def _yaml_walking_checkpoint() -> str | None:
     if not ckpt:
         return None
     if not os.path.isabs(ckpt):
-        repo_root = os.path.dirname(os.path.dirname(os.path.dirname(_YAML_PATH)))
+        repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(_YAML_PATH))))
         ckpt = os.path.join(repo_root, ckpt)
     return ckpt
 

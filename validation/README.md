@@ -12,6 +12,12 @@ per-episode CSV wrappers training uses (`g1_locomotion.utils.metrics_wrappers`),
 numbers are directly comparable to a run's own `*_detailed.csv`. Nothing here trains
 anything — every script only loads a checkpoint and runs inference.
 
+**Branch note (`ik_residuals`)**: `eval_arm.py`/`eval_arm_long_hold.py` below describe
+the RL arm-reaching evals from before the IK pivot. They stay relevant as the baseline
+Phase 3 of `ik_arm_integration_plan.md` compares an IK-based eval against (same
+single-shot-reliability definition, new script) — not obsolete, just not the active
+approach anymore.
+
 ## `eval_walking.py` — the single comprehensive walking eval
 
 One script, one Isaac Sim launch, one `summary.md`, three sections:

@@ -5,13 +5,30 @@ policy with a trained arm-reaching policy on the same robot — the closest thin
 repo to "watch the actual deployment target." WASD/QE drive locomotion, T sets an arm
 target, arm reaching runs unconditionally (no mode gating — see below).
 
+**Branch note (`ik_residuals`, updated 2026-07-27)**: Phase 2 of
+`ik_arm_integration_plan.md` (repo root) landed — this script now has an
+`--arm_backend ik|rl` flag. **`ik` is the default on this branch**: the arm is driven by
+the vendored CasADi/Pinocchio solver (`g1_locomotion.controllers.arm_ik.G1ArmIK`), no
+arm checkpoint needed at all. `--arm_backend rl` keeps the pre-pivot policy-driven path
+described below exactly as it was, for A/B comparison. Run from the `isaac_g1_ik` conda
+env (cloned from `isaac_g1_control` + `pinocchio`/`casadi` — see `ik_arm_integration_plan.md`),
+not `isaac_g1_control` — required for the IK backend, and harmless for the RL backend too.
+
 ## Running it
 
 ```bash
-conda activate isaac_g1_control
+conda activate isaac_g1_ik
 cd ~/Elm/Code/g1_locomotion
 
+# IK backend (default) — no arm checkpoint needed
 python testing/visual_testing/full_demo/g1_full_demo.py \
+    --loco_checkpoint chosen_checkpoints/walking_latest.pt \
+    --arm left \
+    --target 0.3 0.2 1.0
+
+# RL backend, for A/B comparison
+python testing/visual_testing/full_demo/g1_full_demo.py \
+    --arm_backend rl \
     --loco_checkpoint chosen_checkpoints/walking_latest.pt \
     --arm_checkpoint logs/rsl_rl/arms/best_combined/2026-07-26_13-09-32/model_1999.pt \
     --arm left \
@@ -33,9 +50,13 @@ both older 32-D checkpoints (e.g. the 200/20-gain reference) and newer 39-D
 - **T** — type a new arm target at the console (robot-local frame: x forward
   0.20-0.42m, y lateral left-arm 0.08-0.40m/right-arm -0.40--0.08m, z height 0.9-1.15m).
 - **L / R** — select which arm to address when `--arm both`.
-- **Y** (`--arm left` only) — type a target for the *right* arm, driven by mirroring the
-  left-trained policy (see `mdp/symmetry.py`) — no separate right-arm checkpoint needed.
-  Shown as a blue marker vs. the native target's red.
+- Goal marker colour = live distance-to-goal, updated every frame: **green** ≤2cm,
+  **yellow** ≤5cm, **red** >5cm (added 2026-07-27, Phase 2 — lets you see the far-reach
+  workspace gap Phase 1's dense IK sweep found directly on the robot, not just in a plot).
+- **Y** (`--arm left`, `--arm_backend rl` only) — type a target for the *right* arm,
+  driven by mirroring the left-trained policy (see `mdp/symmetry.py`) — no separate
+  right-arm checkpoint needed. Shown as a blue marker vs. the native target's
+  green/yellow/red. Not available on the IK backend (there's no RL network to mirror).
 - **C** — toggle camera follow off/on (off lets you orbit freely with the mouse).
 - **V** — reset camera to the default chase view (re-enables follow).
 

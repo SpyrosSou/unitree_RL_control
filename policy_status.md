@@ -1,5 +1,16 @@
 # Policy status — 29dof pivot
 
+**Branch note (2026-07-27, `ik_residuals`)**: the "Walking + standing" section below is
+current and still the live source of truth — that policy is untouched by the arm pivot.
+The "Arm reaching" section is now **historical** — it's the pure-RL record that
+motivated replacing RL-only arm reaching with IK (+ a later RL residual); see
+`ik_arm_integration_plan.md` for the current plan and `retrospective.md` for the
+narrative. Keep the arm data below as-is — Phase 3 of the plan validates the IK
+approach against these exact numbers (200/20 reference ~30% true single-shot,
+`best_combined` ~28-33% aggregate). Update the Walking section here as before; add new
+IK/residual findings to `ik_arm_integration_plan.md` or a successor doc, not by
+rewriting this section's RL history.
+
 Living summary of what's actually validated vs. still open, for the checkpoints in
 `chosen_checkpoints/`. Update this when a checkpoint gets promoted or a real gap is
 found — don't let it go stale the way `known_issues.md` did on the 23dof branch.

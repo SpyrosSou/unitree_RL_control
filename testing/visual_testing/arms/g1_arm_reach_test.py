@@ -143,7 +143,7 @@ def _yaml_checkpoint(yaml_path: str, arm: str) -> str | None:
         return None
     # Resolve relative paths against the repo root (parent of testing/arm_testing/)
     if not os.path.isabs(ckpt):
-        repo_root = os.path.dirname(os.path.dirname(os.path.dirname(yaml_path)))
+        repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(yaml_path))))
         ckpt = os.path.join(repo_root, ckpt)
     return ckpt
 

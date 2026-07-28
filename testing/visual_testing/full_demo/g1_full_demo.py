@@ -24,23 +24,36 @@ port:
    mechanism the training curriculum uses (`env._arm_motion_targets`/
    `_arm_motion_joint_ids`), not a new action term.
 
+Phase 2 of `ik_arm_integration_plan.md` (2026-07-27): **`--arm_backend ik` (default on
+this branch)** drives the arm via the vendored CasADi/Pinocchio solver
+(`g1_locomotion.controllers.arm_ik.G1ArmIK`) instead of the trained arm RL policy — no
+arm checkpoint needed at all. `--arm_backend rl` keeps the pre-pivot policy-driven path
+exactly as before, for A/B comparison. Mirror-testing (Y/U keys, see below) only exists
+for `--arm_backend rl` — it tests whether the left-trained RL *network* generalizes to
+the right arm, which has no meaning once the arm isn't RL-driven.
+
 Kept essentially unchanged (proven, still correct): the goal-frame convention (fixed
 offset from the torso, recomputed from the live pose every call — never a world-fixed
 point, see `_goal_positions_world`'s docstring for why that matters), the z-height
 convention (ground-referenced, not root-referenced), the homing-between-targets
-behavior, the mirror-testing mode (Y/U keys), and camera control (C/V).
+behavior (RL backend only — see `_compute_arm_targets_ik`'s docstring for why the IK
+backend skips it), and camera control (C/V).
 
 Behaviour:
 - Arms actively reach their current target(s), if any, at all times — no mode gating.
 - WASD/QE command the locomotion policy directly (forward/strafe/turn).
 - Press T to type a new arm target at the console.
 - Press L / R to select which arm to address when arm_mode=both (default: left).
-- Press Y (arm_mode=left only) to type a target for the RIGHT arm, driven by mirroring
-  the left-trained policy (see mdp/symmetry.py) — no separate right-arm checkpoint
-  needed. Shown as a blue marker, vs. the native target's red.
-- Press U (arm_mode=left only) to type two targets, one per arm (left native, right
-  mirrored) — tests whether the mirror-generalized policy holds up driving both arms
-  simultaneously.
+- Goal marker colour = live distance-to-goal: green ≤2cm, yellow ≤5cm, red >5cm (added
+  2026-07-27 so the far-reach workspace gap Phase 1's dense sweep found is visible
+  directly on the robot).
+- Press Y (arm_mode=left, --arm_backend rl only) to type a target for the RIGHT arm,
+  driven by mirroring the left-trained policy (see mdp/symmetry.py) — no separate
+  right-arm checkpoint needed. Shown as a blue marker, vs. the native target's
+  green/yellow/red.
+- Press U (arm_mode=left, --arm_backend rl only) to type two targets, one per arm (left
+  native, right mirrored) — tests whether the mirror-generalized policy holds up
+  driving both arms simultaneously.
 - Press C to toggle camera follow off/on (off lets you orbit freely with the mouse).
 - Press V to reset the camera to the default chase view (and re-enable follow).
 
@@ -51,22 +64,29 @@ _GOAL_BOUNDS, the authoritative source; these numbers are just a quick reference
     z  height      reachable 0.9 – 1.15 m  (ground = 0)
 
 Usage:
-    conda activate isaac_g1_control
+    conda activate isaac_g1_ik
     cd ~/Elm/Code/g1_locomotion
 
-    # Auto-load from testing/general_testing/checkpoints.yaml
+    # Auto-load from testing/general_testing/checkpoints.yaml -- IK backend (default)
     python3 testing/visual_testing/full_demo/g1_full_demo.py
 
-    # Explicit checkpoints + initial arm target
+    # Explicit initial arm target, IK backend
     python3 testing/visual_testing/full_demo/g1_full_demo.py \\
-        --loco_checkpoint logs/rsl_rl/walking/base/.../model_5999.pt \\
-        --arm_checkpoint  logs/rsl_rl/arms/left/.../model_5999.pt \\
+        --loco_checkpoint chosen_checkpoints/walking_latest.pt \\
         --arm left \\
         --target 0.3 0.2 1.0
 
-    # Both arms
+    # Both arms, IK backend
     python3 testing/visual_testing/full_demo/g1_full_demo.py \\
         --arm both \\
+        --target 0.3 0.2 1.0
+
+    # RL backend, for A/B comparison against the IK backend above
+    python3 testing/visual_testing/full_demo/g1_full_demo.py \\
+        --arm_backend rl \\
+        --loco_checkpoint chosen_checkpoints/walking_latest.pt \\
+        --arm_checkpoint  chosen_checkpoints/arm_left_latest.pt \\
+        --arm left \\
         --target 0.3 0.2 1.0
 """
 
@@ -105,6 +125,14 @@ parser.add_argument("--arm_checkpoint", type=str, default=None,
                     help="Checkpoint for the arm policy (overrides YAML).")
 parser.add_argument("--arm", type=str, default=None, choices=["left", "right", "both"],
                     help="Which arm(s) to control. Overrides YAML arm_mode.")
+parser.add_argument(
+    "--arm_backend", type=str, default="ik", choices=["ik", "rl"],
+    help="Phase 2 of ik_arm_integration_plan.md: 'ik' (default on this branch) drives the "
+    "arm via the vendored CasADi/Pinocchio solver (g1_locomotion.controllers.arm_ik) — "
+    "no arm checkpoint needed, mirror-testing (Y/U keys) disabled (it's an RL-network "
+    "generalization test, meaningless for IK). 'rl' keeps the pre-pivot arm-policy path "
+    "exactly as before, for A/B comparison against the IK backend.",
+)
 parser.add_argument("--target", type=float, nargs=3, default=None,
                     metavar=("X", "Y", "Z"),
                     help="Initial arm target in robot-local frame (x y z).")
@@ -127,8 +155,12 @@ simulation_app = app_launcher.app
 # ---------------------------------------------------------------------------
 # Everything after sim is up
 # ---------------------------------------------------------------------------
+import math
+
+import numpy as np
 import g1_locomotion.tasks  # noqa: F401 — registers gym envs
 import torch
+from g1_locomotion.controllers.arm_ik import ARM_JOINT_NAMES, G1ArmIK
 from g1_locomotion.tasks.manager_based.g1_arm.agents.rsl_rl_ppo_cfg import (
     G1ArmBothPPORunnerCfg,
     G1ArmLeftPPORunnerCfg,
@@ -160,7 +192,7 @@ import isaaclab.sim as sim_utils
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 from isaaclab.sim.utils.stage import get_current_stage
-from isaaclab.utils.math import quat_apply, quat_apply_inverse
+from isaaclab.utils.math import quat_apply, quat_apply_inverse, yaw_quat
 
 from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper
 
@@ -184,6 +216,53 @@ ARM_ACTION_FILTER_ALPHA = 0.25
 # joint is within this tolerance of default.
 ARM_HOMING_TOL_RAD = 0.05
 
+# IK backend, hybrid warm-start (2026-07-27): solve_ik normally warm-starts from the
+# arm's live current pose (smooth, correct for a continuous multi-waypoint gesture like
+# a handshake — each solve gets a good, nearby starting guess for free). But IPOPT is a
+# local optimizer, and if the *previous* target left the arm in an unusual/strained
+# configuration, warm-starting the *next* solve from there can land in a meaningfully
+# worse local optimum than starting fresh — confirmed 2026-07-27 in an automated
+# multi-target sweep (validation/eval_arm_ik_standing.py): kinematic error for the exact
+# same target varied between runs (e.g. 26cm vs 34cm), and one case reached ~87cm right
+# before an actual fall (Phase 1's dense sweep never exceeded ~16cm for ANY target,
+# confirming this is solver instability, not a genuinely harder point). Fix: if a solve
+# comes back this far off, treat it as suspect and immediately retry the *same* target
+# from a neutral warm start (arm_ik.reset() to the default pose) before acting on
+# anything — the common case (a good previous reach feeding a nearby next one, e.g. each
+# waypoint of a handshake) never triggers this, only the rare bad one does.
+ARM_IK_RETRY_KINEMATIC_ERR_M = 0.20
+
+# Second, independent safety net (2026-07-27): the once-per-target retry above only
+# guards the FIRST solve after a target change — an automated sweep found a case where
+# a target's kinematic error was fine at first but drifted to ~221cm *mid-hold*
+# (continuous live-warm-start re-solving can wander into a bad basin over many steps,
+# not just at the start), correlating directly with real falls. Checked EVERY step
+# (unlike the retry, this doesn't reset/interrupt the solver's state) — if the solved
+# answer is this far off, don't act on it at all this step: hold the current position
+# and zero the feedforward torque, rather than drive toward a wild, destabilizing
+# solution. Deliberately looser than the retry threshold — this is a last-resort brake,
+# not the primary correction mechanism.
+ARM_IK_HARD_REJECT_M = 0.30
+
+# Root-pose smoothing for the IK target conversion (2026-07-27): found via a fixed-base
+# isolation test that walking's continuous weight-shifting was a MAJOR cause of bad IK
+# solves (kinematic error mean 13.01cm walking vs. 3.16cm base-fixed, same 15 targets;
+# catastrophic ~221cm solves seen walking, never seen base-fixed). Root cause verified
+# by direct derivation, not assumed: the round-trip world<->pelvis-frame conversion
+# (_goal_positions_world -> to_pelvis) is an exact identity ONLY for pure-yaw root
+# rotation — the "ground-referenced z" convention subtracts a large constant offset
+# (~0.8m, pelvis height) that gets carried through the *inverse* of the root
+# orientation, so any ROLL/PITCH tilt component (not yaw) leaks that ~0.8m into the
+# target's x/y, scaled by the tilt angle (a few degrees of sway-induced tilt -> several
+# cm of real perturbation in what the solver is asked to hit, frame to frame). Fix:
+# convert using an EMA-smoothed root pose instead of the raw, jittery one — the
+# round-trip math still cancels to the same intended local offset, but the smoothed
+# orientation's tilt varies far less frame-to-frame, so the leaked perturbation does
+# too. Time constant ~0.4s (alpha=0.05 at 50Hz) — filters sway, still tracks genuine
+# relocation. Reset to the raw pose on any discontinuity (new target, respawn) so a
+# real jump isn't slowly blended in from stale history.
+ARM_IK_ROOT_SMOOTHING_ALPHA = 0.05
+
 # Arm PD gain: matches g1_arm_env.py's training gain while actively reach-driven, the
 # loco env's own stock gain otherwise (matches
 # g1_locomotion.assets.robots.unitree.UNITREE_G1_29DOF_CFG's N5020-16/W4010-25 groups —
@@ -199,17 +278,31 @@ ARM_HOMING_TOL_RAD = 0.05
 _GAIN_ARM_ACTIVE = (40.0, 10.0)
 _GAIN_ARM_HELD = (40.0, 10.0)
 
-# Goal-sphere colours. Red = native (left-trained-policy-driven) target. Blue = the
-# mirror-testing target.
-_RED_SPHERE_CFG = VisualizationMarkersCfg(
+# Goal-sphere colours for the native target(s): live-recolored every frame by
+# _update_goal_markers() based on actual current distance-to-goal, not backend or
+# arm identity — green/yellow/red = within 2/5/10+cm (2026-07-27, added so the far-reach
+# workspace gap found in Phase 1's dense sweep is visible directly on the robot, not just
+# in an offline plot). Index order below IS the marker_indices contract (dict insertion
+# order — see VisualizationMarkers.visualize()'s docstring) — do not reorder casually.
+_GOAL_MARKER_THRESHOLDS_CM = (2.0, 5.0)  # <=2cm -> green, <=5cm -> yellow, else -> red
+_GOAL_STATUS_SPHERE_CFG = VisualizationMarkersCfg(
     prim_path="/Visuals/FullDemoTargets",
     markers={
-        "sphere": sim_utils.SphereCfg(
+        "green": sim_utils.SphereCfg(
             radius=0.04,
-            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.0, 0.0)),
-        )
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.05, 0.64, 0.05)),
+        ),
+        "yellow": sim_utils.SphereCfg(
+            radius=0.04,
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.98, 0.70, 0.10)),
+        ),
+        "red": sim_utils.SphereCfg(
+            radius=0.04,
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.82, 0.23, 0.23)),
+        ),
     },
 )
+# Blue = the mirror-testing target (RL backend only — see module docstring).
 _BLUE_SPHERE_CFG = VisualizationMarkersCfg(
     prim_path="/Visuals/FullDemoMirrorTargets",
     markers={
@@ -237,10 +330,13 @@ def _yaml_value(keys: list[str], default=None):
     return node if node is not None else default
 
 
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(_YAML_PATH))))
+
+
 def _resolve_checkpoint(cli_val: str | None, yaml_keys: list[str], hardcoded: str) -> str:
     path = cli_val or _yaml_value(yaml_keys, hardcoded)
     if path and not os.path.isabs(path):
-        path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(_YAML_PATH))), path)
+        path = os.path.join(_REPO_ROOT, path)
     return path
 
 
@@ -258,21 +354,28 @@ def _default_arm_target(arm_mode: str) -> torch.Tensor:
 
 class G1FullDemo:
     def __init__(self):
+        self.arm_backend = args_cli.arm_backend  # "ik" (default) or "rl" — see --arm_backend help
         self.loco_ckpt = _resolve_checkpoint(
             args_cli.loco_checkpoint, ["loco", "checkpoint"], _DEFAULT_LOCO
         )
         self.arm_mode = args_cli.arm or _yaml_value(["arm_mode"]) or "left"
-        arm_ckpt_default = _DEFAULT_ARM_BOTH if self.arm_mode == "both" else _DEFAULT_ARM_LEFT
-        self.arm_ckpt = _resolve_checkpoint(
-            args_cli.arm_checkpoint, ["arm", self.arm_mode, "checkpoint"], arm_ckpt_default,
-        )
 
-        for name, path in [("loco", self.loco_ckpt), ("arm", self.arm_ckpt)]:
+        checkpoints_to_check = [("loco", self.loco_ckpt)]
+        if self.arm_backend == "rl":
+            arm_ckpt_default = _DEFAULT_ARM_BOTH if self.arm_mode == "both" else _DEFAULT_ARM_LEFT
+            self.arm_ckpt = _resolve_checkpoint(
+                args_cli.arm_checkpoint, ["arm", self.arm_mode, "checkpoint"], arm_ckpt_default,
+            )
+            checkpoints_to_check.append(("arm", self.arm_ckpt))
+        else:
+            self.arm_ckpt = None  # IK backend needs no arm checkpoint at all
+
+        for name, path in checkpoints_to_check:
             if not os.path.isfile(path):
                 raise FileNotFoundError(f"{name} checkpoint not found: {path}")
 
         print(f"[FullDemo] loco     : {self.loco_ckpt}")
-        print(f"[FullDemo] arm ({self.arm_mode:5s}): {self.arm_ckpt}")
+        print(f"[FullDemo] arm ({self.arm_mode:5s}, backend={self.arm_backend}): {self.arm_ckpt or '(none — IK backend)'}")
 
         # ------ locomotion environment ------
         agent_cfg: RslRlOnPolicyRunnerCfg = cli_args_mod.parse_rsl_rl_cfg(LOCO_TASK, args_cli)
@@ -306,8 +409,46 @@ class G1FullDemo:
         all_arm_ids, _ = self.robot.find_joints(list(_LEFT_ARM_JOINTS) + list(_RIGHT_ARM_JOINTS))
         self.all_arm_joint_ids_robot = torch.tensor(all_arm_ids, dtype=torch.long, device=self.device)
 
+        l_ee_ids, _ = self.robot.find_bodies(_LEFT_EE_BODY)
+        r_ee_ids, _ = self.robot.find_bodies(_RIGHT_EE_BODY)
+        self._left_ee_body_id = l_ee_ids[0]
+        self._right_ee_body_id = r_ee_ids[0]
+
         self.loco_policy = self._load_loco_policy(agent_cfg, self.loco_ckpt)
-        self.arm_policy, self.arm_body_ids, self.arm_joint_ids_robot = self._load_arm_policy()
+        if self.arm_backend == "rl":
+            self.arm_policy, self.arm_body_ids, self.arm_joint_ids_robot = self._load_arm_policy()
+        else:
+            # IK backend: no RL arm policy/checkpoint at all. G1ArmIK's own joint order
+            # (ARM_JOINT_NAMES) must line up with _LEFT_ARM_JOINTS+_RIGHT_ARM_JOINTS —
+            # verified equal here (not assumed) so all_arm_joint_ids_robot can double as
+            # the IK's own joint-id tensor; see ik_arm_integration_plan.md landmine #1.
+            assert list(_LEFT_ARM_JOINTS) + list(_RIGHT_ARM_JOINTS) == ARM_JOINT_NAMES, (
+                "g1_arm_env.py's joint lists and arm_ik.py's ARM_JOINT_NAMES have "
+                "diverged — the IK backend's column mapping below assumes these are "
+                "identical and would silently scramble joint targets otherwise."
+            )
+            self.arm_ik = G1ArmIK()
+            # Set True on every discontinuous event (_set_arm_target, env respawn) —
+            # the retry-from-neutral-pose check in _compute_arm_targets_ik only runs
+            # once per event, not every control step (a 2026-07-27 fix: checking every
+            # step was found to repeatedly wipe the solver's warm-start continuity for
+            # any target whose primary solve occasionally blips above the threshold,
+            # making some targets measurably WORSE than not retrying at all).
+            self._ik_retry_pending = False
+            self._ik_debug: dict | None = None  # populated by _compute_arm_targets_ik
+            self._last_tauff: torch.Tensor | None = None  # populated by _compute_arm_targets_ik
+            # Smoothed root ORIENTATION only (not position -- see
+            # ARM_IK_ROOT_SMOOTHING_ALPHA's docstring) for the IK target conversion —
+            # None means "not yet initialized," handled by _compute_arm_targets_ik
+            # seeding it from the live pose on first use.
+            self._ik_smoothed_root_quat: torch.Tensor | None = None
+            n_joints_per_arm = len(_LEFT_ARM_JOINTS)
+            if self.arm_mode == "left":
+                self.arm_joint_ids_robot = self.all_arm_joint_ids_robot[:n_joints_per_arm]
+            elif self.arm_mode == "right":
+                self.arm_joint_ids_robot = self.all_arm_joint_ids_robot[n_joints_per_arm:]
+            else:
+                self.arm_joint_ids_robot = self.all_arm_joint_ids_robot
         self._active_arm_cols = self._cols_in_all_arm(self.arm_joint_ids_robot)
 
         # ------ command state ------
@@ -345,12 +486,14 @@ class G1FullDemo:
 
         self._active_arm_idx = 0  # 0=left, 1=right — which arm the T-key prompt edits
 
-        self._goal_vis = VisualizationMarkers(_RED_SPHERE_CFG)
+        self._goal_vis = VisualizationMarkers(_GOAL_STATUS_SPHERE_CFG)
         self._update_goal_markers()
 
         # ------ mirror-testing state (right arm, driven by mirroring the LEFT-trained
-        # policy). Only meaningful when arm_mode="left". ------
-        self._mirror_enabled = self.arm_mode == "left"
+        # policy). Only meaningful when arm_mode="left" AND arm_backend="rl" — mirroring
+        # tests whether the left-trained RL network generalizes to the right arm, which
+        # has no meaning for the IK backend (there's no "network" to generalize).
+        self._mirror_enabled = self.arm_mode == "left" and self.arm_backend == "rl"
         self._mirror_homing = False
         if self._mirror_enabled:
             r_joints, _ = self.robot.find_joints(_RIGHT_ARM_JOINTS)
@@ -373,7 +516,9 @@ class G1FullDemo:
         self._create_camera()
         self._setup_keyboard()
 
-        print("\n[FullDemo] Ready.")
+        print(f"\n[FullDemo] Ready. Arm backend: {self.arm_backend}"
+              f"{' (no arm checkpoint used)' if self.arm_backend == 'ik' else ''}")
+        print("  Goal marker colour = live distance-to-goal: green <=2cm, yellow <=5cm, red >5cm")
         print("  W/A/D/Q/E  — velocity command    S  — stop")
         print("  T          — type new arm target (blocks simulation briefly)")
         print("  L / R      — switch active arm (only for arm_mode=both)")
@@ -575,6 +720,145 @@ class G1FullDemo:
         new_targets = (current + delta).clamp(limits[:, 0], limits[:, 1])
         return new_targets.unsqueeze(0)
 
+    # ------------------------------------------------------------------ IK backend
+
+    def _compute_arm_targets_ik(self) -> torch.Tensor:
+        """IK backend equivalent of ``_compute_arm_targets``: solve the full 14-DOF
+        both-arm problem every step (matching G1ArmIK's own design — see arm_ik.py's
+        docstring on why solving jointly is equivalent to solving each arm
+        independently once the waist is locked), then rate-limit only the *active*
+        arm's slice from the robot's current joint state toward that solution, through
+        the same ARM_MAX_JOINT_DELTA_PER_STEP clamp and set_joint_position_target seam
+        the RL path uses. Unlike the RL path, there's no separate homing-first phase —
+        the IK solve is valid from any starting configuration, not just a
+        trained-distribution default pose (see _set_arm_target).
+
+        Uses an EMA-SMOOTHED root pose (not the raw, live one) for the world<->pelvis
+        conversion — see ARM_IK_ROOT_SMOOTHING_ALPHA's docstring for why: the
+        ground-referenced-z convention leaks the ~0.8m pelvis-height offset into the
+        target's x/y through any roll/pitch tilt in the root orientation, so the raw,
+        sway-jittery orientation was injecting real, several-cm frame-to-frame
+        perturbation into what the solver was asked to hit — a major cause of the
+        catastrophic kinematic solves seen with the base walking vs. fixed. Still
+        adapts to genuine relocation (not a frozen snapshot), just filtered.
+
+        ONLY the orientation is smoothed, not position (fixed 2026-07-27 — smoothing
+        position too was tested and made some targets measurably worse: it lags the
+        pelvis-frame reference behind the arm's own live world position when used for
+        the "other arm, hold in place" reference, injecting a real mismatch. The leak
+        mechanism derived above only implicates orientation — position can and should
+        stay raw/live)."""
+        root_pos = self.robot.data.root_pos_w[0]
+        raw_root_quat = self.robot.data.root_quat_w[0]
+        if self._ik_smoothed_root_quat is None:
+            self._ik_smoothed_root_quat = raw_root_quat.clone()
+        else:
+            a = ARM_IK_ROOT_SMOOTHING_ALPHA
+            blended_quat = a * raw_root_quat + (1.0 - a) * self._ik_smoothed_root_quat
+            self._ik_smoothed_root_quat = blended_quat / blended_quat.norm()
+        root_quat = self._ik_smoothed_root_quat
+
+        def to_pelvis(world_pos: torch.Tensor) -> np.ndarray:
+            # Live position, smoothed orientation (see docstring above).
+            local = quat_apply_inverse(root_quat, world_pos - root_pos)
+            return local.detach().cpu().numpy()
+
+        goal_world = self._goal_positions_world(root_pos=root_pos, root_quat=root_quat)
+        if self.arm_mode == "both":
+            left_pelvis = to_pelvis(goal_world[0])
+            right_pelvis = to_pelvis(goal_world[1])
+        elif self.arm_mode == "left":
+            left_pelvis = to_pelvis(goal_world[0])
+            # Hold the untargeted arm roughly at its own current position — near-zero
+            # error term for it, doesn't perturb the targeted arm's solve.
+            right_pelvis = to_pelvis(self.robot.data.body_pos_w[0, self._right_ee_body_id])
+        else:
+            right_pelvis = to_pelvis(goal_world[0])
+            left_pelvis = to_pelvis(self.robot.data.body_pos_w[0, self._left_ee_body_id])
+
+        def se3(p: np.ndarray) -> np.ndarray:
+            tf = np.eye(4)
+            tf[:3, 3] = p
+            return tf
+
+        debug_side = "left" if self.arm_mode in ("left", "both") else "right"
+        debug_target_pelvis = left_pelvis if debug_side == "left" else right_pelvis
+
+        current_q_full = self.robot.data.joint_pos[0, self.all_arm_joint_ids_robot].detach().cpu().numpy()
+        sol_q, sol_tauff = self.arm_ik.solve_ik(se3(left_pelvis), se3(right_pelvis), current_q=current_q_full)
+        kinematic_err_m = float(np.linalg.norm(self.arm_ik.fk_wrist(sol_q, debug_side) - debug_target_pelvis))
+
+        # Hybrid warm-start fallback (see ARM_IK_RETRY_KINEMATIC_ERR_M's docstring) —
+        # checked ONCE per discontinuous event (_ik_retry_pending set by
+        # _set_arm_target/_handle_env_resets), not every control step. Checking every
+        # step was found (2026-07-27) to repeatedly wipe the solver's warm-start
+        # continuity for any target whose primary solve occasionally blips above the
+        # threshold, making some targets measurably worse than not retrying at all —
+        # a fresh reach should get exactly one chance at a better warm start, then
+        # normal continuous refinement takes over regardless of later blips.
+        if self._ik_retry_pending:
+            self._ik_retry_pending = False
+            if kinematic_err_m > ARM_IK_RETRY_KINEMATIC_ERR_M:
+                default_q_full = self.robot.data.default_joint_pos[0, self.all_arm_joint_ids_robot].detach().cpu().numpy()
+                self.arm_ik.reset(default_q_full)
+                retry_q, retry_tauff = self.arm_ik.solve_ik(se3(left_pelvis), se3(right_pelvis), current_q=default_q_full)
+                retry_err_m = float(np.linalg.norm(self.arm_ik.fk_wrist(retry_q, debug_side) - debug_target_pelvis))
+                print(f"[FullDemo] IK retry triggered: live-warm-start err={kinematic_err_m * 100:.1f}cm -> "
+                      f"neutral-warm-start retry err={retry_err_m * 100:.1f}cm")
+                sol_q, sol_tauff, kinematic_err_m = retry_q, retry_tauff, retry_err_m
+
+        sol_q_t = torch.tensor(sol_q, dtype=torch.float32, device=self.device)
+
+        n_per_arm = len(_LEFT_ARM_JOINTS)
+        if self.arm_mode == "left":
+            sol_slice = sol_q_t[:n_per_arm]
+        elif self.arm_mode == "right":
+            sol_slice = sol_q_t[n_per_arm:]
+        else:
+            sol_slice = sol_q_t
+
+        current = self.robot.data.joint_pos[0, self.arm_joint_ids_robot]
+
+        if kinematic_err_m > ARM_IK_HARD_REJECT_M:
+            # Hard safety net (see ARM_IK_HARD_REJECT_M's docstring) — even after the
+            # once-per-target retry, this solution is too far off to act on. Hold
+            # position and zero the feedforward torque this step rather than drive
+            # toward it; next step tries again fresh (recoverable, not a latch).
+            new_targets = current.clone()
+            self._last_tauff = torch.zeros(self.all_arm_joint_ids_robot.numel(), device=self.device)
+        else:
+            delta = (sol_slice - current).clamp(-ARM_MAX_JOINT_DELTA_PER_STEP, ARM_MAX_JOINT_DELTA_PER_STEP)
+            new_targets = current + delta
+            # Gravity/Coriolis-at-rest feedforward torque for the FULL 14-DOF solved
+            # pose (both arms) — confirmed necessary 2026-07-27: PD position tracking
+            # alone at 40/10 stalls partway through a lift (rate-limiter's per-step
+            # budget gets fully consumed by gravity sag before it can make net
+            # progress — see ik_arm_integration_plan.md's Phase 2 diagnostics). Applied
+            # on top of the PD position target via set_joint_effort_target in
+            # _update_arm_sim_targets, which PhysX's implicit actuator model adds
+            # additively (stiffness*error + damping*error_vel + joint_efforts) — not a
+            # replacement.
+            self._last_tauff = torch.tensor(sol_tauff, dtype=torch.float32, device=self.device)
+
+        # ------ diagnostics (2026-07-27, Phase 2 debugging): three independent
+        # numbers to localize a reach failure to one of solver / rate-limit /
+        # PD-tracking, instead of guessing. See ik_arm_integration_plan.md Phase 2.
+        # kinematic_err_m already reflects the post-retry solution if a retry happened.
+        self._ik_debug = {
+            # Is the SOLVER's own answer close to the target, in this live pelvis
+            # frame? Large here means a solver/frame-conversion problem.
+            "kinematic_err_cm": kinematic_err_m * 100.0,
+            # Has the RATE-LIMITED commanded target caught up to the fully-solved
+            # answer yet? Large + shrinking over time = still ramping (expected,
+            # transient). Large + not shrinking = a rate-limit bug.
+            "commanded_vs_solved_deg": math.degrees(torch.max(torch.abs(new_targets - sol_slice)).item()),
+            # Is the REAL simulated joint position tracking the fully-solved
+            # target? Large + commanded_vs_solved small = classic PD/gravity sag
+            # (see ik_arm_integration_plan.md's Phase 2 tau_ff note).
+            "actual_vs_solved_deg": math.degrees(torch.max(torch.abs(current - sol_slice)).item()),
+        }
+        return new_targets.unsqueeze(0)
+
     # ------------------------------------------------------------------ mirror testing
 
     def _build_mirror_source_obs(self) -> torch.Tensor:
@@ -629,7 +913,10 @@ class G1FullDemo:
 
         arm_active = self._has_active_arm_target()
         if arm_active or bool(self._arm_homing.any().item()):
-            arm_targets = self._compute_arm_targets() if arm_active else targets[:, self._active_arm_cols].clone()
+            if arm_active:
+                arm_targets = self._compute_arm_targets_ik() if self.arm_backend == "ik" else self._compute_arm_targets()
+            else:
+                arm_targets = targets[:, self._active_arm_cols].clone()
             n_per_arm = len(self.arm_joint_ids_robot) // self._arm_homing.numel()
             for arm_idx in range(self._arm_homing.numel()):
                 if not bool(self._arm_homing[arm_idx]):
@@ -658,6 +945,19 @@ class G1FullDemo:
                 targets[:, self._mirror_arm_cols] = self._compute_mirror_targets()
 
         env._arm_motion_targets = targets
+        if self.arm_backend == "ik":
+            # Applied on top of the PD position target (PhysX's implicit actuator adds
+            # stiffness*error + damping*error_vel + joint_efforts — not a replacement,
+            # see _compute_arm_targets_ik's comment). Explicitly zeroed whenever not
+            # actively IK-driven (idle/homing) so a stale torque from the last active
+            # target doesn't linger and push the arm off its held/default pose.
+            if arm_active and self._last_tauff is not None:
+                self.robot.set_joint_effort_target(self._last_tauff.unsqueeze(0), joint_ids=self.all_arm_joint_ids_robot)
+            else:
+                self.robot.set_joint_effort_target(
+                    torch.zeros(1, self.all_arm_joint_ids_robot.numel(), device=self.device),
+                    joint_ids=self.all_arm_joint_ids_robot,
+                )
         self._update_arm_gains(arm_active, mirror_active)
 
     def _homing_step(self, joint_ids: torch.Tensor) -> torch.Tensor | None:
@@ -728,35 +1028,84 @@ class G1FullDemo:
             return bool(torch.all(self.arm_target_active).item())
         return bool(self.arm_target_active[0].item())
 
-    def _goal_positions_world(self) -> torch.Tensor:
+    def _goal_positions_world(
+        self, root_pos: torch.Tensor | None = None, root_quat: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Fixed offset from the torso, recomputed from the robot's *current* pose
         every call — NOT a world-fixed point snapshotted once. A world-fixed goal would
         force the arm to compensate for base tilt/drift it was never trained to
         handle, which feeds back into more tilt — a runaway feedback loop this
         convention avoids by construction (the goal only moves because the robot
-        pursuing it does)."""
-        pos = self.robot.data.root_pos_w[0].clone()
+        pursuing it does).
+
+        *root_pos*/*root_quat* let a caller pass a smoothed pose instead of the live
+        one (see ``_compute_arm_targets_ik``'s use of this — the IK backend needs this;
+        marker visualization does not and uses the default live pose).
+
+        2026-07-28 FIX: rotates by YAW ONLY, not the full root orientation. Each
+        ``goal_pos_local`` entry's z-component is a large ABSOLUTE ground-referenced
+        height (~0.9-1.15m), not a small pelvis-relative offset -- rotating that by the
+        full quaternion let any real roll/pitch tilt leak that height into world x/y
+        through the rotation matrix's off-diagonal terms (~sin(tilt) * height, e.g.
+        ~14-20cm at a modest 8-10 degree tilt while walking/balancing). Confirmed
+        directly: targets showing 20-30cm kinematic error live solved to 1-2cm in a
+        clean, static, zero-tilt frame with identical coordinates -- the solver was
+        never given a hard problem, it was given a corrupted one. "Ground-referenced"
+        is supposed to mean height-from-gravity + xy-from-facing-direction, regardless
+        of how much the robot happens to be leaning at this exact instant.
+        """
+        pos = (self.robot.data.root_pos_w[0] if root_pos is None else root_pos).clone()
         pos[2] = self._ground_z_w
-        quat = self.robot.data.root_quat_w[0]
+        quat = yaw_quat(self.robot.data.root_quat_w[0] if root_quat is None else root_quat)
         return torch.stack([quat_apply(quat, t) + pos for t in self.goal_pos_local], dim=0)
 
+    def _goal_ee_body_ids(self) -> list[int]:
+        """EE body id per ``self.goal_pos_local`` row, in the same order — arm_mode
+        "both" drives left at index 0 / right at index 1 (see _set_arm_target's L/R-key
+        selection); "left"/"right" each have a single goal slot for that one arm."""
+        if self.arm_mode == "both":
+            return [self._left_ee_body_id, self._right_ee_body_id]
+        return [self._left_ee_body_id if self.arm_mode == "left" else self._right_ee_body_id]
+
     def _update_goal_markers(self):
+        """Recolors each goal marker every frame by its *live* distance-to-goal —
+        green/yellow/red at _GOAL_MARKER_THRESHOLDS_CM (2/5cm) — so reach quality is
+        visible directly on the robot, not just in an offline plot (2026-07-27, added
+        for Phase 2's visual gate)."""
         world_goals = self._goal_positions_world()
+        ee_ids = self._goal_ee_body_ids()
+        ee_pos = torch.stack([self.robot.data.body_pos_w[0, i, :] for i in ee_ids], dim=0)
+        dist_cm = (world_goals - ee_pos).norm(dim=-1) * 100.0
+
+        marker_indices = torch.zeros(world_goals.shape[0], dtype=torch.long, device=self.device)
+        marker_indices[dist_cm > _GOAL_MARKER_THRESHOLDS_CM[0]] = 1
+        marker_indices[dist_cm > _GOAL_MARKER_THRESHOLDS_CM[1]] = 2
+
         inactive = torch.logical_not(self.arm_target_active)
         if bool(torch.any(inactive).item()):
             world_goals = world_goals.clone()
             world_goals[inactive, 2] = -10.0
-        self._goal_vis.visualize(world_goals)
+        self._goal_vis.visualize(world_goals, marker_indices=marker_indices)
 
     def _set_arm_target(self, arm_idx: int, target_local: torch.Tensor):
         self.goal_pos_local[arm_idx] = target_local
         self.arm_target_active[arm_idx] = True
 
-        n_per_arm = len(self.arm_joint_ids_robot) // (2 if self.arm_mode == "both" else 1)
-        start = arm_idx * n_per_arm if self.arm_mode == "both" else 0
-        with torch.inference_mode():
-            self._arm_homing[arm_idx if self.arm_mode == "both" else 0] = True
-            self._filtered_arm_delta[0, start:start + n_per_arm] = 0.0
+        if self.arm_backend == "ik":
+            # No homing-first phase for IK (see _compute_arm_targets_ik's docstring) —
+            # just tell the solver's smoothing filter this is a discontinuous target
+            # change (landmine #9 in ik_arm_integration_plan.md), so it doesn't blend
+            # in raw solutions from whatever the previous, unrelated target was.
+            current_q_full = self.robot.data.joint_pos[0, self.all_arm_joint_ids_robot].detach().cpu().numpy()
+            self.arm_ik.reset(current_q_full)
+            self._ik_retry_pending = True
+            self._ik_smoothed_root_quat = None  # re-seed from the live orientation next call
+        else:
+            n_per_arm = len(self.arm_joint_ids_robot) // (2 if self.arm_mode == "both" else 1)
+            start = arm_idx * n_per_arm if self.arm_mode == "both" else 0
+            with torch.inference_mode():
+                self._arm_homing[arm_idx if self.arm_mode == "both" else 0] = True
+                self._filtered_arm_delta[0, start:start + n_per_arm] = 0.0
 
         self._update_goal_markers()
         arm_label = ["left", "right"][arm_idx] if self.arm_mode == "both" else self.arm_mode
@@ -986,6 +1335,15 @@ class G1FullDemo:
         self._arm_homing.zero_()
         if self._mirror_enabled:
             self._mirror_homing = False
+        if self.arm_backend == "ik":
+            # A respawn is as discontinuous a jump as a new target — reset the
+            # solver's smoothing filter here too (landmine #9), not just in
+            # _set_arm_target.
+            current_q_full = self.robot.data.joint_pos[0, self.all_arm_joint_ids_robot].detach().cpu().numpy()
+            self.arm_ik.reset(current_q_full)
+            self._ik_retry_pending = True
+            self._ik_smoothed_root_pos = None
+            self._ik_smoothed_root_quat = None
         # No re-anchoring needed on respawn — targets are a fixed offset from the
         # torso, recomputed from the live pose every call.
 
@@ -1040,10 +1398,10 @@ def main():
             target_world = demo._goal_positions_world()
             arm_groups = []
             if demo.arm_mode in ("left", "both"):
-                arm_groups.append(("left", 0, demo.arm_body_ids[0]))
+                arm_groups.append(("left", 0, demo._left_ee_body_id))
             if demo.arm_mode in ("right", "both"):
                 arm_idx = 1 if demo.arm_mode == "both" else 0
-                arm_groups.append(("right", arm_idx, demo.arm_body_ids[-1]))
+                arm_groups.append(("right", arm_idx, demo._right_ee_body_id))
 
             dist_str = ""
             for label, gi, body_id in arm_groups:
@@ -1060,9 +1418,17 @@ def main():
             # recomputed every frame, so it reads the same whether the robot is
             # walking or standing still).
             root_xy = demo.robot.data.root_pos_w[0, :2]
+            debug_str = ""
+            if demo.arm_backend == "ik" and demo._ik_debug is not None:
+                d = demo._ik_debug
+                debug_str = (
+                    f"  [ik] kinematic_err={d['kinematic_err_cm']:.1f}cm "
+                    f"commanded_vs_solved={d['commanded_vs_solved_deg']:.1f}deg "
+                    f"actual_vs_solved={d['actual_vs_solved_deg']:.1f}deg"
+                )
             print(
                 f"[FullDemo] step={step:6d}  |cmd|={cmd_mag:.3f}  pos=({root_xy[0].item():+.2f}, {root_xy[1].item():+.2f})  "
-                f"arm_active={demo._has_active_arm_target()}" + dist_str
+                f"arm_active={demo._has_active_arm_target()}" + dist_str + debug_str
             )
 
         step += 1

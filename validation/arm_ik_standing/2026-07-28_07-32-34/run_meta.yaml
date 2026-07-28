@@ -1,0 +1,36 @@
+script: /home/spyros/Elm/Code/g1_locomotion/validation/eval_arm_ik_standing.py
+git_commit: 760c696
+started_at: '2026-07-28T07:32:34'
+args:
+  active_gpu: 0
+  anim_recording_enabled: false
+  anim_recording_start_time: 0
+  anim_recording_stop_time: 10
+  apply_tauff: true
+  arm: left
+  checkpoint: null
+  cpu: false
+  create_new_stage: false
+  device: cuda:0
+  enable_cameras: false
+  experiment_name: null
+  headless: true
+  hide_ui: true
+  hold_steps: 350
+  info: false
+  kit_args: ''
+  load_run: null
+  loco_checkpoint: chosen_checkpoints/walking_latest.pt
+  log_project_name: null
+  logger: null
+  num_targets: 15
+  physics_gpu: 0
+  rendering_mode: null
+  resume: false
+  root_smoothing_alpha: 1.0
+  run_name: null
+  seed: 42
+  settle_steps: 100
+  verbose: false
+  x_max: 0.31
+  xr: false

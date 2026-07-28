@@ -2,6 +2,10 @@
 
 This folder contains the curated deployable checkpoints that are intentionally kept in-repo.
 
+**Branch note (`ik_residuals`, 2026-07-27)**: unchanged for now — will be updated as the
+IK arm integration (`ik_arm_integration_plan.md`) lands, since that replaces the arm
+entry below with an IK-backed component rather than a promoted RL checkpoint.
+
 **Current state (2026-07-27), 29dof pivot — see `policy_status.md` (repo root) for the
 full, living status writeup this summary is kept in sync with:**
 

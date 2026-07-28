@@ -1,5 +1,13 @@
 # 29dof pivot — week retrospective (2026-07-21 to 2026-07-27)
 
+**Branch note (`ik_residuals`): this doc is frozen history from `main`, written at the
+moment the RL-only arm approach was set aside.** It's the "why" behind this branch's
+existence — the Walking section and the "why one combined policy" section are still
+fully accurate; the Arms section describes the pure-RL results that motivated the pivot
+to IK. For current/active work, read `ik_arm_integration_plan.md` instead. Not being
+updated further as IK work progresses — new findings belong in `policy_status.md` or
+the plan doc.
+
 What was actually tried this week and what it showed, in one place. This is a summary
 for orientation — `policy_status.md` (repo root) is the living, detailed source of
 truth this doc is derived from; when the two disagree, trust `policy_status.md`. Some
