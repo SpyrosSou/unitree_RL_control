@@ -65,6 +65,32 @@ def _arm_disturbance_phase(common_step_counter: int) -> int:
     return len(ArmMotionDisturbance._PHASE_STEP_BOUNDARIES)
 
 
+def _check_header_matches(path: str, expected_fieldnames: list[str]) -> None:
+    """Guard against appending rows with a different schema than what's already on disk.
+
+    2026-07-28: found the hard way — these wrappers open existing CSVs in append mode and
+    only write a header when the file is empty, so a column added to a wrapper's
+    fieldnames after a checkpoint's eval directory already has data in it (these live at
+    a fixed, checkpoint-keyed path, e.g. `<checkpoint_dir>/walking_eval/`, reused across
+    every eval invocation against that checkpoint, not a fresh timestamped directory —
+    intentional, so episode counts can accumulate across multiple eval sessions) means the
+    file's header silently stays stale forever. A reader (`csv.DictReader`, which takes the
+    header from row 1) then either KeyErrors on the new column or, worse, silently
+    misaligns if the column *count* happens to still match. Fail loudly here instead of
+    letting either of those happen quietly.
+    """
+    with open(path, newline="") as f:
+        existing_header = next(csv.reader(f), None)
+    if existing_header is not None and existing_header != expected_fieldnames:
+        raise RuntimeError(
+            f"{path} already exists with a different column schema than the current code "
+            f"produces (existing: {existing_header}; expected: {expected_fieldnames}). This "
+            "file is at a fixed, checkpoint-keyed path reused across eval runs — it almost "
+            "certainly predates a metrics/fieldname change. Delete or move the containing "
+            "eval directory and re-run rather than appending mismatched rows into it."
+        )
+
+
 class _DualCsvWriter:
     """Writes each finished-episode row to a detailed CSV (every column) and a slimmer
     summary CSV (just the convergence-relevant subset), so a quick glance doesn't require
@@ -90,6 +116,8 @@ class _DualCsvWriter:
         if self._detailed_file.tell() == 0:
             self._detailed_writer.writeheader()
             self._detailed_file.flush()
+        else:
+            _check_header_matches(self.detailed_path, detailed_fieldnames)
 
         if self._write_summary:
             self.summary_path = os.path.join(log_dir, f"{name}_summary.csv")
@@ -98,6 +126,8 @@ class _DualCsvWriter:
             if self._summary_file.tell() == 0:
                 self._summary_writer.writeheader()
                 self._summary_file.flush()
+            else:
+                _check_header_matches(self.summary_path, summary_fieldnames)
         else:
             self.summary_path = None
             self._summary_file = None
@@ -291,7 +321,16 @@ class StandingMetricsCsvWrapper(gym.Wrapper):
         current_contact_time = contact_sensor.data.current_contact_time[:, self._foot_body_ids]
         control_dt = env.step_dt
 
-        just_touched_down = current_contact_time <= control_dt
+        # 2026-07-28 fix: current_contact_time reads exactly 0 BOTH the instant contact
+        # resumes AND every tick a foot is still fully airborne (there's no "time in
+        # contact" while not in contact) — `<= control_dt` alone can't tell those apart,
+        # and matched the latter far more often in practice, overcounting massively
+        # (verified against real per-tick sensor data via
+        # testing/general_testing/check_step_count_metric.py: current_contact_time stuck
+        # at 0.0 for many consecutive ticks while current_air_time grew the whole time).
+        # Requiring > 0.0 too narrows the window to the single tick contact genuinely
+        # just began.
+        just_touched_down = (current_contact_time > 0.0) & (current_contact_time <= control_dt)
         was_a_real_step = last_air_time > self._STEP_AIR_TIME_THRESHOLD_S
         step_this_tick = (just_touched_down & was_a_real_step).any(dim=-1)
         self._episode_step_count += step_this_tick.long()
@@ -447,6 +486,24 @@ class WalkingMetricsCsvWrapper(gym.Wrapper):
     """
 
     _FOOT_BODY_NAME_PATTERN = ".*_ankle_roll_link"
+    _LEFT_FOOT_BODY_NAME_PATTERN = "left_ankle_roll_link"
+    _RIGHT_FOOT_BODY_NAME_PATTERN = "right_ankle_roll_link"
+    _LEFT_KNEE_JOINT_NAME = "left_knee_joint"
+    _RIGHT_KNEE_JOINT_NAME = "right_knee_joint"
+
+    # Same threshold/mechanism as StandingMetricsCsvWrapper._update_stepping_metrics —
+    # distinguishes a real corrective step (foot genuinely airborne) from contact-sensor
+    # noise around continuous ground contact.
+    _STEP_AIR_TIME_THRESHOLD_S = 0.05
+
+    # 2026-07-28: per-side breakdown, added because every metric above (knee angle, step
+    # count, air time) collapses left+right into one number (mean/max across both feet),
+    # which makes a real, user-visually-suspected asymmetry ("left leg favored,
+    # causing isolated imbalances") impossible to confirm or rule out after the fact —
+    # see the g1_rl_control/policy_status discussion 2026-07-28. Left/right here always
+    # means the robot's own left/right (not screen-relative).
+    _DRIFT_SNAPSHOT_INTERVAL_S = 2.0
+    _MAX_DRIFT_SNAPSHOTS = 10  # 20s episode / 2s cadence — see episode_length_s in the env cfg
 
     _SUMMARY_FIELDS = [
         "episode_index",
@@ -459,6 +516,9 @@ class WalkingMetricsCsvWrapper(gym.Wrapper):
         "fell",
         "mean_lin_vel_track_err_m_s",
         "heading_drift_deg",
+        "step_count",
+        "left_step_count",
+        "right_step_count",
     ]
 
     def __init__(self, env: gym.Env, log_dir: str, write_summary: bool = True):
@@ -505,8 +565,53 @@ class WalkingMetricsCsvWrapper(gym.Wrapper):
             (self._num_envs,), float("inf"), dtype=torch.float32, device=self._device
         )
 
+        # 2026-07-28: real stepping-event count, added because drift (net displacement)
+        # and foot-slip (sliding while in contact) both miss the specific failure the user
+        # visually flagged — a foot lifting and re-planting nearby, which can look like
+        # "stationary stepping" while netting out to good drift numbers. Same
+        # air-time-threshold mechanism as StandingMetricsCsvWrapper._update_stepping_metrics
+        # (ported here rather than switching eval_walking.py to that class, since this one
+        # already carries the drift/knee-angle tracking that class doesn't have).
+        self._episode_step_count = torch.zeros(self._num_envs, dtype=torch.long, device=self._device)
+        self._episode_max_foot_air_time = torch.zeros(self._num_envs, dtype=torch.float32, device=self._device)
+
+        # Per-side breakdown (see class docstring note above) — mirrors the combined
+        # fields above but split left/right instead of pooled.
+        self._left_foot_body_ids_robot: list[int] | None = None
+        self._left_foot_body_ids_sensor: list[int] | None = None
+        self._right_foot_body_ids_robot: list[int] | None = None
+        self._right_foot_body_ids_sensor: list[int] | None = None
+        self._left_knee_joint_ids: list[int] | None = None
+        self._right_knee_joint_ids: list[int] | None = None
+        self._episode_sum_knee_angle_left = torch.zeros(self._num_envs, dtype=torch.float32, device=self._device)
+        self._episode_sum_knee_angle_right = torch.zeros(self._num_envs, dtype=torch.float32, device=self._device)
+        self._episode_min_knee_angle_left = torch.full(
+            (self._num_envs,), float("inf"), dtype=torch.float32, device=self._device
+        )
+        self._episode_min_knee_angle_right = torch.full(
+            (self._num_envs,), float("inf"), dtype=torch.float32, device=self._device
+        )
+        self._episode_step_count_left = torch.zeros(self._num_envs, dtype=torch.long, device=self._device)
+        self._episode_step_count_right = torch.zeros(self._num_envs, dtype=torch.long, device=self._device)
+        self._episode_max_foot_air_time_left = torch.zeros(self._num_envs, dtype=torch.float32, device=self._device)
+        self._episode_max_foot_air_time_right = torch.zeros(self._num_envs, dtype=torch.float32, device=self._device)
+
+        # 2026-07-28: fixed-cadence heading-drift snapshots, added because the final
+        # per-episode drift number alone can't distinguish "one sudden shock mid-episode
+        # that the robot never recovers a clean heading from" vs. "slow continuous yaw-rate
+        # bias accumulating the whole time" — both produce the same final number. NaN
+        # means the episode ended (fell) before reaching that checkpoint, not "drift was
+        # exactly zero" — see _flush_finished_episodes.
+        self._drift_snapshots = torch.full(
+            (self._num_envs, self._MAX_DRIFT_SNAPSHOTS), float("nan"), dtype=torch.float32, device=self._device
+        )
+
     @staticmethod
     def _fieldnames() -> list[str]:
+        snapshot_cols = [
+            f"heading_drift_deg_t{int(round((i + 1) * WalkingMetricsCsvWrapper._DRIFT_SNAPSHOT_INTERVAL_S))}s"
+            for i in range(WalkingMetricsCsvWrapper._MAX_DRIFT_SNAPSHOTS)
+        ]
         return [
             "episode_index",
             "env_id",
@@ -525,7 +630,17 @@ class WalkingMetricsCsvWrapper(gym.Wrapper):
             "lateral_drift_m",
             "mean_knee_angle_deg",
             "min_knee_angle_deg",
-        ]
+            "left_knee_angle_deg",
+            "right_knee_angle_deg",
+            "min_left_knee_angle_deg",
+            "min_right_knee_angle_deg",
+            "step_count",
+            "max_foot_air_time_s",
+            "left_step_count",
+            "right_step_count",
+            "left_max_foot_air_time_s",
+            "right_max_foot_air_time_s",
+        ] + snapshot_cols
 
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
@@ -561,6 +676,17 @@ class WalkingMetricsCsvWrapper(gym.Wrapper):
         self._episode_sum_foot_slip[env_ids] = 0.0
         self._episode_sum_knee_angle[env_ids] = 0.0
         self._episode_min_knee_angle[env_ids] = float("inf")
+        self._episode_step_count[env_ids] = 0
+        self._episode_max_foot_air_time[env_ids] = 0.0
+        self._episode_sum_knee_angle_left[env_ids] = 0.0
+        self._episode_sum_knee_angle_right[env_ids] = 0.0
+        self._episode_min_knee_angle_left[env_ids] = float("inf")
+        self._episode_min_knee_angle_right[env_ids] = float("inf")
+        self._episode_step_count_left[env_ids] = 0
+        self._episode_step_count_right[env_ids] = 0
+        self._episode_max_foot_air_time_left[env_ids] = 0.0
+        self._episode_max_foot_air_time_right[env_ids] = 0.0
+        self._drift_snapshots[env_ids] = float("nan")
 
         # self.unwrapped's robot state here already reflects the *new* episode's initial
         # pose: reset_buffers is only ever called right after the underlying env has
@@ -599,6 +725,8 @@ class WalkingMetricsCsvWrapper(gym.Wrapper):
         self._episode_sum_foot_slip += self._foot_slip_speed(env, robot).detach().float()
         self._update_drift_metrics(env, robot, command)
         self._update_knee_metrics(robot)
+        self._update_stepping_metrics(env)
+        self._update_drift_snapshot(env)
 
     def _update_knee_metrics(self, robot):
         if self._knee_joint_ids is None:
@@ -606,6 +734,16 @@ class WalkingMetricsCsvWrapper(gym.Wrapper):
         knee_pos = robot.data.joint_pos[:, self._knee_joint_ids].detach().float()
         self._episode_sum_knee_angle += knee_pos.mean(dim=-1)
         self._episode_min_knee_angle = torch.minimum(self._episode_min_knee_angle, knee_pos.amin(dim=-1))
+
+        if self._left_knee_joint_ids is None:
+            self._left_knee_joint_ids, _ = robot.find_joints([self._LEFT_KNEE_JOINT_NAME])
+            self._right_knee_joint_ids, _ = robot.find_joints([self._RIGHT_KNEE_JOINT_NAME])
+        left_knee_pos = robot.data.joint_pos[:, self._left_knee_joint_ids].detach().float().squeeze(-1)
+        right_knee_pos = robot.data.joint_pos[:, self._right_knee_joint_ids].detach().float().squeeze(-1)
+        self._episode_sum_knee_angle_left += left_knee_pos
+        self._episode_sum_knee_angle_right += right_knee_pos
+        self._episode_min_knee_angle_left = torch.minimum(self._episode_min_knee_angle_left, left_knee_pos)
+        self._episode_min_knee_angle_right = torch.minimum(self._episode_min_knee_angle_right, right_knee_pos)
 
     def _update_drift_metrics(self, env, robot, command: torch.Tensor):
         dt = env.step_dt
@@ -638,6 +776,89 @@ class WalkingMetricsCsvWrapper(gym.Wrapper):
         in_contact = contact_sensor.data.current_contact_time[:, self._foot_body_ids_sensor] > 0.0
         foot_vel = robot.data.body_lin_vel_w[:, self._foot_body_ids_robot, :2]
         return (foot_vel.norm(dim=-1) * in_contact).sum(dim=-1)
+
+    def _update_stepping_metrics(self, env):
+        """Count real corrective steps (foot lift + re-plant), independent of whether they
+        net out to ~0 displacement — see StandingMetricsCsvWrapper._update_stepping_metrics
+        for the identical mechanism this mirrors. Net drift alone can look fine even while
+        the robot is visibly taking steps in place; this catches that directly."""
+        contact_sensor = env.scene.sensors.get("contact_forces")
+        if contact_sensor is None or contact_sensor.data.last_air_time is None:
+            return
+
+        if self._foot_body_ids_sensor is None:
+            self._foot_body_ids_robot, _ = env.scene["robot"].find_bodies(self._FOOT_BODY_NAME_PATTERN)
+            self._foot_body_ids_sensor, _ = contact_sensor.find_bodies(self._FOOT_BODY_NAME_PATTERN)
+
+        last_air_time = contact_sensor.data.last_air_time[:, self._foot_body_ids_sensor]
+        current_contact_time = contact_sensor.data.current_contact_time[:, self._foot_body_ids_sensor]
+        control_dt = env.step_dt
+
+        # 2026-07-28 fix: current_contact_time reads exactly 0 BOTH the instant contact
+        # resumes AND every tick a foot is still fully airborne (there's no "time in
+        # contact" while not in contact) — `<= control_dt` alone can't tell those apart,
+        # and matched the latter far more often in practice, overcounting massively
+        # (verified against real per-tick sensor data via
+        # testing/general_testing/check_step_count_metric.py: current_contact_time stuck
+        # at 0.0 for many consecutive ticks while current_air_time grew the whole time).
+        # Requiring > 0.0 too narrows the window to the single tick contact genuinely
+        # just began.
+        just_touched_down = (current_contact_time > 0.0) & (current_contact_time <= control_dt)
+        was_a_real_step = last_air_time > self._STEP_AIR_TIME_THRESHOLD_S
+        step_this_tick = (just_touched_down & was_a_real_step).any(dim=-1)
+        self._episode_step_count += step_this_tick.long()
+
+        current_air_time = contact_sensor.data.current_air_time[:, self._foot_body_ids_sensor]
+        self._episode_max_foot_air_time = torch.maximum(
+            self._episode_max_foot_air_time, current_air_time.amax(dim=-1).detach().float()
+        )
+
+        # Per-side breakdown — identical mechanism, just one foot at a time instead of
+        # pooled across both (see class docstring note on why this was added).
+        if self._left_foot_body_ids_sensor is None:
+            self._left_foot_body_ids_robot, _ = env.scene["robot"].find_bodies(self._LEFT_FOOT_BODY_NAME_PATTERN)
+            self._left_foot_body_ids_sensor, _ = contact_sensor.find_bodies(self._LEFT_FOOT_BODY_NAME_PATTERN)
+            self._right_foot_body_ids_robot, _ = env.scene["robot"].find_bodies(self._RIGHT_FOOT_BODY_NAME_PATTERN)
+            self._right_foot_body_ids_sensor, _ = contact_sensor.find_bodies(self._RIGHT_FOOT_BODY_NAME_PATTERN)
+
+        for side, sensor_ids, sum_count, sum_air_time in (
+            ("left", self._left_foot_body_ids_sensor, "_episode_step_count_left", "_episode_max_foot_air_time_left"),
+            ("right", self._right_foot_body_ids_sensor, "_episode_step_count_right", "_episode_max_foot_air_time_right"),
+        ):
+            # Re-slice from the sensor's raw (full-width) data, NOT from
+            # last_air_time/current_contact_time/current_air_time above — those are
+            # already narrowed to the combined 2-wide foot index space
+            # (self._foot_body_ids_sensor), so indexing them with sensor_ids (indices
+            # into the sensor's FULL body list) is an out-of-bounds access whenever the
+            # sensor tracks more than just the two feet (confirmed via a real CUDA
+            # device-side assert, 2026-07-28 — see g1_rl_control chat notes).
+            side_contact = contact_sensor.data.current_contact_time[:, sensor_ids]
+            side_last_air = contact_sensor.data.last_air_time[:, sensor_ids]
+            side_air_now = contact_sensor.data.current_air_time[:, sensor_ids]
+            side_touched_down = (side_contact > 0.0) & (side_contact <= control_dt)
+            side_real_step = side_last_air > self._STEP_AIR_TIME_THRESHOLD_S
+            side_step_this_tick = (side_touched_down & side_real_step).any(dim=-1)
+            setattr(self, sum_count, getattr(self, sum_count) + side_step_this_tick.long())
+            setattr(
+                self, sum_air_time,
+                torch.maximum(getattr(self, sum_air_time), side_air_now.amax(dim=-1).detach().float()),
+            )
+
+    def _update_drift_snapshot(self, env):
+        """Record heading_drift_deg at a fixed cadence during the episode (not just the
+        final value) — see class docstring on _DRIFT_SNAPSHOT_INTERVAL_S for why: the
+        final number alone can't tell a sudden mid-episode shock apart from slow
+        continuous drift, and both look identical in the existing single-column output."""
+        interval_steps = max(1, round(self._DRIFT_SNAPSHOT_INTERVAL_S / env.step_dt))
+        due = (self._episode_steps % interval_steps == 0) & (self._episode_steps > 0)
+        if not bool(due.any()):
+            return
+        for env_id in due.nonzero(as_tuple=False).squeeze(-1).tolist():
+            slot = int(self._episode_steps[env_id].item()) // interval_steps - 1
+            if slot >= self._MAX_DRIFT_SNAPSHOTS:
+                continue
+            heading_drift_deg, _ = self._drift_for_env(env_id)
+            self._drift_snapshots[env_id, slot] = heading_drift_deg
 
     def _drift_for_env(self, env_id: int) -> tuple[float, float]:
         """(heading_drift_deg, lateral_drift_m) for one just-finished episode.
@@ -686,7 +907,21 @@ class WalkingMetricsCsvWrapper(gym.Wrapper):
                 "lateral_drift_m": lateral_drift_m,
                 "mean_knee_angle_deg": math.degrees(self._episode_sum_knee_angle[env_id].item() / steps),
                 "min_knee_angle_deg": math.degrees(self._episode_min_knee_angle[env_id].item()),
+                "left_knee_angle_deg": math.degrees(self._episode_sum_knee_angle_left[env_id].item() / steps),
+                "right_knee_angle_deg": math.degrees(self._episode_sum_knee_angle_right[env_id].item() / steps),
+                "min_left_knee_angle_deg": math.degrees(self._episode_min_knee_angle_left[env_id].item()),
+                "min_right_knee_angle_deg": math.degrees(self._episode_min_knee_angle_right[env_id].item()),
+                "step_count": int(self._episode_step_count[env_id].item()),
+                "max_foot_air_time_s": float(self._episode_max_foot_air_time[env_id].item()),
+                "left_step_count": int(self._episode_step_count_left[env_id].item()),
+                "right_step_count": int(self._episode_step_count_right[env_id].item()),
+                "left_max_foot_air_time_s": float(self._episode_max_foot_air_time_left[env_id].item()),
+                "right_max_foot_air_time_s": float(self._episode_max_foot_air_time_right[env_id].item()),
             }
+            for i in range(self._MAX_DRIFT_SNAPSHOTS):
+                col = f"heading_drift_deg_t{int(round((i + 1) * self._DRIFT_SNAPSHOT_INTERVAL_S))}s"
+                val = self._drift_snapshots[env_id, i].item()
+                row[col] = "" if math.isnan(val) else val
             self._csv.write_row(row)
             self._episode_index[env_id] += 1
         self._reset_buffers(env_ids)
@@ -694,6 +929,19 @@ class WalkingMetricsCsvWrapper(gym.Wrapper):
 
 class ArmMetricsCsvWrapper(gym.Wrapper):
     """Collect per-episode reach-quality metrics for the arm IK task."""
+
+    # 2026-07-28: distance-to-goal over time, added to directly test a real hypothesis
+    # (g1_full_demo.py visual observation) that failed episodes are running out of the
+    # episode's time budget while still closing in on the goal, rather than plateauing
+    # somewhere and never improving further — min_dist_to_goal_cm alone can't distinguish
+    # these (both produce "min distance stayed above 2cm"). final_dist_to_goal_cm (the
+    # LAST tick's distance, not the best-ever) plus fixed-cadence snapshots give the
+    # actual trajectory shape: final_dist_to_goal_cm close to min_dist_to_goal_cm AND
+    # still dropping in the last snapshot(s) means "still converging at timeout" (the
+    # speed hypothesis); final_dist_to_goal_cm much larger than the min (or flat across
+    # the last several snapshots) means "reached its best point then stalled/overshot",
+    # a different failure mode entirely.
+    _DIST_SNAPSHOT_INTERVAL_S = 1.0
 
     _SUMMARY_FIELDS = [
         "episode_index",
@@ -736,6 +984,20 @@ class ArmMetricsCsvWrapper(gym.Wrapper):
             self.unwrapped.scene, "env_origins"
         )
 
+        # Sized dynamically off the wrapped env's own step_dt/max_episode_length rather
+        # than a hardcoded episode length, so this works unchanged whether it's wrapping
+        # the standard 10s/300-step task, GoalCurriculum, or the 45s LongHold eval class.
+        self._dist_snapshot_interval_steps = max(
+            1, round(self._DIST_SNAPSHOT_INTERVAL_S / self.unwrapped.step_dt)
+        )
+        self._max_dist_snapshots = max(
+            1, int(self.unwrapped.max_episode_length) // self._dist_snapshot_interval_steps
+        )
+        self._episode_last_dist = torch.zeros(self._num_envs, dtype=torch.float32, device=self._device)
+        self._dist_snapshots = torch.full(
+            (self._num_envs, self._max_dist_snapshots), float("nan"), dtype=torch.float32, device=self._device
+        )
+
         self._csv = _DualCsvWriter(log_dir, "arm", self._fieldnames(), self._SUMMARY_FIELDS, self._write_summary)
         self.csv_path = self._csv.detailed_path
 
@@ -769,10 +1031,15 @@ class ArmMetricsCsvWrapper(gym.Wrapper):
             "max_dist_to_goal_cm",
             "wobble_active",
             "min_torso_dist_cm",
+            "final_dist_to_goal_cm",
         ]
         base += [f"{name}_deg_at_min_dist" for name in self._arm_joint_names]
         if self._log_goal_position:
             base += ["goal_x_m", "goal_y_m", "goal_z_m"]
+        base += [
+            f"dist_to_goal_cm_t{round((i + 1) * self._DIST_SNAPSHOT_INTERVAL_S, 1)}s"
+            for i in range(self._max_dist_snapshots)
+        ]
         return base
 
     def reset(self, **kwargs):
@@ -806,6 +1073,8 @@ class ArmMetricsCsvWrapper(gym.Wrapper):
         self._episode_min_dist[env_ids] = float("inf")
         self._episode_max_dist[env_ids] = 0.0
         self._episode_min_torso_dist[env_ids] = float("inf")
+        self._episode_last_dist[env_ids] = 0.0
+        self._dist_snapshots[env_ids] = float("nan")
         if self._arm_joint_ids is not None:
             self._episode_joint_pos_at_min_dist[env_ids] = 0.0
 
@@ -836,10 +1105,25 @@ class ArmMetricsCsvWrapper(gym.Wrapper):
                 self._episode_joint_pos_at_min_dist[is_new_min] = current_joint_pos[is_new_min].detach().float()
         self._episode_min_dist = torch.minimum(self._episode_min_dist, worst_dist)
         self._episode_max_dist = torch.maximum(self._episode_max_dist, worst_dist)
+        self._episode_last_dist = worst_dist
         if torso_body_idx is not None:
             self._episode_min_torso_dist = torch.minimum(
                 self._episode_min_torso_dist, closest_torso_dist.detach().float()
             )
+        self._update_dist_snapshot()
+
+    def _update_dist_snapshot(self):
+        """Record dist-to-goal at a fixed cadence during the episode — see class
+        docstring on _DIST_SNAPSHOT_INTERVAL_S for why: min/max distance alone can't show
+        the trajectory shape (still converging vs. plateaued vs. overshot)."""
+        due = (self._episode_steps % self._dist_snapshot_interval_steps == 0) & (self._episode_steps > 0)
+        if not bool(due.any()):
+            return
+        for env_id in due.nonzero(as_tuple=False).squeeze(-1).tolist():
+            slot = int(self._episode_steps[env_id].item()) // self._dist_snapshot_interval_steps - 1
+            if slot >= self._max_dist_snapshots:
+                continue
+            self._dist_snapshots[env_id, slot] = self._episode_last_dist[env_id]
 
     def _flush_finished_episodes(self, done_mask: torch.Tensor, terminated: torch.Tensor, truncated: torch.Tensor):
         env_ids = done_mask.nonzero(as_tuple=False).squeeze(-1)
@@ -877,6 +1161,7 @@ class ArmMetricsCsvWrapper(gym.Wrapper):
                 "max_dist_to_goal_cm": float(self._episode_max_dist[env_id].item()) * 100.0,
                 "wobble_active": wobble_active,
                 "min_torso_dist_cm": min_torso_dist * 100.0 if min_torso_dist != float("inf") else "",
+                "final_dist_to_goal_cm": float(self._episode_last_dist[env_id].item()) * 100.0,
             }
             if self._arm_joint_ids is not None:
                 joint_pos_deg = torch.rad2deg(self._episode_joint_pos_at_min_dist[env_id]).tolist()
@@ -893,6 +1178,10 @@ class ArmMetricsCsvWrapper(gym.Wrapper):
                 # convention, so it's directly comparable to the goal-box definition.
                 goal_local = (env.goal_positions[env_id, 0, :] - env.scene.env_origins[env_id]).tolist()
                 row["goal_x_m"], row["goal_y_m"], row["goal_z_m"] = goal_local
+            for i in range(self._max_dist_snapshots):
+                col = f"dist_to_goal_cm_t{round((i + 1) * self._DIST_SNAPSHOT_INTERVAL_S, 1)}s"
+                val = self._dist_snapshots[env_id, i].item()
+                row[col] = "" if math.isnan(val) else val * 100.0
             self._csv.write_row(row)
             self._episode_index[env_id] += 1
         self._reset_buffers(env_ids)

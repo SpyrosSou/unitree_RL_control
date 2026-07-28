@@ -224,6 +224,28 @@ class G1ArmEnvCfg(DirectRLEnvCfg):
     action_filter_alpha: float = 0.25
     max_action_delta_per_step: float = 0.06
 
+    # 2026-07-28: distance-adaptive rate limit — off by default, every existing task
+    # unaffected. Motivated by a real visual observation (g1_full_demo.py) that the arm
+    # moves noticeably slowly throughout an entire reach, plausibly running out of the
+    # episode's time budget while still closing in on a distant goal rather than ever
+    # actually converging — consistent with `policy_status.md`'s own finding that only
+    # 1.4% of failed eval episodes ever got within the 2cm success radius (i.e. most
+    # failures aren't "reached but didn't hold," they're "never got close"), though
+    # that alone doesn't prove a speed problem specifically (see the new
+    # dist_to_goal_cm_at_t*/final_dist_to_goal_cm eval columns for a more direct check).
+    # This is NOT the same thing as the already-tried-and-rejected uniform rate-limit
+    # relaxation (action_filter_alpha 0.25->0.6, max_action_delta_per_step 0.06->0.15 —
+    # see G1ArmLeftEnvCfg_RateLimit, final eval 21-24% vs baseline's 27-30%, i.e. worse):
+    # that sped up movement everywhere, including right at the goal, which plausibly
+    # hurt final settling precision. This instead keeps max_action_delta_per_step (the
+    # existing, precision-tuned value) unchanged near the goal, and only raises the cap
+    # while still far away — trying to get faster traversal without touching the
+    # behavior that produces precise settling.
+    use_adaptive_rate_limit: bool = False
+    max_action_delta_per_step_far: float = 0.18
+    adaptive_rate_limit_near_dist_m: float = 0.05
+    adaptive_rate_limit_far_dist_m: float = 0.20
+
     # Fraction of the (real hardware) joint range each reset randomizes the arm's
     # starting position within, centered on the hardware range's own midpoint.
     reset_range_fraction: float = 0.15
@@ -538,6 +560,39 @@ class G1ArmLeftAblationRateLimitEnvCfg(G1ArmLeftEnvCfg):
 
     action_filter_alpha: float = 0.6
     max_action_delta_per_step: float = 0.15
+
+
+@configclass
+class G1ArmLeftAdaptiveRateEnvCfg(G1ArmLeftEnvCfg):
+    """2026-07-28: distance-adaptive rate limit — see G1ArmEnvCfg's
+    use_adaptive_rate_limit field docstring for the full mechanism and how this differs
+    from the already-tried-and-rejected G1ArmLeftAblationRateLimitEnvCfg (that one raised
+    the rate limit uniformly, everywhere, including right at the goal, and ended up
+    worse: 21-24% vs baseline's 27-30% final eval, despite looking better early —
+    policy_status.md flags this as "the one case where the early-signal heuristic was
+    misleading," so don't over-trust an early read here either).
+
+    Motivated by a direct visual observation (g1_full_demo.py, 2026-07-28) that the arm
+    moves noticeably slowly throughout an entire reach, plausibly running out of the
+    episode's time budget while still closing in on a distant goal — separately
+    consistent with (not proof of, see the module's own eval-column additions for a
+    direct check) `policy_status.md`'s finding that only 1.4% of failed eval episodes
+    ever got within the 2cm success radius, and that failure is uniform across the whole
+    goal box (not clustered at hard-to-reach regions) — a "never got close, regardless of
+    where the goal was" pattern is at least dimensionally consistent with "ran out of
+    time before arriving," though a slow policy and a poorly-converged one would look
+    similar from aggregate stats alone; the new final_dist_to_goal_cm/
+    dist_to_goal_cm_at_t* eval columns are what actually distinguishes them.
+
+    max_action_delta_per_step_far/adaptive_rate_limit_near_dist_m/
+    adaptive_rate_limit_far_dist_m are all first-guess starting points, not tuned
+    values (same spirit as every other new lever in this project) — chosen so behavior
+    within 5cm of the goal exactly matches the existing, precision-tuned baseline
+    (unchanged max_action_delta_per_step=0.06), while beyond 20cm it can move up to 3x
+    faster (0.18 rad/step, comparable in magnitude to the rejected uniform ablation's
+    0.15, but only far from the goal instead of everywhere)."""
+
+    use_adaptive_rate_limit: bool = True
 
 
 @configclass
@@ -881,9 +936,27 @@ class G1ArmEnv(DirectRLEnv):
 
         current = self.robot.data.joint_pos[:, self.arm_joint_indices_tensor]
         delta = self.filtered_actions * self.cfg.action_scale
-        max_delta = float(self.cfg.max_action_delta_per_step)
-        if max_delta > 0.0:
-            delta = delta.clamp(min=-max_delta, max=max_delta)
+        base_max_delta = float(self.cfg.max_action_delta_per_step)
+
+        if self.cfg.use_adaptive_rate_limit and base_max_delta > 0.0:
+            # Per-arm, per-env rate limit: base_max_delta (the existing, precision-tuned
+            # value) near the goal, ramping up to max_action_delta_per_step_far while
+            # still far away — see cfg field docstring for the full rationale. Computed
+            # per arm group since each arm has its own end-effector/goal and its own
+            # slice of the flat delta tensor (self._arm_groups' "action_slice").
+            far_max_delta = float(self.cfg.max_action_delta_per_step_far)
+            near_d = float(self.cfg.adaptive_rate_limit_near_dist_m)
+            far_d = float(self.cfg.adaptive_rate_limit_far_dist_m)
+            span = max(far_d - near_d, 1e-6)
+            for i, arm in enumerate(self._arm_groups):
+                ee_pos = self.robot.data.body_pos_w[:, arm["ee_idx"], :]
+                dist = torch.norm(self.goal_positions[:, i, :] - ee_pos, dim=-1)  # (N,)
+                frac = ((dist - near_d) / span).clamp(0.0, 1.0)
+                per_env_max_delta = (base_max_delta + (far_max_delta - base_max_delta) * frac).unsqueeze(-1)
+                sl = arm["action_slice"]
+                delta[:, sl] = torch.max(torch.min(delta[:, sl], per_env_max_delta), -per_env_max_delta)
+        elif base_max_delta > 0.0:
+            delta = delta.clamp(min=-base_max_delta, max=base_max_delta)
 
         targets = current + delta
         targets = targets.clamp(self._arm_hw_limits[:, 0], self._arm_hw_limits[:, 1])

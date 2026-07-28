@@ -648,6 +648,175 @@ class G1LocomotionArmDisturbanceStartFullCmdRangeEnvCfg(G1LocomotionArmDisturban
 
 
 @configclass
+class G1LocomotionArmDisturbanceLooseHeightEnvCfg(G1LocomotionArmDisturbanceEnvCfg):
+    """``G1LocomotionArmDisturbanceEnvCfg`` (the walking_latest.pt recipe) plus one change:
+    ``base_height``'s weight loosened from -10 to -4.
+
+    2026-07-27: `policy_status.md`'s "Potential improvement — base_height rigidity"
+    hypothesis, acted on. base_height (mdp.base_height_l2, target 0.78m) is by far the
+    strongest single term in this recipe at -10 — holding pelvis height exactly is
+    geometrically cheapest with near-straight legs, and live visual inspection during the
+    round-2 drift work found near-extended knees during straight walking with occasional
+    foot-crossing/asymmetric-length corrective steps, which the user has now separately
+    and independently reported as visible "little steps"/wobbling while standing that
+    affects the arm policy. User is open to a few cm of height variation (not a full squat
+    like a pre-29dof-pivot policy) if it buys smoother, more human-like balance recovery
+    margin. -4 is a starting point, not a tuned value (same spirit as this project's other
+    starting-point reward changes) — check `eval_walking.py`'s knee-angle tracking
+    (`mean_knee_angle_deg`/`min_knee_angle_deg`, section 4's knee-vs-drift correlation)
+    after training to see whether it moved in the expected direction, and the demo's own
+    visual read for whether the wobbling actually reduced.
+
+    MUST be a real training run, not a post-hoc reward change on an already-trained
+    checkpoint — this changes what the policy is optimized against. Resume/warm-start
+    from `chosen_checkpoints/walking_latest.pt` (the current safe checkpoint, untouched
+    by this experiment — a fresh log directory, not an in-place resume) rather than a
+    fresh from-scratch run, since this is a small, targeted reward tweak on an already-
+    converged policy, not a new capability requiring the full curriculum from scratch.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.rewards.base_height.weight = -4
+
+
+@configclass
+class G1LocomotionArmDisturbanceLooseHeight2EnvCfg(G1LocomotionArmDisturbanceEnvCfg):
+    """Same as ``G1LocomotionArmDisturbanceLooseHeightEnvCfg`` but -2 instead of -4.
+
+    2026-07-28: the -4 result (2000-iter resume from walking_latest.pt) cut stand_still
+    drift substantially (heading 45.2deg->14.4deg, lateral 0.77m->0.50m) with no fall-rate
+    regression, at the cost of forward_fast's heading drift roughly tripling (18.2deg->
+    51.2deg) — the other 3 straight buckets (forward_slow/medium, backward) all improved
+    too. User's priority is standing specifically (a stationary base for the arm policy to
+    reference, not fast locomotion — realistic top speed is expected to stay at/under
+    forward_medium), so the -4 result's one cost doesn't matter for the actual use case.
+    Given that, and given tensorboard showed -4's own training run (both
+    Metrics/base_velocity/error_vel_yaw and Episode_Reward/base_height) had already gone
+    flat well within its 2000 iterations — continuing that exact run further has limited
+    expected upside — the more informative next single-variable step is a STRONGER pull
+    on the same lever, not a milder one: does standing drift keep improving as base_height
+    loosens further, or was -4 already near a ceiling? Resumes from
+    chosen_checkpoints/walking_latest.pt (same baseline as the -4 experiment, not chained
+    off the -4 result) so both remain clean, independently-comparable siblings against the
+    same starting point.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.rewards.base_height.weight = -2
+
+
+@configclass
+class G1LocomotionArmDisturbanceLooseHeightNoStepEnvCfg(G1LocomotionArmDisturbanceLooseHeightEnvCfg):
+    """``G1LocomotionArmDisturbanceLooseHeightEnvCfg`` (base_height -10->-4, the checkpoint
+    already promoted as an improvement) plus one addition: ``mdp.feet_contact_without_cmd``
+    (already present in this project's ``rewards.py`` — ported verbatim from
+    ``unitree_rl_lab`` 2026-07-21 along with everything else in that file, but never wired
+    into any ``RewardsCfg`` until now) — rewards both feet being in ground contact whenever
+    the commanded velocity is ~0, i.e. directly prices in "don't lift a foot while
+    standing," rather than hoping some other reward's side effect achieves it.
+
+    2026-07-28: verified via `testing/general_testing/check_step_count_metric.py` (a real
+    per-tick contact-sensor bug fixed the same day — see metrics_wrappers.py's
+    `_update_stepping_metrics`) that the -4 checkpoint cut net stand-still drift 68%/35%
+    (heading/lateral) but barely touched actual stepping (mean step count 42.95->40.12,
+    mean max foot air time 0.458s->0.445s, both ~3-7% — i.e. -4 likely improved the
+    *outcome* by making steps more symmetric/self-canceling, not by reducing how much the
+    robot actually steps). This is the direct fix for that gap: a term that's positive
+    specifically for ground contact under a near-zero command, rather than another lever
+    on drift.
+
+    weight=1.0 is a starting point, not a tuned value (same spirit as every other reward
+    change in this project) — chosen to be comparable in scale to the existing active
+    `gait` term (weight 0.5, max per-tick reward ~1 during walking) without dominating the
+    ~20-term balance the way two-new-competing-terms did in the drift-fix rounds (see
+    `policy_status.md`'s round 1 writeup) — this is one new additive term, not two, and it
+    doesn't replace/compete with anything the policy already depends on.
+
+    Resumes from the ALREADY-TRAINED -4 checkpoint (`LooseHeightEnvCfg`'s own result,
+    `logs/rsl_rl/walking/arm_disturbance/2026-07-28_09-01-09/model_17997.pt`), not from
+    `walking_latest.pt` — user explicitly wants to keep -4's drift win and add this on top,
+    not re-test it as an independent sibling. Known risk, flagged not avoided: warm-starting
+    into a changed reward composition risks a stale critic (exactly what `policy_status.md`
+    flags as one of two suspected causes of round 1's regression) — this is one new term,
+    not two, and it's short (2-3k iters, user's explicit choice, not overnight) specifically
+    so a bad outcome is cheap to notice and abandon.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.rewards.feet_contact_without_cmd = RewTerm(
+            func=mdp.feet_contact_without_cmd,
+            weight=1.0,
+            params={
+                "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*ankle_roll.*"),
+                "command_name": "base_velocity",
+            },
+        )
+
+
+@configclass
+class G1LocomotionArmDisturbanceLooseHeightNoStepMirrorEnvCfg(G1LocomotionArmDisturbanceLooseHeightNoStepEnvCfg):
+    """``G1LocomotionArmDisturbanceLooseHeightNoStepEnvCfg`` (the model_20996 checkpoint,
+    already promoted for its huge stand-still win) plus one addition: ``mdp.joint_mirror``
+    (already present in ``rewards.py`` — ported verbatim from ``unitree_rl_lab`` 2026-07-21
+    along with everything else in that file, but never wired into any ``RewardsCfg`` until
+    now) — penalizes the squared difference between each left/right leg joint pair, i.e.
+    directly prices in bilateral gait symmetry rather than hoping it falls out of the
+    existing terms.
+
+    2026-07-28: added in response to a real, measured asymmetry, not a hunch. The full
+    eval of model_20996 (see `policy_status.md`) found the RIGHT knee bends 5-7 degrees
+    more than the left across every forward-walking speed (`right_knee_angle_deg` vs
+    `left_knee_angle_deg` in `WalkingMetricsCsvWrapper`'s per-episode CSV, same direction
+    at every tested speed — not noise), the right foot holds longer air time throughout,
+    and during `turn_left` specifically the right leg steps ~6 more times than the left
+    over a 20s episode (vs. near-parity in `turn_right`) — a plausible mechanism for both
+    the sustained ~3.2 deg/s heading-drift bias found during straight walking (confirmed,
+    via new fixed-cadence drift snapshots, to be a smooth continuous bias across all 256
+    `forward_slow` episodes, not concentrated stumble events — though the snapshot
+    cadence is only 2s, so it cannot rule out faster opposite-signed events that
+    partially cancel within a window) and `turn_left`'s much higher eventual fall rate
+    (the overworked right leg destabilizing under sustained left-turn load).
+
+    Covers all 6 leg joint pairs (hip_pitch/roll/yaw, knee, ankle_pitch/roll) rather than
+    knee alone — bilateral symmetry is the general property being priced in, and the
+    step-count/air-time asymmetry already hints at ankle-level involvement beyond just
+    the knee. weight=-1.0 is a starting point, not a tuned value (same spirit as every
+    other reward change in this project) — a squared-radian-difference term with 6 joint
+    pairs is a very different scale than a 0/1 boolean-ish term like
+    `feet_contact_without_cmd`, so this needs its own real tuning pass once a first
+    training run shows whether the *sign* of the effect (does drift/turn_left actually
+    improve) is right before spending time on magnitude.
+
+    Resumes from the ALREADY-TRAINED model_20996 checkpoint (this class's own parent
+    recipe's result), not from `walking_latest.pt` — keeps the stand-still win and adds
+    this on top, consistent with how the NoStep experiment itself was layered onto
+    LooseHeight. Same warm-start-risks-a-stale-critic caveat as every prior layered
+    experiment in this file — kept short (2-3k iters) for the same reason.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.rewards.joint_mirror = RewTerm(
+            func=mdp.joint_mirror,
+            weight=-1.0,
+            params={
+                "asset_cfg": SceneEntityCfg("robot"),
+                "mirror_joints": [
+                    ["left_hip_pitch_joint", "right_hip_pitch_joint"],
+                    ["left_hip_roll_joint", "right_hip_roll_joint"],
+                    ["left_hip_yaw_joint", "right_hip_yaw_joint"],
+                    ["left_knee_joint", "right_knee_joint"],
+                    ["left_ankle_pitch_joint", "right_ankle_pitch_joint"],
+                    ["left_ankle_roll_joint", "right_ankle_roll_joint"],
+                ],
+            },
+        )
+
+
+@configclass
 class G1LocomotionArmDisturbanceEnvCfg_PLAY(G1LocomotionArmDisturbanceEnvCfg):
     """Play/eval variant — same PLAY overrides as ``G1LocomotionEnvCfg_PLAY``, plus starting the
     arm-disturbance phase further along so it's visible quickly (same pattern the 23dof-era

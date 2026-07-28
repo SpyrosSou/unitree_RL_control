@@ -1,36 +1,32 @@
-script: /home/spyros/Elm/Code/g1_locomotion/validation/eval_walking.py
+script: /home/spyros/Elm/Code/g1_locomotion/validation/eval_arm.py
 git_commit: a7c9375
-started_at: '2026-07-28T11:25:15'
+started_at: '2026-07-28T17:01:36'
 args:
   active_gpu: 0
   anim_recording_enabled: false
   anim_recording_start_time: 0
   anim_recording_stop_time: 10
-  arm_disturbance: true
   buckets:
-  - stand_still
-  checkpoint: chosen_checkpoints/walking_latest.pt
+  - no_wobble
+  - with_wobble
+  checkpoint: chosen_checkpoints/arm_left_latest.pt
   cpu: false
   create_new_stage: false
   device: cuda:0
-  displacement_speed: 0.6
-  displacement_steps: 500
   enable_cameras: false
+  goal_x_range: null
   headless: true
+  hidden_dims: null
   hide_ui: true
   info: false
   kit_args: ''
+  legacy32: true
+  locked_wrist: false
+  log_std: false
   num_envs: 256
-  phases:
-  - 0
-  - 1
-  - 2
-  - 3
   physics_gpu: 0
   rendering_mode: null
   seed: 42
-  skip_displacement: true
-  skip_phases: false
   steps_per_bucket: 1500
   verbose: false
   xr: false

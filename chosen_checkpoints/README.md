@@ -2,26 +2,34 @@
 
 This folder contains the curated deployable checkpoints that are intentionally kept in-repo.
 
-**Current state (2026-07-27), 29dof pivot — see `policy_status.md` (repo root) for the
+**Current state (2026-07-28), 29dof pivot — see `policy_status.md` (repo root) for the
 full, living status writeup this summary is kept in sync with:**
 
-- `walking_latest.pt` — **working, ready for initial real-robot testing**, but has a
-  known, actively-being-fixed drift gap (see `policy_status.md`). From
-  `logs/rsl_rl/walking/arm_disturbance/2026-07-24_15-47-18/model_15998.pt`. Three
-  drift-fix attempts since (2026-07-25/26/27) have all made drift worse, not better —
-  none promoted; this checkpoint is untouched by any of them.
-- `walking_2026-07-24_base_only_prev.pt` — the pure base-recipe checkpoint
-  `walking_latest.pt` was warm-started from (no arm-disturbance training), kept for
-  reference/rollback. From
-  `logs/rsl_rl/walking/ablation_reward_weights/2026-07-24_03-13-16/model_5999.pt`.
-- `arm_left_latest.pt` — **stale, not working, do not treat as current.** Predates the
-  real-hardware-gain fix and every finding since. **The actual current-best arm
-  candidate has NOT been promoted here yet** — it's `best_combined`
-  (`logs/rsl_rl/arms/best_combined/2026-07-26_13-09-32/model_1999.pt`), still sitting
-  in `logs/`. Not promoted because arm reaching's real single-shot reliability is only
-  ~30% even for the best checkpoint (see `policy_status.md`'s "Critical finding") — not
-  yet at a bar worth promoting to a curated default. See `policy_status.md` for the
-  current plan (a pivot toward IK for precision grasping).
+- `walking_latest.pt` — **PROMOTED 2026-07-28**, from
+  `logs/rsl_rl/walking/arm_disturbance/2026-07-28_11-41-33/model_20996.pt`
+  (`G1-Locomotion-Velocity-ArmDisturbance-LooseHeightNoStep-v0`). Walking/standing is
+  deliberately **frozen here** for now — this checkpoint has a real, large stand-still
+  stepping/drift fix (the wobble affecting the arm policy) but a known, elevated
+  `turn_left` fall rate under sustained turning (see `policy_status.md`'s 2026-07-28
+  tradeoff note for why: a follow-up `joint_mirror` experiment fixed `turn_left` and
+  forward-walking drift, but reintroduced ~2x of the stand-still regression it was meant
+  to solve — not promoted here for that reason, paused pending a gating fix, not
+  abandoned). Being trained a further ~5000 iterations overnight (same recipe, no reward
+  changes) via `overnight_train.sh` — check `policy_status.md` for whether that changed
+  anything before assuming this entry is still current.
+  The previous `walking_2026-07-24_base_only_prev.pt` reference checkpoint was removed
+  2026-07-28 (superseded, no longer needed for rollback).
+- `arm_left_latest.pt` — **CORRECTED 2026-07-28**: previously called stale here, which
+  was wrong — see `policy_status.md`'s "CORRECTED 2026-07-28" note. Real checkpoint,
+  ~8000 iterations, 24.29%/24.24% success (no_wobble/with_wobble). `best_combined`
+  (`logs/rsl_rl/arms/best_combined/2026-07-26_13-09-32/model_1999.pt`, currently only
+  2000 iterations, 28.20%/32.85%) is somewhat ahead but not promoted here — being
+  trained to 10000 iterations overnight via `overnight_train.sh` to properly test
+  whether the ~25-30% plateau holds with more training; may get promoted here instead
+  once that's done. Both checkpoints show the same failure pattern in per-episode data:
+  converges within ~10-12s of a 20s episode to a stable point 6-10cm from the goal and
+  plateaus there, rather than running out of time while still approaching — see
+  `policy_status.md` for the full diagnostic.
 
 23dof-era checkpoints (1-DOF waist, 5-DOF arms, no wrists — wrong action space for this
 hardware layout regardless) were removed from `main` as part of the pivot; the full

@@ -99,6 +99,70 @@ gym.register(
     },
 )
 
+# 2026-07-27: base_height reward loosened -10 -> -4 — see
+# G1LocomotionArmDisturbanceLooseHeightEnvCfg's own docstring. Uses the SAME PLAY class
+# as the unmodified recipe (G1LocomotionArmDisturbanceEnvCfg_PLAY) — only a reward
+# weight changed here, no action/observation-space difference for eval_walking.py's
+# --arm_disturbance flag to care about.
+gym.register(
+    id="G1-Locomotion-Velocity-ArmDisturbance-LooseHeight-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.g1_locomotion_env_cfg:G1LocomotionArmDisturbanceLooseHeightEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.g1_locomotion_env_cfg:G1LocomotionArmDisturbanceEnvCfg_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1LocomotionArmDisturbancePPORunnerCfg",
+    },
+)
+
+# 2026-07-28: base_height loosened further, -10 -> -2 — see
+# G1LocomotionArmDisturbanceLooseHeight2EnvCfg's own docstring for why this is a
+# stronger pull on the same lever rather than a milder one (user reprioritized standing
+# over forward_fast, so -4's one regression no longer needs protecting against).
+gym.register(
+    id="G1-Locomotion-Velocity-ArmDisturbance-LooseHeight2-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.g1_locomotion_env_cfg:G1LocomotionArmDisturbanceLooseHeight2EnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.g1_locomotion_env_cfg:G1LocomotionArmDisturbanceEnvCfg_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1LocomotionArmDisturbancePPORunnerCfg",
+    },
+)
+
+# 2026-07-28: adds mdp.feet_contact_without_cmd (rewards.py, ported from unitree_rl_lab
+# 2026-07-21, never wired in until now) on top of the already-promoted -4 checkpoint —
+# see G1LocomotionArmDisturbanceLooseHeightNoStepEnvCfg's own docstring for the full
+# rationale (the -4 result cut net drift 68%/35% but barely touched actual stepping,
+# verified via the corrected step-count/foot-air-time metric).
+gym.register(
+    id="G1-Locomotion-Velocity-ArmDisturbance-LooseHeightNoStep-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.g1_locomotion_env_cfg:G1LocomotionArmDisturbanceLooseHeightNoStepEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.g1_locomotion_env_cfg:G1LocomotionArmDisturbanceEnvCfg_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1LocomotionArmDisturbancePPORunnerCfg",
+    },
+)
+
+# 2026-07-28: adds mdp.joint_mirror (rewards.py, ported from unitree_rl_lab 2026-07-21,
+# never wired in until now) on top of the promoted model_20996 checkpoint — see
+# G1LocomotionArmDisturbanceLooseHeightNoStepMirrorEnvCfg's own docstring for the full
+# rationale (a real, measured left/right knee-angle asymmetry found in that checkpoint's
+# full eval, plausibly the mechanism behind both the sustained straight-walking heading
+# drift and turn_left's elevated fall rate).
+gym.register(
+    id="G1-Locomotion-Velocity-ArmDisturbance-LooseHeightNoStepMirror-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.g1_locomotion_env_cfg:G1LocomotionArmDisturbanceLooseHeightNoStepMirrorEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.g1_locomotion_env_cfg:G1LocomotionArmDisturbanceEnvCfg_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1LocomotionArmDisturbancePPORunnerCfg",
+    },
+)
+
 # 2026-07-25: starts the velocity command range at its full target instead of letting
 # the curriculum climb there — see G1LocomotionArmDisturbanceStartFullCmdRangeEnvCfg's
 # own docstring (a stalled curriculum invalidated the previous drift-reward test run).

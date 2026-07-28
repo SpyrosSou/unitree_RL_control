@@ -6,15 +6,53 @@ found — don't let it go stale the way `known_issues.md` did on the 23dof branc
 
 ## Walking + standing (`chosen_checkpoints/walking_latest.pt`)
 
-**Status: working, ready for initial real-robot testing** (sim-verified only — no
-real-robot test yet), **drift is a known gap, actively being worked on (round 2).**
-Promoted 2026-07-25 from `logs/rsl_rl/walking/arm_disturbance/2026-07-24_15-47-18/
-model_15998.pt` — warm-started from a validated base-recipe checkpoint
-(`walking_2026-07-24_base_only_prev.pt`, kept alongside for reference), then trained
-10,000 more iterations on the real deployment recipe
-(`G1-Locomotion-Velocity-ArmDisturbance-v0`). **Untouched by any drift experiment below**
-— every drift attempt trains into its own fresh directory, nothing here promotes over
-it. This is the safe fallback if drift-fixing doesn't pan out.
+**FROZEN 2026-07-28** (explicit user decision — "we can spend weeks trying to improve
+the walking... let's freeze it a little bit"). **Promoted**: `logs/rsl_rl/walking/
+arm_disturbance/2026-07-28_11-41-33/model_20996.pt`
+(`G1-Locomotion-Velocity-ArmDisturbance-LooseHeightNoStep-v0`) — good stand-still
+stepping/drift (the actual thing the arm policy needed fixed), known elevated
+`turn_left` fall rate under sustained turning. See "2026-07-28: the joint_mirror
+tradeoff" below for exactly what was tried after this and why it wasn't promoted
+instead. Being trained ~5000 more iterations overnight (same recipe, no reward changes)
+via `overnight_train.sh` — check whether that changed this entry before trusting it as
+current.
+
+Superseded: the 2026-07-25 promotion (`logs/rsl_rl/walking/arm_disturbance/
+2026-07-24_15-47-18/model_15998.pt`, warm-started from `walking_2026-07-24_base_only_
+prev.pt`) — real walking, but the standing/stepping issue that motivated this whole
+2026-07-28 push. `walking_2026-07-24_base_only_prev.pt` removed from
+`chosen_checkpoints/` the same day (superseded, no longer needed for rollback).
+
+**2026-07-28: the joint_mirror tradeoff.** After promoting model_20996 (LooseHeightNoStep)
+above, one more experiment was tried on top: `joint_mirror` (ported from `unitree_rl_lab`,
+never wired in before — penalizes squared left/right leg-joint-pair differences), added
+because the full eval of model_20996 found a real, measured asymmetry (right knee
+bending 5-7 deg more than left across every forward-walking speed) plausibly behind both
+the sustained ~3.2 deg/s straight-walking heading-drift bias and `turn_left`'s elevated
+fall rate. Result, trained 2999 more iterations
+(`logs/rsl_rl/walking/arm_disturbance/2026-07-28_15-41-19/model_22995.pt`):
+
+- **Worked exactly as designed** — `forward_slow`'s left/right knee-angle gap went from
+  -4.70 deg to +0.02 deg (essentially symmetric).
+- **Fixed two real problems**: forward-walking heading drift roughly halved across every
+  speed/direction (`forward_slow` 62.1->24.7 deg, `backward` 63.8->22.1 deg, etc.), and
+  `turn_left`'s fall rate dropped from 31.79% to 2.69%.
+- **But reintroduced ~2x of the stand-still regression `feet_contact_without_cmd` had
+  just fixed**, across every arm-disturbance phase, not just the disturbance-free
+  bucket: step count roughly doubled (8-10 -> 14-19), heading drift roughly tripled
+  (9-10 deg -> 20-34 deg), lateral drift roughly doubled (0.07-0.12m -> 0.13-0.26m), plus
+  one new stand-still fall (1/257, in the first 3s).
+
+Likely mechanism: `joint_mirror` penalizes left/right asymmetry unconditionally,
+including during `stand_still`, but `feet_contact_without_cmd` may have settled on a
+stance that relies on a slightly asymmetric weight distribution to stay still — the two
+terms are in tension specifically at low/zero commanded velocity. **Not promoted** —
+user explicitly chose to keep model_20996 (pre-mirror) as the frozen checkpoint instead,
+prioritizing the standing win (what the arm/IK work actually needs) over the walking-drift
+and turn_left wins. See item 11 under "Deferred / future items" for the proposed fix
+(gate `joint_mirror` off below `command_norm < 0.1`, the same way
+`feet_contact_without_cmd` is gated) — not implemented, walking is paused, not the mirror
+idea abandoned.
 
 **Confirmed working, not assumed:**
 - Real walking — verified via direct `root_pos_w` displacement measurement (not just
@@ -95,6 +133,18 @@ reward, made drift *worse*: 59-72°).
   failure shape as round 1 attempt B (heading drift getting dramatically worse), just
   less extreme — three different heading-correction attempts now, all making heading
   drift worse, not better. **Not promoted; `walking_latest.pt` remains the fallback.**
+
+  **2026-07-28, tensorboard-checked (not previously done for any drift attempt)**:
+  unlike baseline/round1-attemptA/round1-attemptB (all genuinely flat by the last 20% of
+  training — last-10%-vs-prev-10% change all under 1%) and the round1-related run (which
+  was actively *worsening*, not cut off early — monotonic rise 0.76->0.90 the whole back
+  half), **round 2's `Metrics/base_velocity/error_vel_yaw` was still monotonically
+  falling when training stopped at 8000 iters** (0.94->0.88->0.74->0.70->0.67,
+  -2.5% in the last-10%-vs-prev-10% window — the only one of the four NOT flat). So
+  round 2's "worse than baseline" verdict may reflect an under-trained checkpoint rather
+  than a genuinely worse approach — worth revisiting with more iterations if walking-
+  heading-drift becomes the priority again (it currently isn't — 2026-07-28 focus moved
+  to standing-while-stationary specifically, see below).
   Live visual inspection (not just the metric) found a plausible mechanism: near-extended
   knees during straight walking, with occasional foot-crossing/asymmetric-length
   corrective steps appearing right around where drift kicks in — see "Potential
@@ -134,10 +184,44 @@ arm-IK integration below.
 one structural gap fixed.** Every 7-DOF run at the real hardware gain (40/10
 stiffness/damping, confirmed matching real deployment — see `unitree_rl_lab/deploy/
 include/FSM/State_RLBase.h`, `tau()=0` on real hardware too, so this isn't a sim-only
-artifact) plateaus in the 25-29% success band. `chosen_checkpoints/arm_left_latest.pt`
-is stale — do not treat it as current. **The 200/20-gain reference checkpoint (99.98%
-success) is intact and NOT in chosen_checkpoints/ — it's `logs/rsl_rl/arms/left/
-2026-07-22_06-20-55/model_2999.pt`. No retraining needed to re-validate it.**
+artifact) plateaus in the 25-29% success band.
+
+**CORRECTED 2026-07-28** (this note was wrong): `chosen_checkpoints/arm_left_latest.pt`
+was previously called "stale — do not treat it as current" here. Per the user directly:
+this checkpoint was trained for ~8000 iterations (pre-2026-07-26, i.e. before the
+action_fb observation addition — its own training run's logs were deleted in the
+2026-07-25 cleanup, so the exact config can't be recovered, but the file's mtime,
+2026-07-23, confirms it predates action_fb) and reached "the same results" as
+`best_combined`'s 2000-iteration run (~25-29% band) — the user deliberately kept using
+it over `best_combined` for that reason. **This is a real, meaningful data point for the
+plateau question below**: two checkpoints with different recipes/training lengths
+(2000 vs ~8000 iterations) landing in the same success band is evidence *against* "just
+needs more iterations" being the fix on its own — consistent with the "uniform
+capability shortfall across the whole box" read from the goal-curriculum work below.
+**The 200/20-gain reference checkpoint (99.98% success) is intact and NOT in
+chosen_checkpoints/ — it's `logs/rsl_rl/arms/left/2026-07-22_06-20-55/model_2999.pt`. No
+retraining needed to re-validate it.**
+
+**`best_combined` (`logs/rsl_rl/arms/best_combined/2026-07-26_13-09-32/model_1999.pt`)
+was briefly copied into `chosen_checkpoints/arm_left_best_combined.pt` 2026-07-28 for
+`g1_rl_control`'s first-implementation pass, then deleted by the user the same day** in
+favor of continuing to use `arm_left_latest.pt` (see above) — `chosen_checkpoints/`
+currently has no arm checkpoint in it as of this note. `best_combined`'s own weights
+still exist untouched at the `logs/` path above if needed again (user plans to retrain
+it overnight for more iterations to test the plateau properly).
+
+**Known gap for `g1_rl_control` if `arm_left_latest.pt` becomes the one actually
+deployed**: unlike `best_combined` (whose `params/env.yaml` gave confirmed
+action_scale=0.5/action_filter_alpha=0.25/max_action_delta_per_step=0.06/
+include_action_feedback=true), `arm_left_latest.pt`'s exact training config is
+unrecoverable (logs deleted). Its pre-action_fb mtime means `include_action_feedback`
+was almost certainly `false` for this checkpoint (32-D per-arm obs, not 39-D) —
+`g1_rl_control`'s `PolicyConfig` currently defaults to `true`/39-D, matching
+`best_combined`, not this checkpoint. If `arm_left_latest.pt` (rather than a
+freshly-retrained `best_combined`) ends up being what's actually exported to ONNX and
+deployed, `g1_rl_control`'s `PolicyConfig.include_action_feedback` needs to be set to
+`False` and the ONNX wrapper's expected-obs-dim check (32 vs 39) needs to be re-verified
+against that exported model — not yet done, flagging before Thursday's deployment.
 
 **The real signal**: `Train/mean_episode_length` (this task terminates early on
 success — hold goal 15 consecutive steps). The 200/20-gain reference converges to
@@ -404,6 +488,35 @@ implementation, priority notes added 2026-07-22 per user review.
 10. **Mechanism for the 99.98%-vs-~30% single-shot gap (arms)** — not found despite
     extensive investigation (see "Critical finding" above). Revisit if the IK pivot
     doesn't fully replace the need for a reliable RL reaching policy.
+11. **`joint_mirror` gating fix (walking)** — 2026-07-28's `joint_mirror` experiment
+    (see "The joint_mirror tradeoff" above) fixed forward-walking drift and `turn_left`'s
+    fall rate for real, but reintroduced ~2x of the stand-still stepping/drift
+    regression `feet_contact_without_cmd` had just fixed — likely because `joint_mirror`
+    penalizes left/right asymmetry unconditionally, fighting whatever
+    (possibly-asymmetric) stance `feet_contact_without_cmd` had settled into for
+    standing still. Proposed fix, not yet implemented: gate `joint_mirror` the same way
+    `feet_contact_without_cmd` is gated — off (or reduced) when `command_norm < 0.1` —
+    so it only enforces symmetry during actual walking, where the asymmetry was found,
+    without fighting the stand-still-specific fix. Walking is frozen on the pre-mirror
+    checkpoint for now (user decision, 2026-07-28); revisit this once there's time to
+    spend on walking again.
+12. **Arm: distance-adaptive movement speed for real hardware.** User's idea, 2026-07-28
+    — move faster while far from the goal, slow to the current (precise) speed once
+    close, so the real robot's arm doesn't look sluggish during the initial approach.
+    Implemented in sim as `G1ArmLeftAdaptiveRateEnvCfg`/`G1-Arm-Left-AdaptiveRate-v0`
+    (`g1_arm_env.py`, `use_adaptive_rate_limit` + related cfg fields) but NOT trained —
+    deprioritized after the same day's diagnostic data (new `final_dist_to_goal_cm`/
+    `dist_to_goal_cm_t*s` eval columns) showed failures are dominated by a
+    converged-but-imprecise plateau, not a running-out-of-time-while-approaching
+    pattern (92% of failed episodes end within 1cm of their own best-ever distance;
+    65% stop improving well before the 20s episode ends) — so this isn't expected to
+    fix the sim success-rate ceiling. Still explicitly wanted for the physical robot
+    regardless (a real UX/naturalness concern independent of the success-rate metric,
+    e.g. for a bystander watching the robot reach) — revisit training this once there's
+    GPU time to spare, and/or wire the same fast-far/slow-near idea directly into
+    `g1_rl_control`'s real-hardware action pipeline even if the sim policy itself isn't
+    retrained with it (i.e. as a deployment-side rate shaping, not necessarily a
+    training-side change).
 
 ## Lessons learned (carried from the 23dof phase)
 

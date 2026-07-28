@@ -204,6 +204,20 @@ gym.register(
     },
 )
 
+# 2026-07-28: pairs the new distance-adaptive rate limit (env side, see
+# G1ArmLeftAdaptiveRateEnvCfg's own docstring) with the same proven agent recipe
+# BestCombined uses (privileged_critic + log_std) rather than re-testing from a bare
+# baseline — this is meant to combine with the best-known recipe, not replace it.
+gym.register(
+    id="G1-Arm-Left-AdaptiveRate-v0",
+    entry_point="g1_locomotion.tasks.manager_based.g1_arm.g1_arm_env:G1ArmEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.g1_arm_env:G1ArmLeftAdaptiveRateEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1ArmLeftBestCombinedPPORunnerCfg",
+    },
+)
+
 # ---------------------------------------------------------------------------
 # Right arm  (train + play)
 # ---------------------------------------------------------------------------

@@ -149,7 +149,26 @@ def _pearson(xs: list[float], ys: list[float]) -> float:
     return cov / (var_x * var_y) ** 0.5
 
 
-def _summarize(csv_path: str, is_straight: bool) -> dict:
+# 2026-07-28: a raw fall-rate percentage treats "fell at 3s" and "fell at 18s" as
+# identical, but they're not the same failure in practice — a command held for the full
+# episode duration is an eval artifact (see turn_left's dead ang_vel curriculum
+# discussion), not something a real user is likely to sustain. Bin fall timing so "falls
+# almost immediately" (a real, load-bearing problem) is visible separately from "falls
+# only after sustaining an unrealistically long command" (lower priority).
+_CONTROL_DT_S = 0.02  # sim.dt(0.005) * decimation(4), see g1_locomotion_env_cfg.py
+_FALL_TIMING_BIN_EDGES_S = (3.0, 6.0, 12.0)  # bins: [0,3) [3,6) [6,12) [12,end)
+
+
+def _fall_timing_bin_labels() -> list[str]:
+    edges = _FALL_TIMING_BIN_EDGES_S
+    labels = [f"<{edges[0]:.0f}s"]
+    for lo, hi in zip(edges, edges[1:]):
+        labels.append(f"{lo:.0f}-{hi:.0f}s")
+    labels.append(f">{edges[-1]:.0f}s")
+    return labels
+
+
+def _summarize(csv_path: str, is_straight: bool, compute_drift: bool | None = None) -> dict:
     if not os.path.isfile(csv_path):
         return {"episodes": 0}
     with open(csv_path) as f:
@@ -165,6 +184,15 @@ def _summarize(csv_path: str, is_straight: bool) -> dict:
         "mean_ang_vel_track_err_rad_s": sum(float(r["mean_ang_vel_track_err_rad_s"]) for r in rows) / n,
         "mean_foot_slip_speed_m_s": sum(float(r["mean_foot_slip_speed_m_s"]) for r in rows) / n,
     }
+    if fell > 0:
+        fall_times_s = [int(r["episode_steps"]) * _CONTROL_DT_S for r in rows if int(r["fell"])]
+        edges = _FALL_TIMING_BIN_EDGES_S
+        bin_counts = [0] * (len(edges) + 1)
+        for t in fall_times_s:
+            idx = next((i for i, e in enumerate(edges) if t < e), len(edges))
+            bin_counts[idx] += 1
+        stats["fall_count"] = fell
+        stats["fall_timing_bin_counts"] = bin_counts
     # Knee-angle tracking (2026-07-27, see deferred_items_2026-07-21.md item 8): checks a
     # visually-observed hypothesis that near-extended knees correlate with the
     # asymmetric-step corrections that precede bad heading drift — computed for every
@@ -174,17 +202,40 @@ def _summarize(csv_path: str, is_straight: bool) -> dict:
     min_knee_angles = [float(r["min_knee_angle_deg"]) for r in rows]
     stats["mean_knee_angle_deg"] = sum(mean_knee_angles) / n
     stats["mean_min_knee_angle_deg"] = sum(min_knee_angles) / n
-    if is_straight:
+    # 2026-07-28: real step count (foot lift + re-plant, air-time-threshold gated — see
+    # WalkingMetricsCsvWrapper._update_stepping_metrics). Added because drift (net
+    # displacement) and foot-slip (sliding while in contact) both miss a foot lifting and
+    # re-planting nearby — visually a real "stationary step" but invisible to either of
+    # those metrics if it doesn't net out to much displacement. Computed for every bucket,
+    # same reasoning as knee angle above.
+    step_counts = [int(r["step_count"]) for r in rows]
+    max_air_times = [float(r["max_foot_air_time_s"]) for r in rows]
+    stats["mean_step_count"] = sum(step_counts) / n
+    stats["mean_max_foot_air_time_s"] = sum(max_air_times) / n
+    # 2026-07-28: heading_drift_deg/lateral_drift_m are computed unconditionally by the
+    # wrapper for every bucket (including zero-velocity ones — "expected position" trivially
+    # reduces to start position when nothing is commanded, so the same math is exactly
+    # "how far did it wander despite being told to do nothing"). Previously only surfaced
+    # for `is_straight` buckets; widened so stand_still gets it too — this is the direct
+    # quantification of standing-while-stationary drift, not just a walking-drift metric.
+    if compute_drift is None:
+        compute_drift = is_straight
+    compute_drift = compute_drift or is_straight
+    if compute_drift:
         heading_drifts = [float(r["heading_drift_deg"]) for r in rows]
         lateral_drifts = [float(r["lateral_drift_m"]) for r in rows]
         stats["mean_abs_heading_drift_deg"] = sum(abs(x) for x in heading_drifts) / n
         stats["max_abs_heading_drift_deg"] = max(abs(x) for x in heading_drifts)
         stats["mean_abs_lateral_drift_m"] = sum(abs(x) for x in lateral_drifts) / n
         stats["max_abs_lateral_drift_m"] = max(abs(x) for x in lateral_drifts)
-        # Negative correlation = episodes that stay more extended (lower min knee angle)
-        # tend to drift more — supports the hypothesis. Near zero = no relationship found.
-        abs_heading = [abs(x) for x in heading_drifts]
-        stats["knee_vs_heading_drift_corr"] = _pearson(min_knee_angles, abs_heading)
+        if is_straight:
+            # Negative correlation = episodes that stay more extended (lower min knee
+            # angle) tend to drift more — supports the hypothesis. Near zero = no
+            # relationship found. Kept straight-buckets-only: this specific correlation is
+            # about the walking-drift hypothesis, not the general standing-stillness check
+            # compute_drift enables above.
+            abs_heading = [abs(x) for x in heading_drifts]
+            stats["knee_vs_heading_drift_corr"] = _pearson(min_knee_angles, abs_heading)
     return stats
 
 
@@ -279,7 +330,7 @@ def _run_command_bucket(base_env: ManagerBasedRLEnv, name: str, vx: float, vy: f
     # Close only this bucket's CSV file handles — not wrapped_env.close(), which would
     # cascade down and tear down base_env, breaking the next bucket/phase.
     env._csv.close()
-    return _summarize(env.csv_path, is_straight=name in _STRAIGHT_BUCKETS)
+    return _summarize(env.csv_path, is_straight=name in _STRAIGHT_BUCKETS, compute_drift=(name == "stand_still"))
 
 
 def _run_displacement_check(base_env: ManagerBasedRLEnv) -> dict:
@@ -349,8 +400,9 @@ def main():
         "## 1. Command-bucket sweep",
         "",
         "| Bucket | vx, vy, wz | Episodes | Fall rate | Lin. track err (m/s) | Ang. track err (rad/s) "
-        "| Foot slip (m/s) | Mean\\|heading drift\\| (deg) | Mean\\|lateral drift\\| (m) |",
-        "|---|---|---|---|---|---|---|---|---|",
+        "| Foot slip (m/s) | Mean\\|heading drift\\| (deg) | Mean\\|lateral drift\\| (m) "
+        "| Mean step count | Mean max foot air time (s) |",
+        "|---|---|---|---|---|---|---|---|---|---|---|",
     ]
 
     command_bucket_stats: dict[str, dict] = {}
@@ -360,7 +412,7 @@ def main():
         command_bucket_stats[name] = stats
         if stats["episodes"] == 0:
             print(f"[Eval] Bucket '{name}': no completed episodes — increase --steps_per_bucket.")
-            summary_lines.append(f"| {name} | {vx}, {vy}, {wz} | 0 | — | — | — | — | — | — |")
+            summary_lines.append(f"| {name} | {vx}, {vy}, {wz} | 0 | — | — | — | — | — | — | — | — |")
             continue
 
         drift_str = ""
@@ -374,7 +426,9 @@ def main():
             f"fall_rate={stats['fall_rate']:.2%} "
             f"lin_track_err={stats['mean_lin_vel_track_err_m_s']:.3f} "
             f"ang_track_err={stats['mean_ang_vel_track_err_rad_s']:.3f} "
-            f"foot_slip={stats['mean_foot_slip_speed_m_s']:.3f}" + drift_str
+            f"foot_slip={stats['mean_foot_slip_speed_m_s']:.3f}" + drift_str +
+            f" mean_step_count={stats['mean_step_count']:.2f} "
+            f"mean_max_foot_air_time_s={stats['mean_max_foot_air_time_s']:.3f}"
         )
 
         heading_col = f"{stats['mean_abs_heading_drift_deg']:.2f}" if "mean_abs_heading_drift_deg" in stats else "—"
@@ -382,7 +436,8 @@ def main():
         summary_lines.append(
             f"| {name} | {vx}, {vy}, {wz} | {stats['episodes']} | {stats['fall_rate']:.2%} "
             f"| {stats['mean_lin_vel_track_err_m_s']:.3f} | {stats['mean_ang_vel_track_err_rad_s']:.3f} "
-            f"| {stats['mean_foot_slip_speed_m_s']:.3f} | {heading_col} | {lateral_col} |"
+            f"| {stats['mean_foot_slip_speed_m_s']:.3f} | {heading_col} | {lateral_col} "
+            f"| {stats['mean_step_count']:.2f} | {stats['mean_max_foot_air_time_s']:.3f} |"
         )
 
     summary_lines += [
@@ -481,6 +536,34 @@ def main():
             f"| {name} | {stats['mean_knee_angle_deg']:.2f} | {stats['mean_min_knee_angle_deg']:.2f} "
             f"| {corr_col} |"
         )
+
+    bin_labels = _fall_timing_bin_labels()
+    summary_lines += [
+        "",
+        "## 5. Fall timing breakdown (buckets with any falls)",
+        "",
+        "A raw fall-rate percentage treats a fall at 3s and a fall at 18s as equally bad, "
+        "but a command held for the full episode is an eval artifact, not something a "
+        "real user is likely to sustain (e.g. turn_left/turn_right command wz continuously "
+        "for the whole 20s — see run notes on the dead ang_vel curriculum). This bins WHEN "
+        "falls happen so 'fails almost immediately' (a real problem) is visible separately "
+        "from 'only fails after an unrealistically long sustained command' (lower priority).",
+        "",
+        "| Bucket | Total falls | " + " | ".join(bin_labels) + " |",
+        "|---|---|" + "---|" * len(bin_labels),
+    ]
+    any_falls = False
+    for name in args_cli.buckets:
+        stats = command_bucket_stats.get(name, {})
+        fall_count = stats.get("fall_count", 0)
+        if not fall_count:
+            continue
+        any_falls = True
+        counts = stats["fall_timing_bin_counts"]
+        pct_cells = " | ".join(f"{c} ({c / fall_count:.0%})" for c in counts)
+        summary_lines.append(f"| {name} | {fall_count} | {pct_cells} |")
+    if not any_falls:
+        summary_lines.append("| (no falls in any evaluated bucket) | — |" + " —|" * len(bin_labels))
 
     base_env.close()
 
