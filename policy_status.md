@@ -1,15 +1,17 @@
 # Policy status — 29dof pivot
 
-**Branch note (2026-07-27, `ik_residuals`)**: the "Walking + standing" section below is
-current and still the live source of truth — that policy is untouched by the arm pivot.
-The "Arm reaching" section is now **historical** — it's the pure-RL record that
-motivated replacing RL-only arm reaching with IK (+ a later RL residual); see
-`ik_arm_integration_plan.md` for the current plan and `retrospective.md` for the
-narrative. Keep the arm data below as-is — Phase 3 of the plan validates the IK
-approach against these exact numbers (200/20 reference ~30% true single-shot,
-`best_combined` ~28-33% aggregate). Update the Walking section here as before; add new
-IK/residual findings to `ik_arm_integration_plan.md` or a successor doc, not by
-rewriting this section's RL history.
+**Branch note (2026-07-29, `ik_residuals`)**: the "Walking + standing" section below is
+current and still the live source of truth — that policy is untouched by the arm pivot
+(a separately-retrained walking checkpoint was tested for the arm-integration work, see
+`ik_arm_integration_plan.md`, but nothing here changed). The "Arm reaching" section
+further below is now **historical** — it's the pure-RL record that motivated replacing
+RL-only arm reaching with IK + a residual RL layer. That pivot has since progressed a
+lot: see the new **"Arm reaching — IK + residual RL"** section immediately below for
+the current status summary, `ik_arm_integration_plan.md` for the full technical
+narrative/findings log, and `personal_development/residual_rl.md` for the underlying
+theory. Update the Walking section here as before; keep adding new IK/residual findings
+to `ik_arm_integration_plan.md` first, then summarize here when the status actually
+changes — don't let this section go stale the way the rest of this file warns against.
 
 Living summary of what's actually validated vs. still open, for the checkpoints in
 `chosen_checkpoints/`. Update this when a checkpoint gets promoted or a real gap is
@@ -139,7 +141,100 @@ arm-IK integration below.
   `eval_walking.py`/`check_real_displacement*.py` but not yet to `eval_full_demo.py` —
   check before relying on that script unattended.
 
-## Arm reaching
+## Arm reaching — IK + residual RL (current, `ik_residuals` branch)
+
+Status summary only — full technical narrative/findings log lives in
+`ik_arm_integration_plan.md`, theory writeup in `personal_development/residual_rl.md`.
+This section supersedes the historical "Arm reaching" section below for anything past
+2026-07-27; that section is kept as the pure-RL record that motivated this pivot, not
+a still-live plan.
+
+**Phase 2 (numerical IK + gravity feedforward) — complete.** Vendored `G1ArmIK`
+(CasADi/Pinocchio, adapted from `xr_teleoperate`'s `G1_29_ArmIK`) into
+`source/.../controllers/arm_ik.py`. Root cause found and fixed for the session's
+biggest open mystery (achieved-vs-kinematic tracking gap): the ground-referenced-
+target-to-world conversion rotated by the robot's FULL orientation instead of yaw
+only, leaking pelvis height into world x/y through the rotation matrix whenever the
+robot had real roll/pitch tilt (~14-20cm error at a modest 8-10° tilt) — fixed via
+`yaw_quat()` in `eval_arm_ik_standing.py` and `g1_full_demo.py`. Walking-induced base
+sway confirmed (via a genuinely fixed-base isolation test,
+`eval_arm_ik_fixed_base.py`) to be a separate, real, non-bug source of tracking
+difficulty, independently re-confirmed with a second (retrained) walking checkpoint —
+**decision: decouple arm+residual development from the walking policy for now**,
+revisit once both are independently mature. Clean result on a genuinely fixed base
+with the frame fix applied: kinematic error mean 0.79cm/max 2.95cm (matches or beats
+Phase 1's own static-sweep ceiling), achieved (PD-tracked) error mean 16.65cm, height-
+correlated (r=0.77) — fully explained by a static gravity feedforward plus the real
+robot's soft 40Nm/rad gain, not a remaining bug; exactly the gap the residual layer was
+always meant to close.
+
+**Phase 4 (residual RL on top of the IK baseline) — architecture built, in active
+training/tuning.** New task `G1-Arm-Residual-Left-v0`/`-Right-v0`
+(`source/.../g1_arm_residual/`): the IK baseline is solved once per episode, not every
+step (goal is fixed for the episode on a fixed base, and the solver is CPU/single-
+instance so per-step solving at any real `num_envs` is impractical), cached per-env;
+the policy outputs a small bounded correction on top (`residual_action_scale`); the
+reward reuses the base arm task's real-accuracy reward mostly unchanged. Two real
+reward-exploit mechanisms found and fixed via direct TensorBoard/per-episode-CSV
+inspection, not guessed:
+1. `goal_reached_bonus` originally paid out every step regardless of velocity — made
+   "oscillate rapidly through the 2cm zone" reward-optimal over genuinely settling.
+   Fixed: the bonus now also requires low joint velocity (`goal_reached_max_vel`).
+2. Even after (1), `success_rate` collapsed with more training (95.8%→12.9%,
+   2500→5000 iterations) despite reach rate and per-episode best/final distance
+   staying flat — root cause: nothing rewarded a SUSTAINED streak over the same
+   qualifying steps scattered with gaps (confirmed directly in the per-step
+   dist-to-goal-over-time snapshot data, and independently in a live visual test —
+   the 2500-iteration checkpoint settles immediately after its approach overshoot,
+   the higher-iteration one keeps oscillating around the goal within a few cm).
+   Fixed: the bonus now scales by the current streak length
+   (`hold_streak_bonus_scale`).
+
+Also found and fixed: a real eval-script bug (`eval_arm_residual.py`'s output path
+wasn't checkpoint-specific, silently mixing different checkpoints' episodes into the
+same CSVs — invalidated an earlier "regression" finding until caught and corrected;
+see `ik_arm_integration_plan.md`'s correction note). The streak-bonus fix (2) was
+re-trained fresh to confirm it holds past 2500 iterations, and that run **stalled
+completely** — `goal_reached_bonus` never fired past iteration ~200 of a
+2700-iteration run, `mean_dist_to_goal_cm` frozen at 4.96-5.4cm for every goal
+regardless of position (r≈-0.03 correlation with goal x/y/z — a stable bad
+equilibrium, not slow learning). Root cause: `settle_velocity_penalty_scale` had
+been bumped 20x (0.05→1.0) back when the bonus was still unconditional and dwarfed
+it; once the bonus was ALSO gated on velocity (fix 1), that 20x penalty became the
+dominant signal near the goal and actively deterred entering the 5cm settle zone
+while on-policy exploration noise was still active (`Policy/mean_noise_std` ~0.52 at
+iteration 2800) — the policy learned to hover just outside the ring instead of
+pushing through. **Fixed**: reverted `settle_velocity_penalty_scale` to 0.05,
+loosened `goal_reached_max_vel` 0.5→1.5 rad/s (noise-tolerant). A 2000-iteration
+retrain with this fix showed excellent position control (100% reach rate, 0.35cm
+mean dist — a real, verified improvement) but `success_rate` (14-17%) still trailed
+`22-17-21`'s own iteration-2000 number (96-99%, since independently confirmed to
+collapse to 13-21% by iteration 5000 in that same run — not a fair comparison, but a
+real remaining gap worth explaining, not hand-waving as "needs more training").
+
+Per-episode data resolved it: every FAILED episode ran the full timeout with
+dist-to-goal **rhythmically oscillating** between <0.3cm and 2-3.5cm on a repeating
+multi-second cycle, never damping — present in both this run and the pre-fix
+`22-17-21` run, matching the user's own visual-test description ("overshoots...
+very quickly recovers" / "keeps oscillating... within a few cm"). Root cause found
+in code: `G1ArmResidualEnv._apply_action` never applied `max_action_delta_per_step`
+(0.06 rad, inherited from `G1ArmEnvCfg`, applied correctly in the base task and every
+other script in this project) — the residual could jump the commanded target by its
+full range (up to a 0.3 rad swing) in one control step, softened only by
+`action_filter_alpha`'s EMA (a low-pass, not a hard bound), and nothing in the reward
+penalizes step-to-step change (only action magnitude). **Fixed**: `_apply_action` now
+rate-limits the commanded target relative to the arm's current actual position, same
+pattern as the base task. **Not yet trained/validated** — both fixes are applied in
+the file but no training run has completed with the rate-limit fix in place yet.
+
+Visual test built for this task: `testing/visual_testing/arms/
+g1_arm_residual_reach_test.py` (adapted from `g1_arm_reach_test.py`). The
+already-documented "passive-reaction creep" (torso lean + uncontrolled-arm deflection
+under reaction torque — real PD-not-infinitely-rigid physics, not a bug, see
+landmine #5 in the plan doc) shows up here too, unsurprising since the underlying
+mechanism is unrelated to this task.
+
+## Arm reaching (historical — pure-RL era, superseded by IK + residual RL above)
 
 **Status: not working, root cause still open, but two small real improvements found +
 one structural gap fixed.** Every 7-DOF run at the real hardware gain (40/10

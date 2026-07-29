@@ -245,7 +245,19 @@ def _run_bucket(base_env: G1ArmResidualEnv, name: str, eval_root: str) -> tuple[
 
 def main():
     checkpoint_dir = os.path.dirname(os.path.abspath(args_cli.checkpoint))
-    eval_root = os.path.join(checkpoint_dir, "arm_residual_eval")
+    # 2026-07-29 FIX: was `checkpoint_dir/arm_residual_eval` -- keyed only by the RUN
+    # directory, not the specific checkpoint. ArmMetricsCsvWrapper's underlying
+    # _DualCsvWriter opens its CSVs in APPEND mode (by design, for accumulating more
+    # episodes across repeated eval sessions of the SAME checkpoint) -- but evaluating
+    # multiple DIFFERENT checkpoints from the same run (e.g. model_2499.pt then
+    # model_4998.pt then model_3000.pt) all shared this one path, silently mixing
+    # every checkpoint's episodes into the same file. Confirmed via strictly-increasing
+    # episode counts across three separate eval invocations (560->894->1524) that this
+    # had already happened and contaminated the results. Keying by the checkpoint's own
+    # basename isolates each checkpoint's eval to its own directory, so accumulation
+    # (still desired for re-running the SAME checkpoint) can't cross checkpoints.
+    checkpoint_name = os.path.splitext(os.path.basename(args_cli.checkpoint))[0]
+    eval_root = os.path.join(checkpoint_dir, "arm_residual_eval", checkpoint_name)
     os.makedirs(eval_root, exist_ok=True)
     write_eval_meta(eval_root, args_cli, __file__)
 

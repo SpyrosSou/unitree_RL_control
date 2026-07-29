@@ -191,10 +191,32 @@ class G1ArmResidualLeftEnvCfg(G1ArmLeftEnvCfg):
     # multiplier) but then stayed FLAT (~-1.7) for a further ~1900 iterations post-
     # resume, no directional improvement, while goal_reached_bonus KEPT climbing
     # (38.7->39.9) -- i.e. the bigger penalty changed the NUMBER, not the underlying
-    # velocity behavior. Kept at this value (harmless, complementary once the actual
-    # fix below is in) but superseded as the primary mechanism by
-    # goal_reached_max_vel/G1ArmResidualEnv._get_rewards' override -- see there.
-    settle_velocity_penalty_scale: float = 1.0
+    # velocity behavior. AT THE TIME this was believed "harmless, complementary" once
+    # goal_reached_max_vel became the primary mechanism -- THAT ASSUMPTION WAS WRONG,
+    # see the 2026-07-29 note below. REVERTED to the pre-bump default (0.05).
+    #
+    # 2026-07-29: this 20x bump is the actual cause of the 4k-iteration run stalling
+    # completely (Metrics/frac_envs_reached ~0%, goal_reached_bonus ~0.0 for the
+    # ENTIRE run past iter ~200, min_dist_to_goal_cm frozen at 4.96-5.4cm for every
+    # goal regardless of position -- r<0.03 correlation with goal x/y/z, the
+    # signature of a reward-shaped equilibrium, not an undertrained policy). Root
+    # cause: this penalty was only "harmless" back when goal_reached_bonus paid out
+    # unconditionally and dwarfed it (50 vs ~1). Once goal_reached_bonus ALSO required
+    # low velocity (the fix directly below), that dominant signal vanished, and this
+    # 20x-boosted penalty became the loudest thing near the goal -- and it fires the
+    # instant an env enters settle_proximity_m (5cm) while still noisy, which is
+    # ALWAYS true this early in training (Policy/mean_noise_std was still ~0.52 at
+    # iteration 2800, and that raw noise is injected straight into the commanded
+    # joint target every step via _apply_action's `residual = filtered_actions *
+    # residual_action_scale`, so real physical joint velocity rarely drops near zero
+    # while PPO is still exploring). Net effect: crossing into the 5cm ring cost more
+    # than staying just outside it, so the policy learned to hover at the boundary
+    # instead of pushing through toward the (also newly-gated, see below)
+    # goal_reached_bonus. Reverted to the original 0.05 -- this term's job (discourage
+    # oscillating through the zone) is now handled directly and correctly by
+    # goal_reached_max_vel gating the bonus itself; it doesn't need to also be a large
+    # independent penalty.
+    settle_velocity_penalty_scale: float = 0.05
 
     # 2026-07-28 (the actual, structural fix): goal_reached_bonus now ALSO requires
     # joint velocity under this threshold (rad/s, L2 norm over the 7 controlled
@@ -205,7 +227,41 @@ class G1ArmResidualLeftEnvCfg(G1ArmLeftEnvCfg):
     # A first estimate, not yet validated/tuned against real data -- same "flag it,
     # don't pretend it's final" treatment settle_velocity_penalty_scale itself got
     # when it was first introduced for the base arm task.
-    goal_reached_max_vel: float = 0.5
+    #
+    # 2026-07-29: 0.5 was too strict relative to actual on-policy exploration noise --
+    # Policy/mean_noise_std was still ~0.52 (raw action units) at iteration 2800, and
+    # that noise is injected straight into the commanded joint target every step (see
+    # settle_velocity_penalty_scale's 2026-07-29 note for the full mechanism), so real
+    # physical joint velocity rarely dropped anywhere near 0.5 rad/s while PPO was
+    # still exploring -- goal_reached_bonus fired ~0 times in the entire 2800-iteration
+    # run as a direct result, leaving the policy with no gradient toward genuine
+    # precision at all. Loosened 3x to tolerate typical exploration-driven jitter at
+    # current noise levels while still excluding genuinely fast/uncontrolled motion --
+    # a first estimate, same "flag it" caveat as before. As Policy/mean_noise_std
+    # anneals over training, the *effective* precision needed to also satisfy
+    # goal_hold_steps (15 CONSECUTIVE qualifying steps) should tighten on its own,
+    # without needing to hand-tune a shrinking threshold.
+    goal_reached_max_vel: float = 1.5
+
+    # 2026-07-29: fixes a SECOND, deeper exploit found via clean (post eval-path-bug-fix)
+    # per-checkpoint data -- success_rate collapsed from 95.8% (2500 iters) to 12.9%
+    # (5000 iters) even though reach_rate and the per-episode best/final distance all
+    # stayed roughly constant, and TensorBoard showed the reward STILL climbing the
+    # whole time (not flat, ruling out "just needs more training" again). Root cause:
+    # goal_reached_bonus pays the SAME amount whether it's the 1st or the 14th
+    # consecutive qualifying step -- nothing in the reward gives a consecutive streak
+    # any more value than the same number of qualifying steps scattered with gaps, so
+    # PPO has no gradient pressure distinguishing "settle once, hold" from "hover near
+    # the boundary, flickering in and out" -- confirmed directly in the per-step
+    # dist-to-goal-over-time snapshots (metrics_wrappers.py's ArmMetricsCsvWrapper):
+    # both the failing AND many nominally-"successful" long episodes oscillate in the
+    # 1-3cm band for the ENTIRE episode rather than converging and staying. This scales
+    # goal_reached_bonus by (1 + hold_counter * this), so a longer, unbroken streak is
+    # worth strictly more than the same steps scattered -- breaking a streak now has a
+    # real, escalating opportunity cost, not just the one missed step's flat bonus.
+    # First estimate (not yet tuned): at hold_counter=14 (just before goal_hold_steps=15
+    # would fire success/termination), this gives a ~3.1x multiplier.
+    hold_streak_bonus_scale: float = 0.15
 
 
 @configclass
@@ -219,8 +275,9 @@ class G1ArmResidualRightEnvCfg(G1ArmRightEnvCfg):
     residual_action_scale: float = 0.15
     apply_ik_tauff: bool = True
     goal_bounds_x_override: tuple[float, float] | None = (0.20, 0.31)
-    settle_velocity_penalty_scale: float = 1.0  # see G1ArmResidualLeftEnvCfg's own comment
-    goal_reached_max_vel: float = 0.5  # see G1ArmResidualLeftEnvCfg's own comment
+    settle_velocity_penalty_scale: float = 0.05  # see G1ArmResidualLeftEnvCfg's own comment
+    goal_reached_max_vel: float = 1.5  # see G1ArmResidualLeftEnvCfg's own comment
+    hold_streak_bonus_scale: float = 0.15  # see G1ArmResidualLeftEnvCfg's own comment
 
 
 @configclass
@@ -340,14 +397,39 @@ class G1ArmResidualEnv(G1ArmEnv):
     # ------------------------------------------------------------------
 
     def _apply_action(self):
+        """2026-07-29: was missing max_action_delta_per_step entirely -- the residual
+        could jump the commanded target by its FULL range (+-residual_action_scale,
+        i.e. up to a 0.3 rad swing) in a single control step, only softened by
+        action_filter_alpha's EMA (a low-pass, not a hard bound). Every other script
+        in this project (G1ArmEnv._apply_action, g1_full_demo.py, both eval scripts)
+        hard-clamps the per-step commanded delta to max_action_delta_per_step (0.06
+        rad, inherited from G1ArmEnvCfg but never applied here) for exactly this
+        reason. Confirmed via clean per-checkpoint eval data (2026-07-29): every
+        FAILED episode (both this run and the pre-fix 22-17-21 run) runs the full
+        episode timeout with dist_to_goal rhythmically oscillating between <0.3cm and
+        2-3.5cm on a multi-second cycle that never damps out -- a control-loop limit
+        cycle, not an exploration/training-progress problem (more iterations can't fix
+        a policy that's structurally allowed to command undampened target jumps).
+        Rate-limiting the target relative to the arm's CURRENT actual position (same
+        pattern as G1ArmEnv._apply_action) directly bounds the velocity the PD
+        controller is ever asked to chase, which should prevent this cycle from
+        building up in the first place.
+        """
         self._apply_root_wobble()
 
         alpha = float(self.cfg.action_filter_alpha)
         alpha = min(max(alpha, 0.0), 1.0)
         self.filtered_actions = alpha * self.actions + (1.0 - alpha) * self.filtered_actions
 
+        arm = self._arm_groups[0]
+        current = self.robot.data.joint_pos[:, arm["joint_tensor"]]
         residual = self.filtered_actions * self.cfg.residual_action_scale
-        targets = self.ik_baseline_q + residual
+        desired_targets = self.ik_baseline_q + residual
+        delta = (desired_targets - current)
+        max_delta = float(self.cfg.max_action_delta_per_step)
+        if max_delta > 0.0:
+            delta = delta.clamp(min=-max_delta, max=max_delta)
+        targets = current + delta
         targets = targets.clamp(self._arm_hw_limits[:, 0], self._arm_hw_limits[:, 1])
         self.robot.set_joint_position_target(targets, joint_ids=self.arm_joint_indices_tensor)
         if self.cfg.apply_ik_tauff:
@@ -379,16 +461,19 @@ class G1ArmResidualEnv(G1ArmEnv):
         return obs
 
     # ------------------------------------------------------------------
-    # Rewards: full copy of G1ArmEnv._get_rewards with ONE change -- see below
+    # Rewards: full copy of G1ArmEnv._get_rewards with TWO changes -- see below
     # ------------------------------------------------------------------
 
     def _get_rewards(self) -> torch.Tensor:
-        """Copy of ``G1ArmEnv._get_rewards`` with exactly one behavioral change:
-        ``goal_reached_bonus`` now requires low joint velocity too, not just
-        proximity. Full method duplicated (not a small patch) because the change
-        needs ``joint_vel_norm`` computed earlier in the loop than the base version
-        does, and Python has no clean way to patch one line out of a parent method —
-        if ``G1ArmEnv._get_rewards`` changes later, this needs to be re-synced by hand.
+        """Copy of ``G1ArmEnv._get_rewards`` with exactly two behavioral changes:
+        (1) ``goal_reached_bonus`` requires low joint velocity too, not just
+        proximity, and (2) that bonus is scaled by how long the current consecutive
+        hold streak is, so a sustained hold is worth strictly more than the same
+        number of qualifying steps scattered with gaps. Full method duplicated (not a
+        small patch) because both changes need state computed earlier/differently
+        than the base version does, and Python has no clean way to patch a few lines
+        out of a parent method — if ``G1ArmEnv._get_rewards`` changes later, this
+        needs to be re-synced by hand.
 
         2026-07-28: found via direct TensorBoard inspection (not guessed) that a
         20x bump to ``settle_velocity_penalty_scale`` (see that field's own comment)
@@ -405,10 +490,28 @@ class G1ArmResidualEnv(G1ArmEnv):
         removes the exploit directly: touching the zone while still moving fast no
         longer pays the bonus at all, only genuinely being close AND still does.
 
+        2026-07-29: fix (1) alone was NOT sufficient either -- clean, per-checkpoint
+        eval data (after fixing an unrelated eval-output-path bug that had been
+        silently mixing different checkpoints' episodes together) showed
+        ``success_rate`` collapse from 95.8% (2500 iters) to 12.9% (5000 iters) even
+        though ``reach_rate_no_hold`` and the per-episode best/final distance all
+        stayed roughly constant, and TensorBoard showed the reward STILL climbing
+        the whole time (ruling out "just needs more training" again). Confirmed via
+        the per-step dist-to-goal-over-time snapshots
+        (``metrics_wrappers.py``'s ``ArmMetricsCsvWrapper``): both failing AND many
+        nominally-"successful" long episodes oscillate in the 1-3cm band for the
+        ENTIRE episode rather than converging and staying -- present even at 2500
+        iterations (a minority of harder episodes), just far more prevalent by 5000.
+        Root cause: ``goal_reached_bonus`` paid the SAME amount whether it's the 1st
+        or the 14th consecutive qualifying step, so nothing gave a genuine streak any
+        more value than the same steps scattered with gaps -- fix (2) scales the
+        bonus by the current streak length, so breaking one now has a real,
+        escalating opportunity cost.
+
         The ``success``/``_hold_counter`` definition itself is UNCHANGED (still
         pure proximity, matching the existing, already-meaningful ``goal_hold_steps``
         criterion, and keeping it comparable to every number reported so far) — only
-        the reward term that was creating the exploit is changed.
+        the reward terms that were creating the exploits are changed.
         """
         total = torch.zeros(self.num_envs, device=self.device)
         all_reached = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
@@ -456,6 +559,20 @@ class G1ArmResidualEnv(G1ArmEnv):
 
         mean_dist_to_goal /= self.n_arms
 
+        # THE second fix: scale goal_bonus_term by how long the CURRENT streak would
+        # become if this step counts (prospective hold_counter, computed here but not
+        # yet committed to self._hold_counter -- that still happens at the end of this
+        # method, unchanged). A single arm only (asserted in __init__), so applying
+        # this to the already-accumulated total is equivalent to doing it per-arm
+        # inside the loop above. Zero whenever not currently reached (all_reached=False
+        # resets the prospective counter to 0 too), growing with each additional
+        # consecutive qualifying step -- see this method's docstring / the cfg field's
+        # own comment for the full reasoning.
+        prospective_hold_counter = torch.where(
+            all_reached, self._hold_counter + 1, torch.zeros_like(self._hold_counter)
+        )
+        goal_bonus_term = goal_bonus_term * (1.0 + prospective_hold_counter.float() * self.cfg.hold_streak_bonus_scale)
+
         action_smoothness_term = -torch.norm(self.previous_actions, dim=-1) * self.cfg.action_smoothness_scale
 
         joint_pos = self.robot.data.joint_pos[:, self.arm_joint_indices_tensor]
@@ -489,8 +606,8 @@ class G1ArmResidualEnv(G1ArmEnv):
             ),
         }
 
-        self._hold_counter = torch.where(
-            all_reached, self._hold_counter + 1, torch.zeros_like(self._hold_counter)
-        )
+        # Same value already computed above for the streak-scaled bonus -- committing
+        # it here now that this step's reward is fully finalized.
+        self._hold_counter = prospective_hold_counter
         self.successes = self._hold_counter >= self.cfg.goal_hold_steps
         return total

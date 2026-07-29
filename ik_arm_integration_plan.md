@@ -548,32 +548,68 @@ the pattern that's now removed; re-learning reach is cheap (hit ~50% within the 
 policy biased toward the old exploit.
 
 **Structural fix confirmed working (2026-07-28, fresh run
-`logs/rsl_rl/arms/residual_left/2026-07-28_22-17-21`) — then a real regression
-past 2500 iterations, not yet understood.** At 2500 iterations:
+`logs/rsl_rl/arms/residual_left/2026-07-28_22-17-21`) at 2500 iterations:**
 `success_rate` 64.11%/74.62% (no_wobble/with_wobble), `reach_rate_no_hold`
 99.29%/99.85% — a dramatic improvement over the old exploit run's 12.88%/15.54% at a
 comparable iteration count, confirming the reward-structure fix (not just more
-training) was the right call. Continuing the SAME run to ~5000 iterations then showed
-`success_rate` **drop** to 44.97%/56.26% (reach_rate stayed high, 98.3-98.9%) — real,
-not noise (894-1015 episodes per bucket). `Train/mean_episode_length` explains the
-mechanism: climbed from 176 (81% of the 176/300 window, actually 59%) to 244 (81% of
-the 300-step cap) across exactly this window, while `frac_envs_reached` and
-`goal_reached_bonus`'s per-step average KEPT climbing the whole time (not flat like
-the original exploit) — meaning the policy is still improving by the continuous
-reward (spending more total time reached+still across a WIDER, presumably harder,
-goal population) while the strict, zero-tolerance `goal_hold_steps` (15 CONSECUTIVE
-steps, any single miss resets to 0) is satisfied less often on this now-harder mix.
-Hypothesis, not confirmed: a real tension between "reward keeps rewarding broader
-coverage" and "success metric has zero tolerance for even one bad step" — distinct
-from the original bug (reward fully decoupled from stillness). **Not yet known
-whether this is a transient dip that more training resolves, or close to the actual
-success-rate peak for this reward under current settings** — only two points on the
-curve (2500, ~5000) have been measured. `model_2499.pt` is the best-measured
-checkpoint so far; use it for anything downstream (e.g. the visual reach test) until
-this is resolved. Cheap next step, no new training needed: eval the intermediate
-checkpoints already on disk (model_3000/3500/4000.pt) to see the actual shape of the
-decline before deciding whether to keep training past 5000 or address
+training) was the right call.
+
+**CORRECTION (2026-07-29): the "regression past 2500 iterations" originally recorded
+here was an artifact of an eval-script bug, not a real finding about the policy —
+struck through in spirit, kept here so the mistake isn't silently lost.**
+`eval_arm_residual.py`'s output path was keyed only by the checkpoint's *run
+directory* (`checkpoint_dir/arm_residual_eval`), not the specific checkpoint file.
+`ArmMetricsCsvWrapper`'s `_DualCsvWriter` opens its CSVs in APPEND mode by design (so
+repeated eval sessions of the SAME checkpoint accumulate more episodes) — but
+evaluating `model_2499.pt`, then `model_4998.pt`, then `model_3000.pt` from the same
+run directory all shared that one path, silently mixing every checkpoint's episodes
+into the same files. Confirmed via strictly-increasing episode counts across three
+separate eval invocations (560→894→1524). The reported "5000-iteration success_rate
+dropped to 44.97%/56.26%" was therefore a blend of the 2500 and 5000 checkpoints'
+episodes, not a clean measurement of 5000 alone — **whether training past 2500
+actually helped, hurt, or plateaued is genuinely unknown and needs re-measuring.**
+Fixed: `eval_root` now includes the checkpoint's own basename
+(`arm_residual_eval/<checkpoint_name>/`), isolating each checkpoint's eval to its own
+directory. The old, contaminated `arm_residual_eval/` folder (files directly under
+it, not in a per-checkpoint subfolder) should not be trusted for anything — it
+predates the fix. Re-run 2500/3000/~5000 with the fixed script for a real picture of
+the trend before deciding whether to keep training past 5000 or address
 `goal_hold_steps`/the reward directly.
+
+**Clean re-eval (2026-07-29) confirmed the collapse is real, and revealed the actual
+mechanism**: `success_rate` 95.76%/98.56% (2500 iters) → 28.15%/43.43% (3800) →
+12.87%/21.20% (5000), while `reach_rate_no_hold` and per-episode best/final distance
+all stayed roughly flat. Direct visual confirmation (user's own reach test, both
+checkpoints): 2500 recovers from its approach overshoot and settles immediately;
+4998 keeps oscillating around the goal (within a few cm) indefinitely. Confirmed in
+the per-step `dist_to_goal_cm_t*s` snapshot columns (from the `metrics_wrappers.py`
+update pulled over from `main`): this oscillating pattern is present even at 2500 (a
+minority of harder/longer episodes, including some that are nominally "successful" —
+they wander for most of the episode and happen to land a clean streak right before
+timeout), just far more prevalent by 5000 — not a new failure mode, a growing one.
+Root cause: `goal_reached_bonus` paid the same amount whether it's the 1st or 14th
+consecutive qualifying step, so nothing in the reward valued an unbroken streak over
+the same steps scattered with gaps — PPO had no gradient pressure against "hover near
+the boundary, flicker in and out" once it discovered that was reward-competitive
+across a wider goal population. **Second fix implemented**
+(`G1ArmResidualEnv._get_rewards`): `goal_reached_bonus` now scales by
+`(1 + hold_counter * hold_streak_bonus_scale)` — a longer unbroken streak is worth
+strictly more, so breaking one has a real, escalating opportunity cost. First
+estimate, `hold_streak_bonus_scale=0.15` (~3.1x multiplier just before
+`goal_hold_steps` would fire). Training this from a fresh run again, same reasoning
+as before (the incentive structure changed meaningfully, not just a weight nudge).
+
+Also confirmed via the same visual test, separate from the hold problem: torso lean +
+passive right-arm elbow movement during reaching matches the already-documented
+"passive-reaction creep" (landmine #5) — real physics (PD-held, not infinitely rigid,
+waist/opposite-arm joints reacting to the active arm's motion), not a bug. And a real,
+not-yet-addressed design gap: `_apply_action` commands the full `ik_baseline_q +
+residual` target instantly every step with no rate-limiting on the jump, unlike every
+other script in this project (`g1_full_demo.py`, both eval scripts), which all clamp
+the per-step commanded delta to 0.06 rad specifically for smooth, deployment-safe
+motion — very likely the direct cause of the fast/jerky motion and overshoot
+transient the user observed in both checkpoints. Worth its own isolated fix later,
+not bundled with the reward work above.
 
 **Deferred idea (2026-07-28, user's own suggestion, explicitly parked for later —
 "one change at a time"):** scale `residual_action_scale` down as distance-to-goal
@@ -586,6 +622,71 @@ goal. Plausibly complementary to the settle-reward fix above (reward teaches wan
 stillness; a tighter budget makes wobbling harder even before that's learned). Not
 implemented yet — revisit as its own isolated test once the settle-reward fix's own
 effect is clear, not bundled into the same run.
+
+**2026-07-29: the streak-bonus fresh run stalled completely, and it's a real
+implementation bug, not an exploration/patience issue.** At iteration ~2400-2700,
+every one of `frac_envs_reached`, `goal_reached_bonus`, `mean_dist_to_goal_cm`, and
+`position_dist` had been flat since iteration ~200 — `goal_reached_bonus` essentially
+never fired in the entire run. Per-episode data (checkpoint 2500 eval) confirmed this
+wasn't "still learning": `min_dist_to_goal_cm` clustered at **4.96-5.4cm for every
+episode regardless of goal position** (correlation with goal x/y/z: r ≈ -0.03),
+reached within the first second and frozen for the rest of the episode — the
+signature of a stable reward-shaped equilibrium, not an undertrained policy. That
+equilibrium sits right at `settle_proximity_m` (5cm), which was the giveaway.
+
+**Root cause**: `settle_velocity_penalty_scale` had been bumped 20x (0.05→1.0) back
+when `goal_reached_bonus` still paid out unconditionally and dwarfed it (50 vs ~1) —
+harmless at the time. Once `goal_reached_bonus` was gated on low velocity too (the
+first streak-era fix), that dominant signal vanished, and the 20x-boosted settle
+penalty became the loudest thing near the goal. `Policy/mean_noise_std` was still
+~0.52 at iteration 2800 (barely decayed from 1.0) — that raw exploration noise feeds
+straight into the commanded joint target every step (`_apply_action`'s `residual =
+filtered_actions * residual_action_scale`), so real physical joint velocity rarely
+approached zero while PPO was still exploring. Net effect: entering the 5cm settle
+ring while still noisy (always, this early) cost more than staying just outside it —
+the policy learned to hover at the boundary instead of pushing through toward the
+(also velocity-gated, same noise problem) bonus zone. Two compounding defects, not
+one: a stale penalty scale actively deterring entry, and a velocity gate stricter
+than what on-policy exploration noise allows.
+
+**Fix**: reverted `settle_velocity_penalty_scale` 1.0→0.05 (its original pre-bump
+value — its job is now handled directly and correctly by the velocity-gated bonus,
+it doesn't also need to be a large independent penalty), and loosened
+`goal_reached_max_vel` 0.5→1.5 rad/s (noise-tolerant estimate; as
+`Policy/mean_noise_std` anneals over training, the *effective* precision needed to
+also satisfy 15 CONSECUTIVE qualifying steps should tighten on its own). The stalled
+run should be interrupted rather than continued — 2400+ iterations of a completely
+flat curve on every relevant metric will not resolve itself within remaining budget.
+Needs a fresh training run once restarted.
+
+**2026-07-29 (later the same day): the settle/velocity fix above was necessary but
+not sufficient** — a fresh 2000-iteration run with it applied reached excellent
+position precision (100% reach_rate, 0.35cm mean dist) but success_rate (14-17%) was
+still far below `22-17-21`'s OWN iteration-2000 number (96-99%, since shown to
+collapse to 13-21% by iteration 5000 in that same run — not a fair comparison, but a
+real question remained: why does the harder, honestly-measured criterion take so
+much longer to satisfy even once, when precision is already this good?). Answer:
+clean per-checkpoint FAIL-episode data showed every failing episode running the full
+episode timeout with dist-to-goal **rhythmically oscillating** between <0.3cm and
+2-3.5cm on a repeating multi-second cycle, for the entire episode, never damping —
+present in both this run and the old pre-fix `22-17-21` run (matches the user's own
+visual-test description of `2500`/`4998`: "overshoots... very quickly recovers" /
+"keeps oscillating... within a few cm" — the same underlying limit-cycle, just more
+prevalent by 5000). Root cause, finally found in code, not tuning:
+`G1ArmResidualEnv._apply_action` never applied `max_action_delta_per_step` (0.06 rad,
+inherited from `G1ArmEnvCfg`, applied correctly in `G1ArmEnv._apply_action` and every
+other script in this project) — the residual could jump the commanded target by its
+full range (up to a 0.3 rad swing) in a single control step, softened only by
+`action_filter_alpha`'s EMA (a low-pass, not a hard bound). Nothing in the reward
+penalizes this either (`action_smoothness_term` penalizes action MAGNITUDE, not
+step-to-step CHANGE). **Fix**: `_apply_action` now rate-limits the commanded target
+relative to the arm's current actual position, same pattern as the base task. This
+is a genuine implementation gap (a feature every other script already had, silently
+missing here), not a reward-tuning question — expected to directly prevent the
+oscillation from building up, independent of training duration.
+
+Needs a fresh training run to evaluate (the previous 2000-iteration run pre-dates
+this fix and isn't representative of it).
 
 ## Working conventions on this branch (non-negotiable, carried from `main`)
 
