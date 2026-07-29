@@ -159,7 +159,7 @@ from rsl_rl.runners import OnPolicyRunner
 from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
 
 
-def _summarize(csv_path: str) -> dict:
+def _summarize(csv_path: str, goal_threshold_cm: float) -> dict:
     if not os.path.isfile(csv_path):
         return {"episodes": 0}
     with open(csv_path) as f:
@@ -174,11 +174,26 @@ def _summarize(csv_path: str) -> dict:
 
     return {
         "episodes": n,
+        # "success" (env's own definition, unchanged): reached AND held under
+        # goal_threshold for goal_hold_steps CONSECUTIVE steps.
         "success_rate": sum(int(r["success"]) for r in rows) / n,
+        # 2026-07-29, ported from ik_residuals (user request there 2026-07-28): a
+        # SEPARATE reach-only rate -- did min_dist_to_goal ever drop under
+        # goal_threshold at all, regardless of whether it then held there for the
+        # required consecutive-step count. Derived directly from the existing
+        # min_dist_to_goal_cm column, no wrapper/env change needed. More representative
+        # for anything that doesn't need a hold-in-place (e.g. a path-following/
+        # residual-correction use case) -- success_rate alone would understate tracking
+        # quality by penalizing a hold behavior that use case doesn't even want.
+        "reach_rate_no_hold": sum(1 for d in dists if d < goal_threshold_cm) / n,
         "mean_reward": sum(float(r["mean_reward"]) for r in rows) / n,
         "mean_dist_cm": sum(dists) / n,
         "p50_dist_cm": pct(0.50),
         "p90_dist_cm": pct(0.90),
+        # final_dist_to_goal_cm (2026-07-28 metrics_wrappers.py addition): distinguishes
+        # "still converging when the episode timed out" from "reached its best point
+        # then stalled/overshot" -- min_dist alone can't tell these apart.
+        "mean_final_dist_cm": sum(float(r["final_dist_to_goal_cm"]) for r in rows) / n,
     }
 
 
@@ -273,7 +288,8 @@ def _run_bucket(base_env: G1ArmEnv, name: str, eval_root: str) -> tuple[dict, li
     # Close only this bucket's CSV file handles — not wrapped_env.close(), which would
     # cascade down and tear down base_env, breaking the next bucket.
     env._csv.close()
-    return _summarize(env.csv_path), joint_ranges, reward_breakdown
+    goal_threshold_cm = base_env.cfg.goal_threshold * 100.0
+    return _summarize(env.csv_path, goal_threshold_cm), joint_ranges, reward_breakdown
 
 
 def main():
@@ -296,8 +312,8 @@ def main():
         "",
         f"Checkpoint: `{args_cli.checkpoint}`",
         "",
-        "| Bucket | Episodes | Success rate | Mean reward | Mean dist (cm) | Median dist (cm) | p90 dist (cm) |",
-        "|---|---|---|---|---|---|---|",
+        "| Bucket | Episodes | Success rate (reach+hold) | Reach rate (no hold) | Mean reward | Mean dist (cm) | Median dist (cm) | p90 dist (cm) | Mean final dist (cm) |",
+        "|---|---|---|---|---|---|---|---|---|",
     ]
 
     joint_range_lines = [
@@ -333,19 +349,22 @@ def main():
         stats, joint_ranges, reward_breakdown = _run_bucket(base_env, name, eval_root)
         if stats["episodes"] == 0:
             print(f"[Eval] Bucket '{name}': no completed episodes — increase --steps_per_bucket.")
-            summary_lines.append(f"| {name} | 0 | — | — | — | — | — |")
+            summary_lines.append(f"| {name} | 0 | — | — | — | — | — | — | — |")
             continue
         print(
             f"[Eval] Bucket '{name}': episodes={stats['episodes']} "
             f"success_rate={stats['success_rate']:.2%} "
+            f"reach_rate_no_hold={stats['reach_rate_no_hold']:.2%} "
             f"mean_reward={stats['mean_reward']:.3f} "
             f"mean_dist_cm={stats['mean_dist_cm']:.2f} "
             f"p50_dist_cm={stats['p50_dist_cm']:.2f} "
-            f"p90_dist_cm={stats['p90_dist_cm']:.2f}"
+            f"p90_dist_cm={stats['p90_dist_cm']:.2f} "
+            f"mean_final_dist_cm={stats['mean_final_dist_cm']:.2f}"
         )
         summary_lines.append(
-            f"| {name} | {stats['episodes']} | {stats['success_rate']:.2%} | {stats['mean_reward']:.3f} "
-            f"| {stats['mean_dist_cm']:.2f} | {stats['p50_dist_cm']:.2f} | {stats['p90_dist_cm']:.2f} |"
+            f"| {name} | {stats['episodes']} | {stats['success_rate']:.2%} | {stats['reach_rate_no_hold']:.2%} "
+            f"| {stats['mean_reward']:.3f} | {stats['mean_dist_cm']:.2f} | {stats['p50_dist_cm']:.2f} "
+            f"| {stats['p90_dist_cm']:.2f} | {stats['mean_final_dist_cm']:.2f} |"
         )
         for jr in joint_ranges:
             hw_lo, hw_hi = jr["hw_range_deg"]

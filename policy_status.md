@@ -54,6 +54,32 @@ and turn_left wins. See item 11 under "Deferred / future items" for the proposed
 `feet_contact_without_cmd` is gated) — not implemented, walking is paused, not the mirror
 idea abandoned.
 
+**2026-07-29: plain continuation also regressed standing, with no reward change at
+all.** Overnight, model_20996 was trained 5000 more iterations on the exact same
+`LooseHeightNoStep` recipe (no new terms, no weight changes) as a control/"does more
+training alone help" check, landing at `logs/rsl_rl/walking/arm_disturbance/
+2026-07-29_03-06-11/model_25995.pt`. Result on `stand_still`: step count 8.23->31.72
+(nearly 4x), |lateral drift| 0.076->0.773m (~10x), and a new nonzero fall rate
+(0.00%->1.16%) — a bigger regression than `joint_mirror` produced, with none of that
+experiment's compensating upside (no turn_left/forward-drift improvement, since nothing
+about the reward changed). **Puzzling part**: `Train/mean_reward` and
+`Episode_Reward/feet_contact_without_cmd`'s own tensorboard curves stay completely flat
+throughout the whole continuation (episode length near-max the entire time, no visible
+divergence) — so this isn't "training visibly broke," the aggregate training-time
+reward doesn't clearly show it. Best guess: the policy drifted into a slightly
+different, more brittle behavior specifically at the exact `(0,0,0)` command edge case,
+which training rarely samples exactly (same dead-curriculum issue noted for
+`turn_left`/`turn_right` — `rel_standing_envs=0.02` plus a `(-0.1,0.1)` sampled range
+means literal zero-command is a narrow slice of what's actually trained against, so
+nothing strongly anchors behavior there specifically) — not confirmed, just the most
+consistent explanation for a regression invisible in the aggregate reward. **Not
+promoted** — `chosen_checkpoints/walking_latest.pt` confirmed still exactly model_20996
+(checksum-verified), this experiment lives entirely in its own separate `logs/`
+directory. **General lesson**: don't assume plain continuation of a working recipe is
+safe-by-default even with an unchanged reward and a flat-looking training curve — worth
+an eval check before trusting any further continuation of this checkpoint, not just
+reward-changing experiments.
+
 **Confirmed working, not assumed:**
 - Real walking — verified via direct `root_pos_w` displacement measurement (not just
   reward/error metrics, after this project's own earlier mistake reading a track-error
@@ -308,6 +334,24 @@ the walking items above):** extend to 8000 iters total to actually confirm the p
 holds, rather than relying on the 2000-iter read alone (goal_curriculum's own "still
 climbing" read at 2000 iters turned out to still be true after extending — worth the
 same confirmation here before fully trusting this as final).
+
+**RESOLVED 2026-07-29**: extended to ~10000 iters total overnight
+(`logs/rsl_rl/arms/best_combined/2026-07-29_00-09-42/model_9999.pt`). Plateau confirmed
+real, not an artifact of stopping early: 30.15%/28.10% (no_wobble/with_wobble) vs the
+2000-iter checkpoint's 28.20%/32.85% — essentially a wash, `no_wobble` up ~2pts,
+`with_wobble` down ~5pts, both within noise for these episode counts. This is the
+**second** independent confirmation that iteration count alone isn't the lever —
+`arm_left_latest` (~8000 iters, older pre-action_fb recipe) already landed in the same
+~25-30% band; now the actual `BestCombined` recipe does too at ~10000. Not promoted
+over the 2000-iter checkpoint (no real improvement to justify it). Two other findings
+from the same eval, using new columns ported from `ik_residuals` 2026-07-29 (see
+`validation/eval_arm.py`'s `_summarize`): `reach_rate_no_hold` (30.63%/28.92%) is barely
+above `success_rate` — holding once it arrives is essentially free, reaching is the
+entire bottleneck, confirming the "holding is basically solved" read above; and
+`mean_final_dist_cm` (7.28/7.47cm) stays close to `mean_dist_cm` (7.11/7.22cm) — same
+converges-then-plateaus shape as the 2000-iter checkpoint, unchanged by more training.
+**Iteration count is now ruled out twice over — the next lever has to be structural
+(`goal_curriculum`, still unfinished, or the IK pivot), not more brute-force training.**
 
 **Gain search (2026-07-26) — closed.** Tested against Unitree's own real values, not
 guesses: `Gain60Kd1p5` (60/1.5, dedicated arm-SDK example gain) — 24.43%/23.42%,

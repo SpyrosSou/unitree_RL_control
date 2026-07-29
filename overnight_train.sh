@@ -53,43 +53,53 @@ echo "Overnight run starting $(date). Full log: $LOG_FILE"
 # ==========================================================================================
 # TASK QUEUE — 2026-07-28 overnight run
 # ==========================================================================================
+# CORRECTED 2026-07-29: RSL-RL's OnPolicyRunner.learn() computes
+# tot_iter = current_learning_iteration (from the resumed checkpoint) + num_learning_iterations
+# (confirmed directly from on_policy_runner.py source) — i.e. --max_iterations is ADDITIVE
+# on a --resume, NOT an absolute target. The first run of this script used the target
+# totals (10000/26000) directly as --max_iterations, which actually produced totals of
+# ~12000 (1999+10000) and would have produced ~47000 (20996+26000) — caught after the arm
+# step confirmed the 12000 number, stopped before the walking step ever started. Flag
+# values below are corrected to actually land at the intended totals.
+#
 # 1) Arm: continue best_combined (currently 2000 iters, 28.20%/32.85% success, plateaued
-#    at that iteration count per policy_status.md) to 10000 total — confirms or kills the
-#    "just needs more iterations" theory once and for all (arm_left_latest already
-#    suggested no, at ~8000 iters/same result, but that was a different, older recipe —
-#    this tests the actual BestCombined recipe directly).
+#    at that iteration count per policy_status.md) to a TOTAL of ~10000 (flag: 8001 more,
+#    1999+8001=10000) — confirms or kills the "just needs more iterations" theory once and
+#    for all (arm_left_latest already suggested no, at ~8000 iters/same result, but that
+#    was a different, older recipe — this tests the actual BestCombined recipe directly).
 # 2) Walking: continue the FROZEN "chosen" checkpoint (LooseHeightNoStep, model_20996 —
 #    good stepping/drift, poor turn_left — NOT the joint_mirror variant, which traded
 #    that win away for better turn_left/drift, see policy_status.md's 2026-07-28 tradeoff
-#    note) another ~5000 iterations, same recipe, no new reward changes. Deliberately NOT
-#    training joint_mirror further tonight — that line of work is paused pending the
-#    command_norm-gating fix (see policy_status.md), not abandoned.
+#    note) another 5000 iterations (flag: 5000 more, 20996+5000=25996, same recipe, no new
+#    reward changes). Deliberately NOT training joint_mirror further tonight — that line
+#    of work is paused pending the command_norm-gating fix (see policy_status.md), not
+#    abandoned.
 # Each training step is followed by its own eval so results are ready to read in the
 # morning, not just raw checkpoints.
 
-run_step "Train: arm best_combined -> 10000 iters total" \
+run_step "Train: arm best_combined -> ~10000 iters total (+8001)" \
     python scripts/rsl_rl/train.py --task G1-Arm-Left-BestCombined-v0 \
         --resume --checkpoint logs/rsl_rl/arms/best_combined/2026-07-26_13-09-32/model_1999.pt \
-        --resume_new_dir --max_iterations 10000 --headless --seed "$SEED"
+        --resume_new_dir --max_iterations 8001 --headless --seed "$SEED"
 
 ARM_RUN_DIR=$(latest_run_dir "arms/best_combined")
 ARM_CKPT=$(latest_checkpoint "$ARM_RUN_DIR")
 if [ -n "$ARM_CKPT" ]; then
-    run_step "Eval: arm best_combined @ 10000 iters" \
+    run_step "Eval: arm best_combined @ ~10000 iters" \
         python validation/eval_arm.py --checkpoint "$ARM_CKPT" --log_std --headless
 else
     echo "[SKIP] arm eval — no checkpoint found in $ARM_RUN_DIR."
 fi
 
-run_step "Train: walking LooseHeightNoStep -> 26000 iters total (+5000)" \
+run_step "Train: walking LooseHeightNoStep -> ~26000 iters total (+5000)" \
     python scripts/rsl_rl/train.py --task G1-Locomotion-Velocity-ArmDisturbance-LooseHeightNoStep-v0 \
         --resume --checkpoint logs/rsl_rl/walking/arm_disturbance/2026-07-28_11-41-33/model_20996.pt \
-        --resume_new_dir --max_iterations 26000 --headless --seed "$SEED"
+        --resume_new_dir --max_iterations 5000 --headless --seed "$SEED"
 
 WALK_RUN_DIR=$(latest_run_dir "walking/arm_disturbance")
 WALK_CKPT=$(latest_checkpoint "$WALK_RUN_DIR")
 if [ -n "$WALK_CKPT" ]; then
-    run_step "Eval: walking LooseHeightNoStep @ 26000 iters" \
+    run_step "Eval: walking LooseHeightNoStep @ ~26000 iters" \
         python validation/eval_walking.py --checkpoint "$WALK_CKPT" \
             --arm_disturbance --skip_displacement --headless
 else
