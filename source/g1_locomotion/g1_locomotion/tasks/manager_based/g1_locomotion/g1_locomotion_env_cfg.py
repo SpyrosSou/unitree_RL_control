@@ -817,6 +817,53 @@ class G1LocomotionArmDisturbanceLooseHeightNoStepMirrorEnvCfg(G1LocomotionArmDis
 
 
 @configclass
+class G1LocomotionArmDisturbanceStandingPackageEnvCfg(G1LocomotionArmDisturbanceLooseHeightNoStepEnvCfg):
+    """2026-07-29 "standing package": the promoted model_20996 recipe
+    (``LooseHeightNoStep``) plus three changes that ALL target stand-still specifically
+    and are ALL gated to (near-)zero commands — by construction none of them can push
+    against walking-time behavior, which is why they're bundled in one run rather than
+    tested as three separate overnights (walking is the secondary priority; the
+    interaction risk between standing-only-gated terms is low).
+
+    Motivation (see policy_status.md 2026-07-29): stand-still drift/stepping regressed
+    under BOTH a reward change (joint_mirror) and a plain no-change continuation —
+    because (a) exact (0,0,0) commands are only ever sampled for the
+    ``rel_standing_envs`` slice (2%), so the literal stand-still case is barely trained,
+    and (b) nothing in the reward anchors *position* while standing (velocity-tracking
+    exp terms have ~zero gradient at small errors; lateral drift has no term at all) —
+    the corner is unanchored and random-walks between checkpoints.
+
+    The three changes:
+    1. ``zero_command_snap_threshold=0.1`` — sampled commands with norm < 0.1 snap to
+       exact (0,0,0) (see ``UniformLevelVelocityCommand``): kills the contradictory
+       band where ``track_lin_vel`` demands ~0.08 m/s while ``feet_contact_without_cmd``
+       (gate < 0.1) simultaneously rewards planted feet, and multiplies exact-zero
+       exposure. Snapped envs also pass ``ArmMotionDisturbance``'s literal-command-norm
+       standing gate, so they get arm-disturbance training too.
+    2. ``rel_standing_envs`` 0.02 -> 0.2 — an order of magnitude more standing
+       practice, without going as far as the (untrained) StandingFocus cfg's 0.5.
+    3. ``stand_position_drift`` (``mdp.StandingPositionDriftPenalty``, weight -1.0, a
+       starting point not a tuned value) — anchors position-at-standing-onset the same
+       way ``heading_drift`` already anchors yaw. Zero whenever commanded to move.
+
+    Train from FRESH weights, not a warm start — the reward composition changes, and
+    both round-1's regression and the 2026-07-29 continuation entry point at
+    warm-starting into changed conditions with a stale critic as the historically risky
+    move here (2026-07-26 round-2 note says the same).
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.commands.base_velocity.zero_command_snap_threshold = 0.1
+        self.commands.base_velocity.rel_standing_envs = 0.2
+        self.rewards.stand_position_drift = RewTerm(
+            func=mdp.StandingPositionDriftPenalty,
+            weight=-1.0,
+            params={"command_name": "base_velocity", "standing_threshold": 0.1},
+        )
+
+
+@configclass
 class G1LocomotionArmDisturbanceEnvCfg_PLAY(G1LocomotionArmDisturbanceEnvCfg):
     """Play/eval variant — same PLAY overrides as ``G1LocomotionEnvCfg_PLAY``, plus starting the
     arm-disturbance phase further along so it's visible quickly (same pattern the 23dof-era

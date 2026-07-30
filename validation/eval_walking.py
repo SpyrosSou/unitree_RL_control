@@ -57,18 +57,38 @@ from isaaclab.app import AppLauncher
 
 # Command envelope: name -> (lin_vel_x, lin_vel_y, ang_vel_z). "straight" buckets (zero
 # commanded lateral velocity and yaw rate) are the ones drift is meaningfully checked on.
+#
+# FIXED 2026-07-29: the turn/strafe/combo buckets previously commanded velocities the
+# policy was NEVER trained on — training limit_ranges cap ang_vel_z at ±0.2 and
+# lin_vel_y at ±0.3 (and ang_vel_z effectively trains at only ±0.1, since
+# ang_vel_cmd_levels was never wired into CurriculumCfg — see mdp/curriculums.py), yet
+# turn_left/right evaluated at ±0.6 (3-6x out of distribution) and strafe at ±0.4.
+# The elevated turn_left fall rates recorded in policy_status.md were therefore
+# stress-test numbers, not in-distribution performance. Default buckets now stay inside
+# the trained envelope; the old values are kept as explicit "*_stress" buckets (opt-in
+# via --buckets, excluded from the default list) so the OOD data point isn't lost.
+# NOTE: turn_*/strafe_*/combo numbers from summaries generated before this date used
+# the old (stress) commands — compare old summaries against the *_stress buckets, not
+# the same-named default ones.
 _BUCKETS = {
     "stand_still": (0.0, 0.0, 0.0),
     "forward_slow": (0.3, 0.0, 0.0),
     "forward_medium": (0.6, 0.0, 0.0),
     "forward_fast": (0.9, 0.0, 0.0),
     "backward": (-0.3, 0.0, 0.0),
-    "strafe_left": (0.0, 0.4, 0.0),
-    "strafe_right": (0.0, -0.4, 0.0),
-    "turn_left": (0.0, 0.0, 0.6),
-    "turn_right": (0.0, 0.0, -0.6),
-    "forward_turn_combo": (0.5, 0.0, 0.4),
+    "strafe_left": (0.0, 0.3, 0.0),
+    "strafe_right": (0.0, -0.3, 0.0),
+    "turn_left": (0.0, 0.0, 0.2),
+    "turn_right": (0.0, 0.0, -0.2),
+    "forward_turn_combo": (0.5, 0.0, 0.2),
+    # Out-of-distribution stress variants (the pre-2026-07-29 bucket values):
+    "strafe_left_stress": (0.0, 0.4, 0.0),
+    "strafe_right_stress": (0.0, -0.4, 0.0),
+    "turn_left_stress": (0.0, 0.0, 0.6),
+    "turn_right_stress": (0.0, 0.0, -0.6),
+    "forward_turn_combo_stress": (0.5, 0.0, 0.4),
 }
+_DEFAULT_BUCKETS = [name for name in _BUCKETS if not name.endswith("_stress")]
 _STRAIGHT_BUCKETS = {"forward_slow", "forward_medium", "forward_fast", "backward"}
 _PHASES = [0, 1, 2, 3]
 
@@ -82,8 +102,9 @@ parser.add_argument(
     "(section 2) runs at all — meaningless without the disturbance event in the first place.",
 )
 parser.add_argument(
-    "--buckets", type=str, nargs="+", default=list(_BUCKETS.keys()), choices=list(_BUCKETS.keys()),
-    help="Which command buckets to evaluate in section 1.",
+    "--buckets", type=str, nargs="+", default=_DEFAULT_BUCKETS, choices=list(_BUCKETS.keys()),
+    help="Which command buckets to evaluate in section 1. The *_stress buckets (the "
+    "pre-2026-07-29 out-of-distribution turn/strafe commands) are opt-in, not default.",
 )
 parser.add_argument(
     "--phases", type=int, nargs="+", default=_PHASES, choices=_PHASES,

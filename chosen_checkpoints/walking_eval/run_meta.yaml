@@ -1,6 +1,6 @@
 script: /home/spyros/Elm/Code/g1_locomotion/validation/eval_walking.py
-git_commit: a7c9375
-started_at: '2026-07-28T11:25:15'
+git_commit: 0a16eb7
+started_at: '2026-07-29T19:53:47'
 args:
   active_gpu: 0
   anim_recording_enabled: false
@@ -9,6 +9,15 @@ args:
   arm_disturbance: true
   buckets:
   - stand_still
+  - forward_slow
+  - forward_medium
+  - forward_fast
+  - backward
+  - strafe_left
+  - strafe_right
+  - turn_left
+  - turn_right
+  - forward_turn_combo
   checkpoint: chosen_checkpoints/walking_latest.pt
   cpu: false
   create_new_stage: false
@@ -29,7 +38,7 @@ args:
   physics_gpu: 0
   rendering_mode: null
   seed: 42
-  skip_displacement: true
+  skip_displacement: false
   skip_phases: false
   steps_per_bucket: 1500
   verbose: false

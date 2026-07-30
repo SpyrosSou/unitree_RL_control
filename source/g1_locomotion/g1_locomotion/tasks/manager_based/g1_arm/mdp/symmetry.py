@@ -49,49 +49,61 @@ __all__ = ["compute_symmetric_arm_states", "mirror_arm_obs", "mirror_arm_actions
 # Roll/yaw joints flip sign under a left-right mirror, pitch joints (and the single-hinge
 # elbow) don't — same convention as g1_locomotion/mdp/symmetry.py.
 _PER_ARM_OBS_DIM = 39
+# 2026-07-29: the integrated-target variant (G1ArmLeftIntegratedEnvCfg) appends a 7-D
+# target_fb block (joint_targets - joint_pos) after action_fb — a joint-space quantity,
+# so it mirrors with the same per-joint sign pattern as joint_pos/joint_vel/action_fb.
+_PER_ARM_OBS_DIM_INTEGRATED = 46
 _PER_ARM_ACTION_DIM = 7
+
+# Per-joint mirror signs: shoulder_pitch, shoulder_roll*, shoulder_yaw*, elbow,
+# wrist_roll*, wrist_pitch, wrist_yaw* — roll/yaw joints flip, pitch (and the
+# single-hinge elbow) don't.
+_JOINT_SIGN = [1.0, -1.0, -1.0, 1.0, -1.0, 1.0, -1.0]
 
 _OBS_SIGN = torch.tensor(
     [
         1.0, -1.0, 1.0,        # base_lin_vel
         -1.0, 1.0, -1.0,       # base_ang_vel
         1.0, -1.0, 1.0,        # projected_gravity
-        # joint_pos: shoulder_pitch, shoulder_roll*, shoulder_yaw*, elbow,
-        #            wrist_roll*, wrist_pitch, wrist_yaw*
-        1.0, -1.0, -1.0, 1.0, -1.0, 1.0, -1.0,
-        # joint_vel: same order/signs as joint_pos
-        1.0, -1.0, -1.0, 1.0, -1.0, 1.0, -1.0,
+        *_JOINT_SIGN,          # joint_pos
+        *_JOINT_SIGN,          # joint_vel
         1.0, -1.0, 1.0,        # ee_pos
         1.0, -1.0, 1.0,        # goal
         1.0, -1.0, 1.0,        # error
-        # action_fb: same order/signs as joint_pos/joint_vel
-        1.0, -1.0, -1.0, 1.0, -1.0, 1.0, -1.0,
+        *_JOINT_SIGN,          # action_fb
     ],
     dtype=torch.float32,
 )
-_ACTION_SIGN = torch.tensor([1.0, -1.0, -1.0, 1.0, -1.0, 1.0, -1.0], dtype=torch.float32)
+_OBS_SIGN_INTEGRATED = torch.cat(
+    [_OBS_SIGN, torch.tensor(_JOINT_SIGN, dtype=torch.float32)]  # + target_fb
+)
+_ACTION_SIGN = torch.tensor(_JOINT_SIGN, dtype=torch.float32)
 
 assert _OBS_SIGN.numel() == _PER_ARM_OBS_DIM
+assert _OBS_SIGN_INTEGRATED.numel() == _PER_ARM_OBS_DIM_INTEGRATED
 assert _ACTION_SIGN.numel() == _PER_ARM_ACTION_DIM
 
 
 def mirror_arm_obs(obs: torch.Tensor) -> torch.Tensor:
     total_dim = obs.shape[-1]
-    sign = _OBS_SIGN.to(obs.device)
 
-    if total_dim == _PER_ARM_OBS_DIM:
+    if total_dim in (_PER_ARM_OBS_DIM, _PER_ARM_OBS_DIM_INTEGRATED):
         # Single-arm mode: pure sign flip, no block swap needed.
+        sign = (_OBS_SIGN if total_dim == _PER_ARM_OBS_DIM else _OBS_SIGN_INTEGRATED).to(obs.device)
         return obs * sign
 
-    if total_dim == 2 * _PER_ARM_OBS_DIM:
+    if total_dim in (2 * _PER_ARM_OBS_DIM, 2 * _PER_ARM_OBS_DIM_INTEGRATED):
         # Both-arms mode: mirroring swaps which arm is "left" and which is "right", so
-        # the two 32-D blocks swap position *and* each gets sign-flipped.
-        left, right = obs[:, :_PER_ARM_OBS_DIM], obs[:, _PER_ARM_OBS_DIM:]
+        # the two per-arm blocks swap position *and* each gets sign-flipped.
+        per_arm = total_dim // 2
+        sign = (_OBS_SIGN if per_arm == _PER_ARM_OBS_DIM else _OBS_SIGN_INTEGRATED).to(obs.device)
+        left, right = obs[:, :per_arm], obs[:, per_arm:]
         return torch.cat([right * sign, left * sign], dim=-1)
 
     raise RuntimeError(
-        f"G1 29dof arm symmetry: observation dim {total_dim} is neither one arm "
-        f"({_PER_ARM_OBS_DIM}) nor both arms ({2 * _PER_ARM_OBS_DIM}) — check this "
+        f"G1 29dof arm symmetry: observation dim {total_dim} is not one arm "
+        f"({_PER_ARM_OBS_DIM}/{_PER_ARM_OBS_DIM_INTEGRATED}) or both arms "
+        f"({2 * _PER_ARM_OBS_DIM}/{2 * _PER_ARM_OBS_DIM_INTEGRATED}) — check this "
         "wasn't applied to a task with a different observation layout than "
         "g1_arm_env.py currently defines."
     )

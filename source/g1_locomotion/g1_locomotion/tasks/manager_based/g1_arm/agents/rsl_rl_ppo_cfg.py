@@ -288,6 +288,22 @@ class G1ArmLeftBestCombinedPPORunnerCfg(G1ArmPPORunnerCfg):
 
 
 @configclass
+class G1ArmLeftIntegratedPPORunnerCfg(G1ArmPPORunnerCfg):
+    """2026-07-29: runner for the integrated-action-target env (G1ArmLeftIntegratedEnvCfg
+    — the static-torque-ceiling fix, probe-validated via
+    testing/general_testing/check_arm_static_torque_ceiling.py). Same proven agent
+    recipe as BestCombined (privileged critic + log_std; action_fb comes from the env
+    base class), so the comparison against best_combined's 28.20%/32.85% isolates the
+    env-side parameterization change, not an agent-side confound."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.experiment_name = "arms/integrated"
+        self.obs_groups = {"policy": ["policy"], "critic": ["critic"]}
+        self.policy.noise_std_type = "log"
+
+
+@configclass
 class G1ArmLeftAblationEntropyCoefSmallPPORunnerCfg(G1ArmPPORunnerCfg):
     """2026-07-25 ablation: entropy_coef=0.003, a real gap between the two extremes
     already tested — 0.0 (baseline) collapses Mean action noise std to 0.09 by

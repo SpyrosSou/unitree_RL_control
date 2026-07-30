@@ -218,6 +218,32 @@ gym.register(
     },
 )
 
+# 2026-07-29: integrated (persistent) action targets + env-local ee/goal observations —
+# the static-torque-ceiling fix, probe-validated via
+# testing/general_testing/check_arm_static_torque_ceiling.py (the legacy current+delta
+# pipeline caps static holding torque at kp*0.06 = 2.4 Nm at the real 40/10 gain;
+# typical goal-box postures need 4.5-5.7 Nm). See G1ArmLeftIntegratedEnvCfg's docstring.
+# Obs is 46-D (target_fb added) — NOT loadable by/against any pre-existing checkpoint.
+gym.register(
+    id="G1-Arm-Left-Integrated-v0",
+    entry_point="g1_locomotion.tasks.manager_based.g1_arm.g1_arm_env:G1ArmEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.g1_arm_env:G1ArmLeftIntegratedEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1ArmLeftIntegratedPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="G1-Arm-Left-Integrated-Play-v0",
+    entry_point="g1_locomotion.tasks.manager_based.g1_arm.g1_arm_env:G1ArmEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.g1_arm_env:G1ArmLeftIntegratedEnvCfg_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1ArmLeftIntegratedPPORunnerCfg",
+    },
+)
+
 # ---------------------------------------------------------------------------
 # Right arm  (train + play)
 # ---------------------------------------------------------------------------

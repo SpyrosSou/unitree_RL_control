@@ -73,7 +73,15 @@ def ang_vel_cmd_levels(
     limit_ranges = command_term.cfg.limit_ranges
 
     reward_term = env.reward_manager.get_term_cfg(reward_term_name)
-    reward = torch.mean(env.reward_manager._episode_sums[reward_term_name][env_ids]) / env.max_episode_length_s
+    # FIXED 2026-07-29: same normalization bug lin_vel_cmd_levels had (fixed there
+    # 2026-07-22, see its comment above) — dividing by the fixed full episode budget
+    # instead of each env's actual elapsed time structurally blocks promotion while
+    # fall rate is high, regardless of true tracking quality. Fixed now so that IF this
+    # term ever gets wired into a CurriculumCfg (it never has been — as of 2026-07-29
+    # no recipe expands ang_vel_z past its (-0.1, 0.1) starting range, which is why
+    # sustained turning is effectively untrained), it actually works.
+    elapsed_s = env.episode_length_buf[env_ids].clamp(min=1).float() * env.step_dt
+    reward = torch.mean(env.reward_manager._episode_sums[reward_term_name][env_ids] / elapsed_s)
 
     if env.common_step_counter % env.max_episode_length == 0:
         if reward > reward_term.weight * 0.8:

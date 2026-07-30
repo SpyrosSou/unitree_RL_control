@@ -340,6 +340,36 @@ class G1ArmEnvCfg(DirectRLEnvCfg):
     # since this flag alone does not resize the tensor the network expects.
     include_action_feedback: bool = True
 
+    # ADDED 2026-07-29: integrated (persistent) action targets — THE fix for the
+    # static-torque ceiling confirmed by testing/general_testing/
+    # check_arm_static_torque_ceiling.py. The legacy pipeline re-anchors the commanded
+    # target to the MEASURED joint position every step (targets = current + delta,
+    # |delta| <= max_action_delta_per_step), so at any static equilibrium the PD torque
+    # is capped at kp * max_action_delta_per_step = 2.4 Nm at the real 40/10 gain — but
+    # typical goal-box reach postures need 4.5-5.7 Nm at shoulder pitch/roll (URDF-
+    # derived, probe-confirmed: the pipeline saturates at exactly 2.42-2.46 Nm implied
+    # torque and sags 35-54 deg, while this integrated mechanism holds the same postures
+    # at 0.00 deg error sustaining 5.4-6.2 Nm AT THE SAME GAIN). When True, the same
+    # per-step delta (same EMA filter, same rate cap — smoothness semantics unchanged)
+    # instead accumulates into a persistent target state that CAN drift beyond the
+    # current position to build up a gravity-holding bias — exactly what real
+    # deployment's absolute-target interface (default + scale*action, see
+    # unitree_rl_lab's State_RLBase) already allows and the legacy pipeline forbade.
+    # Deployment note: g1_rl_control must replicate the integration (target += clamped
+    # delta), NOT the legacy current+delta, for checkpoints trained with this flag.
+    # False by default — every pre-2026-07-29 task/checkpoint keeps legacy behavior.
+    integrate_action_targets: bool = False
+
+    # ADDED 2026-07-29: observe ee_pos/goal in the env-local frame (env_origins
+    # subtracted) instead of raw world coordinates. With 4096 envs at 2 m spacing the
+    # raw world values carry per-env constant offsets of tens of meters, so after
+    # empirical observation normalization those 6 dims are mostly env-identity noise —
+    # and mdp/symmetry.py's y-sign flip on them produced mirrored samples inconsistent
+    # with the env's actual origin. Local-frame values make both the features and the
+    # mirror physically meaningful. False by default: this silently changes observation
+    # VALUES (not dims), so old checkpoints must keep reading what they trained on.
+    env_local_obs: bool = False
+
     # Robot — G1 29dof asset, fixed base (this task doesn't need locomotion-grade
     # ground-contact fidelity; only arm joints are RL-actuated, everything else held
     # rigid by its own default PD gains, see __post_init__).
@@ -596,6 +626,41 @@ class G1ArmLeftAdaptiveRateEnvCfg(G1ArmLeftEnvCfg):
 
 
 @configclass
+class G1ArmLeftIntegratedEnvCfg(G1ArmLeftEnvCfg):
+    """2026-07-29: integrated action targets + env-local ee/goal observations — the
+    static-torque-ceiling fix, probe-validated the same day (see
+    integrate_action_targets' own field docstring for the mechanism and
+    testing/general_testing/check_arm_static_torque_ceiling.py for the evidence:
+    the legacy pipeline saturates at exactly kp*0.06 = 2.4 Nm and sags 35-54 deg on
+    typical goal-box postures; the integrated mechanism holds them at 0.00 deg at the
+    same 40/10 gain).
+
+    Observation grows 39 -> 46: a 7-D target_fb block (joint_targets - joint_pos, the
+    accumulated PD bias) is appended per arm. Without it the persistent target would be
+    hidden state a memoryless policy can't know — the exact POMDP gap action_fb was
+    added to close for the EMA filter (action_fb itself stays, same rationale as
+    before: the EMA state is still in the loop). mdp/symmetry.py handles the 46-D
+    layout explicitly (target_fb mirrors with the joint-space sign pattern).
+
+    Everything else deliberately unchanged from the plain left-arm task (same gain,
+    same rate limit, same reward, same noise) so the 2000-iteration comparison against
+    best_combined isolates the parameterization change + local-frame obs, not a
+    bundle of retuned hyperparameters."""
+
+    integrate_action_targets: bool = True
+    env_local_obs: bool = True
+    observation_space: int = 46
+
+
+@configclass
+class G1ArmLeftIntegratedEnvCfg_PLAY(G1ArmLeftIntegratedEnvCfg):
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.num_envs = 32
+        self.episode_length_s = 20.0
+
+
+@configclass
 class G1ArmLeftAblationLowVelNoiseEnvCfg(G1ArmLeftEnvCfg):
     """2026-07-25 ablation: joint_vel_noise reduced from 1.5 rad/s to 0.1 rad/s, in
     isolation (no other change — same gain, same reward, symmetry intact).
@@ -828,6 +893,11 @@ class G1ArmEnv(DirectRLEnv):
         self.goal_positions = torch.zeros((self.num_envs, self.n_arms, 3), device=self.device)
         self.previous_actions = torch.zeros((self.num_envs, self.cfg.action_space), device=self.device)
         self.filtered_actions = torch.zeros((self.num_envs, self.cfg.action_space), device=self.device)
+        # cfg.integrate_action_targets: the persistent commanded-target state — always
+        # allocated (cheap), only read/written when the flag is on. Initialized to the
+        # current joint positions (zero initial PD bias); _reset_idx re-anchors it to
+        # each env's randomized reset posture.
+        self.joint_targets = self.robot.data.joint_pos[:, self.arm_joint_indices_tensor].clone()
         self.successes = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         # Consecutive-steps-within-threshold counter — see goal_hold_steps' own comment.
         self._hold_counter = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
@@ -958,8 +1028,18 @@ class G1ArmEnv(DirectRLEnv):
         elif base_max_delta > 0.0:
             delta = delta.clamp(min=-base_max_delta, max=base_max_delta)
 
-        targets = current + delta
+        # cfg.integrate_action_targets: accumulate the (identically rate-limited) delta
+        # into the persistent target instead of re-anchoring to the measured position —
+        # removes the kp*max_delta static-torque ceiling (see the cfg field's docstring
+        # and check_arm_static_torque_ceiling.py). Legacy path unchanged for every
+        # pre-2026-07-29 task/checkpoint.
+        if self.cfg.integrate_action_targets:
+            targets = self.joint_targets + delta
+        else:
+            targets = current + delta
         targets = targets.clamp(self._arm_hw_limits[:, 0], self._arm_hw_limits[:, 1])
+        if self.cfg.integrate_action_targets:
+            self.joint_targets = targets
         self.robot.set_joint_position_target(targets, joint_ids=self.arm_joint_indices_tensor)
         self.previous_actions[:] = self.filtered_actions
 
@@ -1016,6 +1096,13 @@ class G1ArmEnv(DirectRLEnv):
             ee_pos = self.robot.data.body_pos_w[:, arm["ee_idx"], :]  # (N, 3)
             goal = self.goal_positions[:, i, :]                        # (N, 3)
             error = goal - ee_pos                                       # (N, 3)
+            # cfg.env_local_obs (2026-07-29): subtract env_origins so ee_pos/goal are
+            # robot-local values instead of raw world coordinates carrying a per-env
+            # constant offset of up to tens of meters — see the cfg field's docstring.
+            # error is unaffected either way (the origin cancels in the difference).
+            if self.cfg.env_local_obs:
+                ee_pos = ee_pos - self.scene.env_origins
+                goal = goal - self.scene.env_origins
             # ADDED 2026-07-26: the policy previously had NO way to observe its own
             # action-filter's internal state (self.filtered_actions — an EMA of past
             # actions, action_filter_alpha=0.25, i.e. ~75% memory of history each step).
@@ -1036,6 +1123,18 @@ class G1ArmEnv(DirectRLEnv):
                 action_fb = self.filtered_actions[:, arm["action_slice"]]  # (N, 7)
                 parts.append(action_fb)
                 critic_parts.append(action_fb)
+            # cfg.integrate_action_targets (2026-07-29): the persistent target is new
+            # hidden state in the control loop — expose the accumulated PD bias
+            # (target - measured position) so a memoryless policy can regulate it,
+            # same POMDP-gap rationale as action_fb for the EMA filter. Exact internal
+            # state, no noise (same reasoning as action_fb's own comment above).
+            if self.cfg.integrate_action_targets:
+                target_fb = (
+                    self.joint_targets[:, arm["action_slice"]]
+                    - self.robot.data.joint_pos[:, jt]
+                )  # (N, 7)
+                parts.append(target_fb)
+                critic_parts.append(target_fb)
         return {"policy": torch.cat(parts, dim=-1), "critic": torch.cat(critic_parts, dim=-1)}
 
     # ------------------------------------------------------------------
@@ -1214,6 +1313,9 @@ class G1ArmEnv(DirectRLEnv):
 
         self.previous_actions[env_ids_tensor] = 0.0
         self.filtered_actions[env_ids_tensor] = 0.0
+        # Re-anchor the persistent target (cfg.integrate_action_targets) to the exact
+        # randomized posture just written to sim — zero initial PD bias every episode.
+        self.joint_targets[env_ids_tensor] = joint_pos[:, self.arm_joint_indices_tensor]
         self.successes[env_ids_tensor] = False
         self._hold_counter[env_ids_tensor] = 0
         self.episode_length_buf[env_ids_tensor] = 0

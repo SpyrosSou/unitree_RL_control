@@ -309,3 +309,53 @@ class HeadingDriftPenalty(ManagerTermBase):
         self._cmd_yaw_integral += command[:, 2] * env.step_dt
 
         return heading_drift.abs()
+
+
+class StandingPositionDriftPenalty(ManagerTermBase):
+    """Penalizes xy drift from the position where the robot last entered standing.
+
+    ADDED 2026-07-29 (standing package). Nothing else in the recipe anchors *position*
+    while standing: the exp-shaped velocity-tracking terms have near-zero gradient at
+    small velocity errors (drifting at 0.04 m/s costs ~0.6% of the tracking reward), and
+    lateral drift has no term at all since the round-1 drift experiment was reverted —
+    so stand-still position drift is structurally free, consistent with it regressing
+    whenever unrelated training pressure shifts (see policy_status.md's 2026-07-29
+    plain-continuation entry). Same anchored-at-transition design as
+    ``HeadingDriftPenalty`` above (which keeps covering yaw): the anchor is captured the
+    step an env's command norm drops below ``standing_threshold``, the penalty is the
+    xy distance from that anchor, and it is zero whenever the env is commanded to move —
+    by construction this term cannot fight any walking behavior. After a push
+    (``push_robot`` stays active), the gradient favors stepping back to the anchor
+    rather than accepting the displaced position.
+    """
+
+    def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+        asset_cfg: SceneEntityCfg = cfg.params.get("asset_cfg", SceneEntityCfg("robot"))
+        self._robot: Articulation = env.scene[asset_cfg.name]
+        self._anchor_xy = torch.zeros(env.num_envs, 2, device=self.device)
+        self._was_standing = torch.zeros(env.num_envs, dtype=torch.bool, device=self.device)
+
+    def reset(self, env_ids: torch.Tensor | None = None) -> None:
+        if env_ids is None:
+            env_ids = slice(None)
+        # Anchor re-captured on the first post-reset step an env counts as standing.
+        self._was_standing[env_ids] = False
+
+    def __call__(
+        self,
+        env: ManagerBasedRLEnv,
+        command_name: str = "base_velocity",
+        standing_threshold: float = 0.1,
+        asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    ) -> torch.Tensor:
+        command = env.command_manager.get_command(command_name)
+        standing = torch.norm(command, dim=1) < standing_threshold
+        pos_xy = self._robot.data.root_pos_w[:, :2]
+
+        entering = standing & ~self._was_standing
+        self._anchor_xy[entering] = pos_xy[entering]
+        self._was_standing[:] = standing
+
+        drift = torch.norm(pos_xy - self._anchor_xy, dim=1)
+        return drift * standing.float()

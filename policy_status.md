@@ -6,16 +6,34 @@ found — don't let it go stale the way `known_issues.md` did on the 23dof branc
 
 ## Walking + standing (`chosen_checkpoints/walking_latest.pt`)
 
+**PROMOTED 2026-07-30 (current):** `logs/rsl_rl/walking/arm_disturbance/
+2026-07-29_23-28-41/model_6999.pt` (`G1-Locomotion-Velocity-ArmDisturbance-
+StandingPackage-v0`, trained fresh — the "standing package": exact-zero command snap,
+`rel_standing_envs` 0.02→0.2, a new position-anchor penalty at standing onset; see the
+2026-07-30 entries below for the full recipe and results). Chosen specifically for the
+arm-integration priority — stand_still step count 8.23→1.96, |lateral drift|
+0.076→0.031m, 0% falls across every disturbance phase, and the in-distribution turn
+eval (see the 2026-07-30 eval-bucket-fix entry below) reads 0% falls everywhere.
+**Known costs, not yet addressed:** `forward_slow` heading drift roughly doubled
+(62→112 deg; medium/fast/backward improved), and in-place turning is now essentially
+untrained/ignored. Superseded checkpoint below (`model_20996`) kept as
+`chosen_checkpoints/walking_latest_prev.pt` for rollback/comparison — better
+straight-line walking and turning, worse standing.
+
+<details>
+<summary>Superseded 2026-07-28 promotion history (model_20996, kept for context)</summary>
+
 **FROZEN 2026-07-28** (explicit user decision — "we can spend weeks trying to improve
 the walking... let's freeze it a little bit"). **Promoted**: `logs/rsl_rl/walking/
 arm_disturbance/2026-07-28_11-41-33/model_20996.pt`
 (`G1-Locomotion-Velocity-ArmDisturbance-LooseHeightNoStep-v0`) — good stand-still
 stepping/drift (the actual thing the arm policy needed fixed), known elevated
-`turn_left` fall rate under sustained turning. See "2026-07-28: the joint_mirror
-tradeoff" below for exactly what was tried after this and why it wasn't promoted
-instead. Being trained ~5000 more iterations overnight (same recipe, no reward changes)
-via `overnight_train.sh` — check whether that changed this entry before trusting it as
-current.
+`turn_left` fall rate under sustained turning (later found 2026-07-30 to be almost
+entirely an eval artifact, not a real weakness — see below). See "2026-07-28: the
+joint_mirror tradeoff" below for exactly what was tried after this and why it wasn't
+promoted instead.
+
+</details>
 
 Superseded: the 2026-07-25 promotion (`logs/rsl_rl/walking/arm_disturbance/
 2026-07-24_15-47-18/model_15998.pt`, warm-started from `walking_2026-07-24_base_only_
@@ -79,6 +97,31 @@ directory. **General lesson**: don't assume plain continuation of a working reci
 safe-by-default even with an unchanged reward and a flat-looking training curve — worth
 an eval check before trusting any further continuation of this checkpoint, not just
 reward-changing experiments.
+
+**2026-07-29 — turn/strafe evals were out-of-distribution, plus a "standing package"
+built (not yet trained).** Code review found `ang_vel_cmd_levels` exists in
+`mdp/curriculums.py` but was NEVER wired into `CurriculumCfg` (only `terrain_levels` +
+`lin_vel_cmd_levels` are), so every run trains yaw commands at the starting (-0.1, 0.1)
+only — while `eval_walking.py` commanded turns at ±0.6 (3-6x OOD) and strafe at ±0.4
+(vs the ±0.3 limit). The elevated `turn_left` fall rates above are therefore
+stress-test numbers, not in-distribution performance (the left-vs-right difference
+still reflects the real measured gait asymmetry). Fixed 2026-07-29: default eval
+buckets now stay inside the trained envelope (turn ±0.2, strafe ±0.3, combo wz 0.2);
+the old commands live on as opt-in `*_stress` buckets — pre-2026-07-29 summaries'
+turn/strafe rows compare against `*_stress`, not the same-named defaults. Also fixed
+`ang_vel_cmd_levels`' stale episode-length normalization (the exact bug
+`lin_vel_cmd_levels` had fixed 2026-07-22) so it actually works if ever wired in.
+**Standing package** (`G1-Locomotion-Velocity-ArmDisturbance-StandingPackage-v0`,
+implemented, NOT yet trained — train from FRESH weights): the model_20996 recipe plus
+three standing-only-gated changes targeting the unanchored-zero-command mechanism
+behind both 2026-07-28/29 standing regressions — (1) sampled commands with norm < 0.1
+snap to exact (0,0,0) (`UniformLevelVelocityCommand`, kills the contradictory
+track-vs-feet-contact band and multiplies exact-zero exposure), (2) `rel_standing_envs`
+0.02→0.2, (3) `mdp.StandingPositionDriftPenalty` weight -1.0 (anchors position at
+standing onset the way `heading_drift` anchors yaw; zero whenever commanded to move).
+Also noted 2026-07-29: RSL-RL resumes restore weights but NOT env curriculum state —
+every warm-started run re-anneals command ranges from (-0.1, 0.1), a confound when
+comparing layered experiments.
 
 **Confirmed working, not assumed:**
 - Real walking — verified via direct `root_pos_w` displacement measurement (not just
@@ -206,11 +249,18 @@ arm-IK integration below.
 
 ## Arm reaching
 
-**Status: not working, root cause still open, but two small real improvements found +
-one structural gap fixed.** Every 7-DOF run at the real hardware gain (40/10
-stiffness/damping, confirmed matching real deployment — see `unitree_rl_lab/deploy/
-include/FSM/State_RLBase.h`, `tau()=0` on real hardware too, so this isn't a sim-only
-artifact) plateaus in the 25-29% success band.
+**Status as of 2026-07-30: root cause found and fixed — reaching itself is solved.**
+The 25-29%-plateau history below (everything up to and including the
+"CORRECTED 2026-07-28" note) turned out to trace to one thing: the action pipeline's
+`current + delta` parameterization capped static holding torque well below what
+gravity requires at the real 40/10 hardware gain (see "2026-07-29 — ROOT CAUSE FOUND"
+further down). Fixed via `G1-Arm-Left-Integrated-v0`: 100% reach rate, ~1-3mm typical
+precision at the real gain. **Not yet promoted to `chosen_checkpoints/`** — one more
+retrain is needed to fix a termination/bonus incentive issue (see the 2026-07-30
+outcome entry and `arms_policy_finalisation.md` for the exact pick-up plan) before
+this is a finished artifact. The history below (gain sweeps, entropy ablations, locked
+wrist, etc.) is kept for the record — all of it was, in hindsight, working around a
+single control-interface detail, not the actual bottleneck.
 
 **CORRECTED 2026-07-28** (this note was wrong): `chosen_checkpoints/arm_left_latest.pt`
 was previously called "stale — do not treat it as current" here. Per the user directly:
@@ -352,6 +402,78 @@ entire bottleneck, confirming the "holding is basically solved" read above; and
 converges-then-plateaus shape as the 2000-iter checkpoint, unchanged by more training.
 **Iteration count is now ruled out twice over — the next lever has to be structural
 (`goal_curriculum`, still unfinished, or the IK pivot), not more brute-force training.**
+
+**2026-07-29 — ROOT CAUSE FOUND (probe-confirmed, fix implemented, training pending):
+the action pipeline itself caps static holding torque below what gravity demands.**
+`_apply_action` re-anchors the commanded target to the MEASURED joint position every
+step (`targets = current + delta`, `|delta| <= 0.06 rad`), so at any static equilibrium
+the PD torque is capped at `kp * 0.06` — **2.4 Nm at 40/10** vs 12 Nm at 200/20. URDF
+analysis (left arm 3.52 kg incl. hand): typical goal-box reach postures need 4.5-5.7 Nm
+at shoulder pitch/roll; ~72% of random arm poses exceed 2.4 Nm at some proximal joint,
+~0% exceed 12 Nm, and kp=15's 0.9 Nm ceiling is exceeded by 99% — mapping cleanly onto
+the observed 200/20≈99.98% / 40/10≈28-30% / 15/1≈5.5% results, the ~290/300
+episode-length ceiling (can't hold 15 consecutive steps without static torque), the
+~7cm converged-but-imprecise sag plateau, and why no RL-side lever ever moved it.
+Confirmed with a no-RL probe (`testing/general_testing/check_arm_static_torque_ceiling.py`,
+run 2026-07-29): the pipeline saturates at exactly 2.42-2.46 Nm implied torque and sags
+35-54 deg on high-torque postures (but holds a 1.4 Nm control posture — falsifiable
+both ways, passed both ways), while an integrated-target variant holds ALL postures at
+0.00 deg error at the same 40/10 gain, sustaining 5.4-6.2 Nm. Probe side-finding: the
+~11-14cm residual ee error common to ALL well-holding modes is torso/waist lean under
+the arm's weight (stock-gain passive waist joints — same mechanism as 2026-07-27's
+measured ~20 deg waist_pitch creep; compensable by a policy that sees true ee position).
+**Fix implemented as `G1-Arm-Left-Integrated-v0`** (`G1ArmLeftIntegratedEnvCfg` +
+`G1ArmLeftIntegratedPPORunnerCfg`, BestCombined agent recipe): same per-step rate
+limit/EMA, but the delta accumulates into a persistent target that can hold a gravity
+bias (matches real deployment's absolute-target semantics — g1_rl_control must
+replicate `target += clamped delta`, NOT `current + delta`). Also in this variant:
+obs 39→46 (`target_fb` = target − joint_pos, closing the new hidden-state POMDP gap;
+symmetry.py extended for 46/92-D) and env-local ee/goal obs (`env_local_obs=True` —
+raw world coords carried per-env origin offsets of tens of meters, making those dims
+normalization-noise and the symmetry mirror on them physically inconsistent). Every
+pre-existing task/checkpoint untouched (both behaviors flag-gated, default off).
+Eval via `validation/eval_arm.py --integrated`. NOT yet trained — 2k-iter comparison
+vs best_combined's 28.20%/32.85% is the pending decisive test.
+
+**2026-07-30 — Integrated trained 8000 iters
+(`logs/rsl_rl/arms/integrated/2026-07-29_20-27-48`): the fix works — reaching is
+SOLVED; the residual low "success rate" is a termination-incentive artifact, not a
+capability gap.** Headline numbers (final checkpoint, 539/554 episodes):
+`reach_rate_no_hold` **100.00%** both buckets (best_combined: ~30%), min-dist mean
+**0.14-0.15 cm** / p90 0.25-0.26 cm (best_combined: ~7 cm), `final_dist_to_goal_cm`
+mean 1.22-1.26 cm with **100% of all 1093 episodes ending within 2.76 cm** (81% within
+2.0 cm), per-step `frac_envs_reached` 0.79. Millimeter-precision reaching at the real
+40/10 hardware gain, robust to wobble. BUT `success_rate` (15 CONSECUTIVE steps <2cm +
+early termination) reads only 6.49%/9.39% (10.78%/16.67% at the 2000-iter checkpoint) —
+diagnosis: the policy hovers at ~1.1 cm mean, flickering across the 2 cm line, so the
+consecutive-hold counter keeps resetting; and `terminate_on_success` makes completing a
+hold REWARD-NEGATIVE (termination ends the 50/step `goal_reached_bonus` stream and
+respawns a distant goal), so the reward-optimal behavior is to dither at the boundary
+and never "succeed." Evidence it's the incentive, not noise: 2k→8k training improved
+every real quantity (min dist 0.22→0.14 cm, final dist 1.40→1.26 cm, in-zone frac
+0.71→0.79, joints-at-limit 0.84→0.22, mean reward 33.8→38.2) while the success flag
+FELL 10.8→6.5 — the optimizer is learning to avoid termination. Fix is reward/metric
+design, not more capability work: (a) train without `terminate_on_success` (or keep
+paying the bonus post-success) and/or scale `goal_reached_bonus` by the hold counter so
+settling deeper strictly beats dithering; (b) judge checkpoints by final-window
+distance (this one scores ~81% at 2 cm / 100% at 3 cm), which is what a grasp use case
+actually needs. For deployment NOW this is already the best arm artifact this repo has
+produced (the 200/20 reference's true single-shot rate was ~30%). Deployment reminder:
+`g1_rl_control` must integrate deltas (`target += clamped_delta`), not `current+delta`.
+
+**2026-07-30 — StandingPackage trained 7000 iters fresh
+(`logs/rsl_rl/walking/arm_disturbance/2026-07-29_23-28-41`, model_6999): standing goal
+achieved, with two honest costs.** `stand_still`: step count 8.23→**1.96**, |lateral
+drift| 0.076→**0.031 m**, 0% falls, near-0% across all 4 disturbance phases (1/1025)
+— the package (zero-snap + rel_standing 0.2 + position anchor) did exactly what it was
+built for. Costs vs model_20996: (1) `forward_slow` heading drift 62→112 deg (medium/
+fast/backward improved: 52→44, 57→43, 64→17); (2) in-place turning is now essentially
+ignored — `turn_left/right` ang track err ≈ the commanded 0.2 rad/s with ~2 steps,
+i.e. it stands still through pure-turn commands (turning was always undertrained —
+dead ang_vel curriculum — but this policy sacrifices it further for stillness).
+Promotion to `chosen_checkpoints/walking_latest.pt` is justified for the
+arm-integration use case (user's stated priority); keep model_20996 as the
+better-walking fallback if forward_slow drift or in-place turning ever matter.
 
 **Gain search (2026-07-26) — closed.** Tested against Unitree's own real values, not
 guesses: `Gain60Kd1p5` (60/1.5, dedicated arm-SDK example gain) — 24.43%/23.42%,

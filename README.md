@@ -15,9 +15,12 @@ This repository contains:
 
 **Start here if you're new to this repo (human or a fresh Claude chat): read the
 "Overview / up to speed" section near the bottom of this file, then `policy_status.md`
-for full current status and findings, then `retrospective.md` for a narrative summary
-of what was tried this week and why (including why walking is one combined policy
-instead of two decoupled ones).**
+for full current status and findings (or `policy_overview.md` for a brief
+reward/curriculum/what's-been-tried summary of both current recipes), then
+`retrospective.md` for a narrative summary of what was tried this week and why
+(including why walking is one combined policy instead of two decoupled ones). If
+you're specifically picking up the arm policy's last remaining step, go straight to
+`arms_policy_finalisation.md`.**
 
 ## What Is In This Repo
 
@@ -50,9 +53,14 @@ environment.
 This repo ignores large training logs (`logs/`) and intermediate checkpoints, but keeps
 a small curated set of deployable models in `chosen_checkpoints/` — see that directory's
 own `README.md` for exactly which checkpoint is current and its provenance. As of
-2026-07-27: `walking_latest.pt` is the deployable walking+standing checkpoint;
-`arm_left_latest.pt` is stale — the actual current-best arm checkpoint (`best_combined`)
-hasn't been promoted there yet, see `chosen_checkpoints/README.md`.
+2026-07-30: `walking_latest.pt` is the promoted walking+standing checkpoint (the
+"standing package" recipe — much stiller when standing, at the cost of more
+straight-line heading drift and untrained in-place turning; see
+`chosen_checkpoints/README.md`). `arm_left_latest.pt` is still stale — the actual
+current-best arm checkpoint (`G1-Arm-Left-Integrated-v0`, which solved precise
+reaching via a 2026-07-29 fix) hasn't been promoted there yet: it needs one more
+reward-design retrain first (see `arms_policy_finalisation.md`) and isn't yet
+compatible with the demo script below.
 
 ## Quick Start
 
@@ -86,7 +94,13 @@ python testing/visual_testing/full_demo/g1_full_demo.py \
 ```
 
 See `testing/visual_testing/full_demo/README.md` for controls, keybindings, and the
-`--reset_arm_on_walk` flag.
+`--reset_arm_on_walk` flag. `--loco_checkpoint` above now resolves to the 2026-07-30
+"standing package" checkpoint (see `chosen_checkpoints/README.md`) automatically.
+`--arm_checkpoint` is left on `best_combined` deliberately — the newer, better
+`G1-Arm-Left-Integrated-v0` checkpoint is not yet demo-compatible (this script
+hand-rolls its own arm control loop rather than reusing `G1ArmEnv`, and doesn't yet
+know about that task's integrated-target action pipeline or 46-D observation
+layout) — see `chosen_checkpoints/README.md` for what's needed before that changes.
 
 ## Repo Layout
 
@@ -137,25 +151,30 @@ project's own validation/testing methodology was kept, only the underlying asset
 changed). Older 23-DOF-era work lives on the `23_dof` git branch and an external backup
 at `~/Elm/Backups/g1_locomotion/23_dof/` if ever needed — not deleted, just superseded.
 
-**Current status (2026-07-27):**
-- **Walking/standing**: working, `chosen_checkpoints/walking_latest.pt` — 0% fall rate,
-  real verified translation, but a known ~24-27° heading drift over a straight 20s walk.
-  Three rounds of drift-fix attempts all made heading drift *worse*, not better —
-  treated as a real pattern, not bad luck, and currently on hold. A live hypothesis
-  (`base_height`'s reward weight forcing near-locked knees, reducing balance-recovery
-  margin) is flagged but not yet acted on.
-- **Arms**: no single checkpoint is fully trustworthy yet. The training-time success
-  metric (up to 99.98% for one reference checkpoint) does NOT reflect true single-shot
-  reliability (~30%, confirmed via a dedicated long-hold/single-attempt test) — a real,
-  hard-won methodology finding, not just a tuning gap. `best_combined`
-  (`logs/rsl_rl/arms/best_combined/2026-07-26_13-09-32/model_1999.pt`) is the current
-  best RL candidate under every eval method tried so far.
-- **Current direction**: given RL alone hasn't reliably solved precise single-shot
-  reaching, the plan is to use `unitreerobotics/xr_teleoperate`'s `G1_29_ArmIK`
-  (Pinocchio+CasADi, official Unitree code, matches this exact robot) for precise
-  grasp targets, keeping the RL policy for compliant continuous-gesture motion. This is
-  being implemented on a new branch (proposed: `29dof_IK`) — `main` stays exactly as-is
-  as the fallback if the IK approach doesn't pan out.
+**Current status (2026-07-30):**
+- **Walking/standing**: working, `chosen_checkpoints/walking_latest.pt` — 0% fall rate
+  across every command bucket (including in-distribution turning) and every
+  arm-disturbance phase, real verified translation, and — as of the 2026-07-30
+  "standing package" promotion — genuinely still while standing (step count ~2,
+  lateral drift ~3cm). Traded off to get there: straight-line heading drift while
+  actually walking got worse (~112° vs. the prior checkpoint's ~62° over a 20s
+  episode), and sustained in-place turning is now essentially untrained/ignored.
+  Several earlier drift-fix rounds also made heading drift worse, not better — see
+  `policy_status.md` for the full history and what's still open.
+- **Arms**: the long-standing ~25-30% plateau is **resolved** — root cause found
+  2026-07-29 (the action pipeline capped static holding torque well below what
+  gravity needs at the real 40/10 hardware gain) and fixed via an integrated
+  action-target parameterization (`G1-Arm-Left-Integrated-v0`). Reaching itself is
+  now genuinely solved: 100% reach rate, ~1-3mm typical precision. One more
+  reward-design retrain is needed before promotion (the current checkpoint dithers
+  right at the 2cm boundary instead of settling deep, due to a termination/bonus
+  incentive issue, not a capability gap) — see `arms_policy_finalisation.md` for the
+  exact pick-up plan, or `policy_status.md` for the full evidence trail.
+- **IK pivot, reassessed**: `unitreerobotics/xr_teleoperate`'s `G1_29_ArmIK` was
+  under consideration as a fallback while pure-RL reaching looked stuck (see history
+  below) — with reaching now solved, IK is no longer needed as the primary path for
+  precise grasping, though it may still be worth keeping as a belt-and-braces option
+  for exact SE(3) targets once the arm policy is otherwise finished.
 
 **Working conventions worth knowing before touching anything:**
 - Verify before concluding — this project has repeatedly found that plausible-sounding

@@ -19,7 +19,14 @@ One script, one Isaac Sim launch, one `summary.md`, three sections:
 1. **Command-bucket sweep** — a fixed command envelope (forward at a few speeds,
    backward, strafe, turn, a combined forward+turn case), each held constant for the
    whole rollout. Reports fall rate, tracking error, foot slip, and — for the
-   zero-lateral/zero-yaw "straight" buckets — heading/lateral drift.
+   zero-lateral/zero-yaw "straight" buckets — heading/lateral drift. **Fixed
+   2026-07-30**: the turn/strafe/combo buckets previously commanded velocities well
+   outside what any recipe actually trains on (ang_vel_z curriculum was never wired
+   in — see `policy_status.md`) — default buckets now stay in-distribution; the old
+   out-of-distribution commands are kept as opt-in `*_stress` buckets (`--buckets
+   turn_left_stress ...`). Numbers from summaries generated before this date used the
+   old commands for turn/strafe/combo — compare those against `*_stress`, not the
+   same-named defaults.
 2. **Arm-disturbance phase sweep** — fall rate while standing still, under each of the
    4 disturbance phases pinned individually (only with `--arm_disturbance`; skip with
    `--skip_phases`). **Important**: the disturbance's phase is sampled once per episode
@@ -41,26 +48,45 @@ bucket/phase in their own subdirectories. Pass `--arm_disturbance` for any check
 trained on `G1-Locomotion-Velocity-ArmDisturbance-v0` (every current walking
 checkpoint); omit only for a pure base-recipe checkpoint.
 
-**Reading the numbers** (current reference: `walking_latest.pt`, 2026-07-27): fall rate
-0% across every bucket/phase is the bar to clear. `mean_lin_vel_track_err_m_s` around
-0.10-0.13 m/s at 0.3-0.6 m/s commanded is the current baseline. Heading drift is a known
-open issue — see `policy_status.md`'s "Known gap" section for current numbers and
-context before treating any specific drift value as surprising.
+**Reading the numbers** (current reference: `walking_latest.pt`, the 2026-07-30
+"standing package" promotion — see `chosen_checkpoints/README.md`): fall rate 0%
+across every bucket/phase (including in-distribution turning) is the bar to clear.
+`mean_lin_vel_track_err_m_s` around 0.10-0.13 m/s at 0.3-0.6 m/s commanded is the
+baseline. This checkpoint trades better standing (step count ~2, lateral drift ~3cm)
+for worse straight-line heading drift and untrained in-place turning — see
+`policy_status.md`'s Walking section for current numbers and context before treating
+any specific drift value as surprising.
 
-## `eval_arm.py` — can it actually reach the goal?
+## `eval_arm.py` — can it actually reach the goal, and can it hold it?
 
 ```bash
 conda activate isaac_g1_control
 python validation/eval_arm.py --checkpoint logs/rsl_rl/arms/<run>/model_<iter>.pt --headless
 ```
 
-Output: `<checkpoint_dir>/arm_eval/summary.md` — success rate, mean/median/p90 distance
-to goal, joint-range utilization (did it use a genuine range of motion or just tiny
+Output: `<checkpoint_dir>/arm_eval/summary.md` — mean/median/p90 distance to goal,
+joint-range utilization (did it use a genuine range of motion or just tiny
 movements), and a per-reward-term breakdown, across two buckets (synthetic base-tilt
-"wobble" forced off vs. on).
+"wobble" forced off vs. on). Headline columns as of 2026-07-30:
+- **Settled <2cm / <3cm** — fraction of episodes *ending* that close to the goal.
+- **Tail-settle (Ws)** — fraction of episodes that stayed under `goal_threshold` for
+  the *entire* trailing `W` seconds (`--tail_window_s`, default 5.0) — the direct
+  hold-capability measure, distinguishing genuine settling from a policy that's still
+  oscillating right up to the last instant. Computed purely from existing per-second
+  distance snapshots; works on any checkpoint.
+- **Success rate (reach+hold, legacy)** — the original 15-consecutive-step-hold +
+  early-termination definition. Kept for historical comparison only — it's a known
+  **incentive artifact** for a well-trained policy under `terminate_on_success=True`
+  (completing the hold ends the per-step bonus stream, so the policy learns to dither
+  at the boundary instead) and reads a **structural 0%** for any checkpoint trained
+  with `terminate_on_success=False`. Do not judge a checkpoint by this column alone —
+  see `policy_status.md`'s 2026-07-30 arm entries and `arms_policy_finalisation.md`.
 
-**Flags for older checkpoints** (needed or `runner.load()` fails on a shape/key
+**Flags for older/other checkpoints** (needed or `runner.load()` fails on a shape/key
 mismatch, not a silent corruption):
+- `--integrated` — a `G1-Arm-Left-Integrated-v0` checkpoint (2026-07-29 static-
+  torque-ceiling fix: integrated action targets + env-local ee/goal obs, 46-D) — the
+  current best arm candidate, see `chosen_checkpoints/README.md`.
 - `--legacy32` — checkpoints trained before 2026-07-26's `action_fb` observation
   addition (32-D obs instead of 39-D) — e.g. the 200/20-gain reference.
 - `--log_std` — checkpoints trained with `noise_std_type="log"` instead of the default

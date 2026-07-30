@@ -91,6 +91,25 @@ parser.add_argument(
     "confirmed 2026-07-24 trying to load a locked-wrist checkpoint without this flag).",
 )
 parser.add_argument(
+    "--tail_window_s", type=float, default=5.0,
+    help="Window (seconds) for the tail-settle-rate metric: fraction of episodes whose "
+    "distance-to-goal stayed under --goal_threshold for the ENTIRE last N seconds of the "
+    "episode, computed from the existing per-second dist_to_goal_cm_t*s snapshot columns "
+    "(no env/wrapper change). The direct 'hold capability' measure for a checkpoint trained "
+    "with terminate_on_success=False (where the legacy success/hold-counter metric reads a "
+    "structural 0%% — see arms_policy_finalisation.md); also meaningful for any other "
+    "checkpoint. Clipped to the episode length if longer.",
+)
+parser.add_argument(
+    "--integrated", action="store_true",
+    help="Evaluate a G1-Arm-Left-Integrated-v0 checkpoint (2026-07-29 static-torque-"
+    "ceiling fix: integrated action targets + env-local ee/goal obs, 46-D). Required "
+    "or runner.load() fails with a strict shape-mismatch error (46-D vs 39-D obs — "
+    "safe failure, not silent corruption). Implies the log_std/privileged-critic "
+    "runner recipe (G1ArmLeftIntegratedPPORunnerCfg); do not combine with "
+    "--legacy32/--locked_wrist/--log_std.",
+)
+parser.add_argument(
     "--log_std", action="store_true",
     help="Evaluate a checkpoint trained with noise_std_type='log' (e.g. the "
     "ablation_log_std run) instead of the default 'scalar' parameterization. "
@@ -121,11 +140,13 @@ simulation_app = app_launcher.app
 import csv
 import math
 import os
+import re
 
 import g1_locomotion.tasks  # noqa: F401 — registers gym envs
 import torch
 from g1_locomotion.tasks.manager_based.g1_arm.agents.rsl_rl_ppo_cfg import (
     G1ArmLeftAblationLogStdPPORunnerCfg,
+    G1ArmLeftIntegratedPPORunnerCfg,
     G1ArmLeftLockedWristPPORunnerCfg,
     G1ArmLeftPPORunnerCfg,
 )
@@ -133,6 +154,7 @@ from g1_locomotion.tasks.manager_based.g1_arm.g1_arm_env import (
     G1ArmEnv,
     G1ArmLeftEnvCfg_Legacy32,
     G1ArmLeftEnvCfg_PLAY,
+    G1ArmLeftIntegratedEnvCfg_PLAY,
     G1ArmLeftLockedWristEnvCfg,
 )
 
@@ -140,11 +162,15 @@ if args_cli.locked_wrist:
     _EnvCfgCls = G1ArmLeftLockedWristEnvCfg
 elif args_cli.legacy32:
     _EnvCfgCls = G1ArmLeftEnvCfg_Legacy32
+elif args_cli.integrated:
+    _EnvCfgCls = G1ArmLeftIntegratedEnvCfg_PLAY
 else:
     _EnvCfgCls = G1ArmLeftEnvCfg_PLAY
 
 if args_cli.locked_wrist:
     _PPORunnerCfgCls = G1ArmLeftLockedWristPPORunnerCfg
+elif args_cli.integrated:
+    _PPORunnerCfgCls = G1ArmLeftIntegratedPPORunnerCfg
 elif args_cli.log_std:
     _PPORunnerCfgCls = G1ArmLeftAblationLogStdPPORunnerCfg
 else:
@@ -158,8 +184,56 @@ from rsl_rl.runners import OnPolicyRunner
 
 from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
 
+# Matches ArmMetricsCsvWrapper's per-second snapshot columns, e.g. "dist_to_goal_cm_t5.0s".
+_TAIL_SNAPSHOT_RE = re.compile(r"^dist_to_goal_cm_t([0-9.]+)s$")
 
-def _summarize(csv_path: str, goal_threshold_cm: float) -> dict:
+
+def _tail_settle_stats(rows: list[dict], goal_threshold_cm: float, tail_window_s: float) -> dict:
+    """2026-07-30: 'did distance-to-goal stay under threshold for the ENTIRE last
+    tail_window_s of the episode' -- computed purely from the existing per-second
+    dist_to_goal_cm_t*s snapshot columns (metrics_wrappers.py's
+    _DIST_SNAPSHOT_INTERVAL_S=1.0s cadence, already written to every arm_detailed.csv;
+    no env/wrapper change). Motivated by (see arms_policy_finalisation.md): with
+    terminate_on_success=False the legacy success/hold-counter metric reads a
+    structural 0% (the CSV's own 'success' column is `terminated[env_id]`, and
+    terminated is only ever True when terminate_on_success is on), and
+    final_dist_to_goal_cm/settled_rate_* only check the single LAST instant -- a
+    policy still oscillating right up to episode end would pass those but shouldn't
+    count as 'holding'. This checks a whole trailing window instead of one instant.
+
+    Episodes lacking a full tail_window_s of snapshots (ended before that window, e.g.
+    an old checkpoint's early-success termination, or too few --steps_per_bucket steps)
+    are excluded from the denominator and counted in tail_excluded -- reported
+    separately rather than silently treated as pass or fail either way."""
+    if not rows:
+        return {"tail_settle_rate": 0.0, "tail_settle_window_s": 0.0, "tail_settle_excluded": 0}
+    snapshot_times = sorted(
+        float(m.group(1)) for c in rows[0].keys() if (m := _TAIL_SNAPSHOT_RE.match(c))
+    )
+    if not snapshot_times:
+        return {"tail_settle_rate": 0.0, "tail_settle_window_s": 0.0, "tail_settle_excluded": len(rows)}
+    max_t = snapshot_times[-1]
+    window_used = min(tail_window_s, max_t)
+    tail_cols = [f"dist_to_goal_cm_t{round(t, 1)}s" for t in snapshot_times if t > max_t - window_used + 1e-6]
+
+    settled = 0
+    excluded = 0
+    for r in rows:
+        vals = [r[c] for c in tail_cols]
+        if any(v == "" for v in vals):
+            excluded += 1
+            continue
+        if all(float(v) < goal_threshold_cm for v in vals):
+            settled += 1
+    denom = len(rows) - excluded
+    return {
+        "tail_settle_rate": (settled / denom) if denom > 0 else 0.0,
+        "tail_settle_window_s": window_used,
+        "tail_settle_excluded": excluded,
+    }
+
+
+def _summarize(csv_path: str, goal_threshold_cm: float, tail_window_s: float) -> dict:
     if not os.path.isfile(csv_path):
         return {"episodes": 0}
     with open(csv_path) as f:
@@ -168,6 +242,7 @@ def _summarize(csv_path: str, goal_threshold_cm: float) -> dict:
         return {"episodes": 0}
     n = len(rows)
     dists = sorted(float(r["min_dist_to_goal_cm"]) for r in rows)
+    tail_stats = _tail_settle_stats(rows, goal_threshold_cm, tail_window_s)
 
     def pct(p: float) -> float:
         return dists[min(int(n * p), n - 1)]
@@ -194,6 +269,27 @@ def _summarize(csv_path: str, goal_threshold_cm: float) -> dict:
         # "still converging when the episode timed out" from "reached its best point
         # then stalled/overshot" -- min_dist alone can't tell these apart.
         "mean_final_dist_cm": sum(float(r["final_dist_to_goal_cm"]) for r in rows) / n,
+        # ADDED 2026-07-30: "settled" rates -- fraction of episodes ENDING within
+        # 2cm/3cm of the goal, the use-case-representative headline for a grasp task
+        # ("get there and be there at the end"). Motivated by the Integrated run's
+        # eval (see policy_status.md 2026-07-30): success_rate read 6.5% while 81% of
+        # episodes ended <2cm and 100% ended <2.76cm -- the 15-CONSECUTIVE-step hold +
+        # terminate_on_success makes success_rate an incentive artifact (completing a
+        # hold is reward-negative, so a well-trained policy dithers at the boundary
+        # and rarely "succeeds"), NOT a capability measure. Judge checkpoints by these
+        # two columns and the dist columns; treat success_rate as a legacy indicator
+        # until the env's termination/bonus design is reworked (see
+        # arms_policy_finalisation.md step 1).
+        "settled_rate_2cm": sum(1 for r in rows if float(r["final_dist_to_goal_cm"]) < 2.0) / n,
+        "settled_rate_3cm": sum(1 for r in rows if float(r["final_dist_to_goal_cm"]) < 3.0) / n,
+        # ADDED 2026-07-30: see _tail_settle_stats' own docstring -- the direct "hold
+        # capability" measure (stayed under goal_threshold for the WHOLE trailing
+        # tail_window_s, not just the final instant), for use with
+        # terminate_on_success=False checkpoints where the legacy success column
+        # structurally reads 0%.
+        "tail_settle_rate": tail_stats["tail_settle_rate"],
+        "tail_settle_window_s": tail_stats["tail_settle_window_s"],
+        "tail_settle_excluded": tail_stats["tail_settle_excluded"],
     }
 
 
@@ -289,7 +385,7 @@ def _run_bucket(base_env: G1ArmEnv, name: str, eval_root: str) -> tuple[dict, li
     # cascade down and tear down base_env, breaking the next bucket.
     env._csv.close()
     goal_threshold_cm = base_env.cfg.goal_threshold * 100.0
-    return _summarize(env.csv_path, goal_threshold_cm), joint_ranges, reward_breakdown
+    return _summarize(env.csv_path, goal_threshold_cm, args_cli.tail_window_s), joint_ranges, reward_breakdown
 
 
 def main():
@@ -312,8 +408,24 @@ def main():
         "",
         f"Checkpoint: `{args_cli.checkpoint}`",
         "",
-        "| Bucket | Episodes | Success rate (reach+hold) | Reach rate (no hold) | Mean reward | Mean dist (cm) | Median dist (cm) | p90 dist (cm) | Mean final dist (cm) |",
-        "|---|---|---|---|---|---|---|---|---|",
+        "Headline columns: **Settled <2cm / <3cm** (fraction of episodes ENDING that close "
+        "to the goal — the grasp-use-case measure) and **Tail-settle (Ws)** (fraction of "
+        "episodes that stayed under goal_threshold for the ENTIRE last W seconds, W shown "
+        "per-row — the direct HOLD-capability measure, distinguishing 'settled and still' "
+        "from 'happened to be close at the very last instant'; computed from the existing "
+        "per-second dist_to_goal_cm_t*s columns, see arms_policy_finalisation.md). Episodes "
+        "ending before a full W-second window existed are excluded from that rate, not "
+        "counted as pass or fail — see 'excl.' in the same cell. 'Success rate (reach+hold)' "
+        "is the env's legacy 15-consecutive-steps-under-2cm + early-termination definition — "
+        "known to be an INCENTIVE ARTIFACT for well-trained policies (completing the hold is "
+        "reward-negative under terminate_on_success, so good policies dither at the boundary "
+        "and score single digits while ending ~1cm from the goal — see policy_status.md "
+        "2026-07-30), and STRUCTURALLY 0% for any checkpoint trained with "
+        "terminate_on_success=False. Do not judge checkpoints by it until the env's "
+        "termination/bonus design is reworked (arms_policy_finalisation.md, step 1).",
+        "",
+        "| Bucket | Episodes | Settled <2cm | Settled <3cm | Tail-settle (Ws) | Success rate (reach+hold, legacy) | Reach rate (no hold) | Mean reward | Mean dist (cm) | Median dist (cm) | p90 dist (cm) | Mean final dist (cm) |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
 
     joint_range_lines = [
@@ -349,11 +461,19 @@ def main():
         stats, joint_ranges, reward_breakdown = _run_bucket(base_env, name, eval_root)
         if stats["episodes"] == 0:
             print(f"[Eval] Bucket '{name}': no completed episodes — increase --steps_per_bucket.")
-            summary_lines.append(f"| {name} | 0 | — | — | — | — | — | — | — |")
+            summary_lines.append(f"| {name} | 0 | — | — | — | — | — | — | — | — | — | — |")
             continue
+        tail_cell = (
+            f"{stats['tail_settle_rate']:.2%} (W={stats['tail_settle_window_s']:.1f}s"
+            + (f", excl={stats['tail_settle_excluded']})" if stats["tail_settle_excluded"] else ")")
+        )
         print(
             f"[Eval] Bucket '{name}': episodes={stats['episodes']} "
-            f"success_rate={stats['success_rate']:.2%} "
+            f"settled_rate_2cm={stats['settled_rate_2cm']:.2%} "
+            f"settled_rate_3cm={stats['settled_rate_3cm']:.2%} "
+            f"tail_settle_rate={stats['tail_settle_rate']:.2%} "
+            f"(window={stats['tail_settle_window_s']:.1f}s, excluded={stats['tail_settle_excluded']}) "
+            f"success_rate(legacy)={stats['success_rate']:.2%} "
             f"reach_rate_no_hold={stats['reach_rate_no_hold']:.2%} "
             f"mean_reward={stats['mean_reward']:.3f} "
             f"mean_dist_cm={stats['mean_dist_cm']:.2f} "
@@ -362,7 +482,9 @@ def main():
             f"mean_final_dist_cm={stats['mean_final_dist_cm']:.2f}"
         )
         summary_lines.append(
-            f"| {name} | {stats['episodes']} | {stats['success_rate']:.2%} | {stats['reach_rate_no_hold']:.2%} "
+            f"| {name} | {stats['episodes']} | {stats['settled_rate_2cm']:.2%} | {stats['settled_rate_3cm']:.2%} "
+            f"| {tail_cell} "
+            f"| {stats['success_rate']:.2%} | {stats['reach_rate_no_hold']:.2%} "
             f"| {stats['mean_reward']:.3f} | {stats['mean_dist_cm']:.2f} | {stats['p50_dist_cm']:.2f} "
             f"| {stats['p90_dist_cm']:.2f} | {stats['mean_final_dist_cm']:.2f} |"
         )

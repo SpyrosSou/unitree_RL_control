@@ -163,6 +163,23 @@ gym.register(
     },
 )
 
+# 2026-07-29 "standing package": the model_20996 recipe plus three standing-only-gated
+# changes (exact-zero command snap, rel_standing_envs 0.02->0.2, position anchor while
+# standing) — see G1LocomotionArmDisturbanceStandingPackageEnvCfg's own docstring.
+# Train from FRESH weights (reward composition changed; see the docstring's stale-critic
+# rationale). Uses the same PLAY class as the base ArmDisturbance recipe — no
+# action/observation-space difference for eval_walking.py to care about.
+gym.register(
+    id="G1-Locomotion-Velocity-ArmDisturbance-StandingPackage-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.g1_locomotion_env_cfg:G1LocomotionArmDisturbanceStandingPackageEnvCfg",
+        "play_env_cfg_entry_point": f"{__name__}.g1_locomotion_env_cfg:G1LocomotionArmDisturbanceEnvCfg_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1LocomotionArmDisturbancePPORunnerCfg",
+    },
+)
+
 # 2026-07-25: starts the velocity command range at its full target instead of letting
 # the curriculum climb there — see G1LocomotionArmDisturbanceStartFullCmdRangeEnvCfg's
 # own docstring (a stalled curriculum invalidated the previous drift-reward test run).
