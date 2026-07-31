@@ -304,6 +304,19 @@ class G1ArmLeftIntegratedPPORunnerCfg(G1ArmPPORunnerCfg):
 
 
 @configclass
+class G1ArmLeftIntegratedNoTermPPORunnerCfg(G1ArmLeftIntegratedPPORunnerCfg):
+    """2026-07-30: same agent recipe as G1ArmLeftIntegratedPPORunnerCfg — only
+    experiment_name differs, so this run's logs land separately (`arms/
+    integrated_no_term`) rather than mixing with the first Integrated run. The actual
+    change (terminate_on_success=False) lives in the env cfg
+    (G1ArmLeftIntegratedNoTermEnvCfg), not here — see that class's docstring."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.experiment_name = "arms/integrated_no_term"
+
+
+@configclass
 class G1ArmLeftAblationEntropyCoefSmallPPORunnerCfg(G1ArmPPORunnerCfg):
     """2026-07-25 ablation: entropy_coef=0.003, a real gap between the two extremes
     already tested — 0.0 (baseline) collapses Mean action noise std to 0.09 by

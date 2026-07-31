@@ -244,6 +244,30 @@ gym.register(
     },
 )
 
+# 2026-07-30: disables terminate_on_success — the hold-quality fix for the dithering
+# problem found in the first Integrated run (6.5-9.4% legacy success despite solved
+# reaching) — see G1ArmLeftIntegratedNoTermEnvCfg's own docstring and
+# arms_policy_finalisation.md step 1.
+gym.register(
+    id="G1-Arm-Left-IntegratedNoTerm-v0",
+    entry_point="g1_locomotion.tasks.manager_based.g1_arm.g1_arm_env:G1ArmEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.g1_arm_env:G1ArmLeftIntegratedNoTermEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1ArmLeftIntegratedNoTermPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="G1-Arm-Left-IntegratedNoTerm-Play-v0",
+    entry_point="g1_locomotion.tasks.manager_based.g1_arm.g1_arm_env:G1ArmEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.g1_arm_env:G1ArmLeftIntegratedNoTermEnvCfg_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:G1ArmLeftIntegratedNoTermPPORunnerCfg",
+    },
+)
+
 # ---------------------------------------------------------------------------
 # Right arm  (train + play)
 # ---------------------------------------------------------------------------

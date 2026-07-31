@@ -110,6 +110,18 @@ parser.add_argument(
     "--legacy32/--locked_wrist/--log_std.",
 )
 parser.add_argument(
+    "--integrated_no_term", action="store_true",
+    help="Evaluate a G1-Arm-Left-IntegratedNoTerm-v0 checkpoint (2026-07-30: same "
+    "46-D integrated-target env as --integrated, but trained with "
+    "terminate_on_success=False to fix the dithering/hold-quality problem — see "
+    "arms_policy_finalisation.md step 1). Uses the matching NoTerm PLAY env (also "
+    "terminate_on_success=False) so the eval's tail-settle-rate metric always sees a "
+    "full trailing window, not one cut short by an early success termination. Same "
+    "network/runner recipe as --integrated (shares G1ArmLeftIntegratedPPORunnerCfg — "
+    "terminate_on_success doesn't affect network shape). Do not combine with "
+    "--integrated/--legacy32/--locked_wrist/--log_std.",
+)
+parser.add_argument(
     "--log_std", action="store_true",
     help="Evaluate a checkpoint trained with noise_std_type='log' (e.g. the "
     "ablation_log_std run) instead of the default 'scalar' parameterization. "
@@ -155,6 +167,7 @@ from g1_locomotion.tasks.manager_based.g1_arm.g1_arm_env import (
     G1ArmLeftEnvCfg_Legacy32,
     G1ArmLeftEnvCfg_PLAY,
     G1ArmLeftIntegratedEnvCfg_PLAY,
+    G1ArmLeftIntegratedNoTermEnvCfg_PLAY,
     G1ArmLeftLockedWristEnvCfg,
 )
 
@@ -162,6 +175,8 @@ if args_cli.locked_wrist:
     _EnvCfgCls = G1ArmLeftLockedWristEnvCfg
 elif args_cli.legacy32:
     _EnvCfgCls = G1ArmLeftEnvCfg_Legacy32
+elif args_cli.integrated_no_term:
+    _EnvCfgCls = G1ArmLeftIntegratedNoTermEnvCfg_PLAY
 elif args_cli.integrated:
     _EnvCfgCls = G1ArmLeftIntegratedEnvCfg_PLAY
 else:
@@ -169,7 +184,7 @@ else:
 
 if args_cli.locked_wrist:
     _PPORunnerCfgCls = G1ArmLeftLockedWristPPORunnerCfg
-elif args_cli.integrated:
+elif args_cli.integrated or args_cli.integrated_no_term:
     _PPORunnerCfgCls = G1ArmLeftIntegratedPPORunnerCfg
 elif args_cli.log_std:
     _PPORunnerCfgCls = G1ArmLeftAblationLogStdPPORunnerCfg
@@ -207,14 +222,35 @@ def _tail_settle_stats(rows: list[dict], goal_threshold_cm: float, tail_window_s
     separately rather than silently treated as pass or fail either way."""
     if not rows:
         return {"tail_settle_rate": 0.0, "tail_settle_window_s": 0.0, "tail_settle_excluded": 0}
-    snapshot_times = sorted(
+    candidate_times = sorted(
         float(m.group(1)) for c in rows[0].keys() if (m := _TAIL_SNAPSHOT_RE.match(c))
     )
-    if not snapshot_times:
+    if not candidate_times:
         return {"tail_settle_rate": 0.0, "tail_settle_window_s": 0.0, "tail_settle_excluded": len(rows)}
-    max_t = snapshot_times[-1]
+    # FIXED 2026-07-31: drop any snapshot column that's EMPTY FOR EVERY ROW before
+    # picking the trailing window -- confirmed on a real run (arms/integrated_no_term/
+    # 2026-07-30_19-57-17) that the nominal final slot (t == episode_length_s, e.g.
+    # t20.0s for a 20s episode) is empty in 100% of rows: an episode truncates the
+    # instant episode_length_buf hits its cap, one control step short of the exact
+    # step-count boundary metrics_wrappers.py's _update_dist_snapshot needs to fire
+    # that slot's "due" check -- a property of that existing wrapper, not a
+    # per-checkpoint quirk. The original version anchored the window to this
+    # structurally-dead column, so EVERY episode got excluded (denom=0, silently
+    # reporting the 0.0 fallback) regardless of real hold quality -- confirmed: that
+    # run's own Settled-<2cm/mean-dist/frac_envs_reached numbers show near-perfect
+    # holding, so the correct tail-settle rate was nowhere near 0%. Only entirely-dead
+    # columns are dropped (not per-row) -- a column populated for most-but-not-all
+    # rows still participates, and rows still missing it individually are (correctly)
+    # excluded per-row below.
+    usable_times = [
+        t for t in candidate_times
+        if any(r[f"dist_to_goal_cm_t{round(t, 1)}s"] != "" for r in rows)
+    ]
+    if not usable_times:
+        return {"tail_settle_rate": 0.0, "tail_settle_window_s": 0.0, "tail_settle_excluded": len(rows)}
+    max_t = usable_times[-1]
     window_used = min(tail_window_s, max_t)
-    tail_cols = [f"dist_to_goal_cm_t{round(t, 1)}s" for t in snapshot_times if t > max_t - window_used + 1e-6]
+    tail_cols = [f"dist_to_goal_cm_t{round(t, 1)}s" for t in usable_times if t > max_t - window_used + 1e-6]
 
     settled = 0
     excluded = 0

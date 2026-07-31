@@ -89,18 +89,21 @@ what each shows.
 ```bash
 python testing/visual_testing/full_demo/g1_full_demo.py \
     --loco_checkpoint chosen_checkpoints/walking_latest.pt \
-    --arm_checkpoint logs/rsl_rl/arms/best_combined/2026-07-26_13-09-32/model_1999.pt \
-    --arm left --target 0.3 0.2 1.0
+    --arm_checkpoint chosen_checkpoints/arm_left_latest.pt \
+    --arm left --integrated --target 0.3 0.2 1.0
 ```
 
 See `testing/visual_testing/full_demo/README.md` for controls, keybindings, and the
-`--reset_arm_on_walk` flag. `--loco_checkpoint` above now resolves to the 2026-07-30
-"standing package" checkpoint (see `chosen_checkpoints/README.md`) automatically.
-`--arm_checkpoint` is left on `best_combined` deliberately — the newer, better
-`G1-Arm-Left-Integrated-v0` checkpoint is not yet demo-compatible (this script
-hand-rolls its own arm control loop rather than reusing `G1ArmEnv`, and doesn't yet
-know about that task's integrated-target action pipeline or 46-D observation
-layout) — see `chosen_checkpoints/README.md` for what's needed before that changes.
+`--reset_arm_on_walk` flag. `chosen_checkpoints/walking_latest.pt` is the 2026-07-30
+"standing package" checkpoint; `chosen_checkpoints/arm_left_latest.pt` is the
+`G1-Arm-Left-Integrated-v0` checkpoint (see `chosen_checkpoints/README.md` for
+both). **`--integrated` is required whenever the arm checkpoint is from the
+Integrated task family** (this one, or its `IntegratedNoTerm` successor) — it switches the
+demo to that task's integrated action-target pipeline and env-local observation
+frame; passing it for any other (pre-2026-07-29) checkpoint, or omitting it for an
+Integrated one, is a hard error (the demo cross-checks the flag against the
+checkpoint's actual observation width). Fixed 2026-07-30 — not yet live-tested
+against Isaac Sim, verify interactively before trusting it.
 
 ## Repo Layout
 

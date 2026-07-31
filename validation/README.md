@@ -87,6 +87,15 @@ mismatch, not a silent corruption):
 - `--integrated` — a `G1-Arm-Left-Integrated-v0` checkpoint (2026-07-29 static-
   torque-ceiling fix: integrated action targets + env-local ee/goal obs, 46-D) — the
   current best arm candidate, see `chosen_checkpoints/README.md`.
+- `--integrated_no_term` — a `G1-Arm-Left-IntegratedNoTerm-v0` checkpoint (2026-07-30:
+  same 46-D layout as `--integrated`, but `terminate_on_success=False` — the fix for
+  the dithering/hold-quality problem, see `arms_policy_finalisation.md`). Selects a
+  matching eval env that's also `terminate_on_success=False`, so every episode runs
+  full length and the Tail-settle-rate metric's trailing window is never cut short.
+  Do not combine with `--integrated`.
+- `g1_full_demo.py` (`testing/visual_testing/full_demo/`) needs the equivalent
+  `--integrated` flag for either of the above two checkpoints — see that script's
+  own `--help`/module docstring; fixed 2026-07-30, not yet live-tested.
 - `--legacy32` — checkpoints trained before 2026-07-26's `action_fb` observation
   addition (32-D obs instead of 39-D) — e.g. the 200/20-gain reference.
 - `--log_std` — checkpoints trained with `noise_std_type="log"` instead of the default

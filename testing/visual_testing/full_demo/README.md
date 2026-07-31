@@ -5,6 +5,12 @@ policy with a trained arm-reaching policy on the same robot — the closest thin
 repo to "watch the actual deployment target." WASD/QE drive locomotion, T sets an arm
 target, arm reaching runs unconditionally (no mode gating — see below).
 
+**Isolated variants (2026-07-31)**: `arms_full_demo.py` and `walking_full_demo.py`,
+same directory — see their own section near the bottom of this file. Use these when
+you want to test one half without the other interacting (e.g. is a wobble in the arm
+demo coming from the arm policy itself, or from the walking policy's own base motion
+feeding into it?).
+
 ## Running it
 
 ```bash
@@ -67,3 +73,52 @@ fallback if the checkpoint-inference fix above ever needs debugging, or if you
 specifically want the old hardcoded-32-D behavior. For normal use, prefer
 `g1_full_demo.py` — it handles both old and new checkpoint formats already, this file
 doesn't add any capability the main script lacks.
+
+## `arms_full_demo.py` — arm control only, lower body physically fixed
+
+Derived from `g1_full_demo.py` 2026-07-31: every arm-control code path (checkpoint
+loading, `--integrated` auto-detection, observation construction, the integrated
+action-target pipeline, mirror-testing, target prompting, camera control) is copied
+verbatim — only the locomotion half is removed. The robot's root is rigidly pinned
+(`fix_root_link=True`, the same convention `g1_arm_env.py`'s own training task uses)
+instead of being driven by a walking policy, and legs/waist are held at their default
+pose every step. No `--loco_checkpoint` needed — there's no locomotion policy at all.
+
+```bash
+python testing/visual_testing/full_demo/arms_full_demo.py \
+    --arm_checkpoint chosen_checkpoints/arm_left_latest.pt \
+    --arm left --integrated --target 0.3 0.2 1.0
+```
+
+Controls: **T** (new target), **L/R** (select arm, `--arm both` only), **Y/U**
+(mirror-testing, `--arm left` only), **C/V** (camera). No WASD — there's nothing to
+walk. `--integrated` is required for a `G1-Arm-Left-Integrated(-NoTerm)-v0` checkpoint,
+same as `g1_full_demo.py` (see that flag's own `--help` text for why).
+
+Use this when you want to know whether something you're seeing in `g1_full_demo.py`
+is really the arm policy's own behavior, or an interaction with the walking policy's
+base motion (a moving/tilting torso the arm was only ever trained against a synthetic
+version of).
+
+## `walking_full_demo.py` — locomotion only, arms held rigid
+
+Derived from `g1_full_demo.py` 2026-07-31: the locomotion half (WASD/QE, loco-policy
+loading, the velocity-command term, camera control) is copied verbatim; every
+arm-related code path (target prompting, mirror-testing, goal markers, arm-policy
+loading) is removed, and both arms are pinned to their default joint positions every
+step instead of being driven by an arm policy. Built from the plain (non-
+`ArmDisturbance`) locomotion task deliberately, so no scripted arm-motion disturbance
+fires either — see the script's own module docstring for why that's safe (the
+checkpoint's action/observation space is identical between task families).
+
+```bash
+python testing/visual_testing/full_demo/walking_full_demo.py \
+    --loco_checkpoint chosen_checkpoints/walking_latest.pt
+```
+
+Controls: **W/A/D/Q/E** (locomotion), **S** (stop), **C/V** (camera). No arm-related
+keys — arms never move.
+
+Use this when you want to check walking-specific behavior (drift, gait, fall recovery)
+without any possibility of the arm's presence or motion confounding what you're
+watching.

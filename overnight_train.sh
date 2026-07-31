@@ -51,73 +51,48 @@ latest_checkpoint() {
 echo "Overnight run starting $(date). Full log: $LOG_FILE"
 
 # ==========================================================================================
-# TASK QUEUE — 2026-07-29 overnight run (~9h window; see timing note per step)
+# TASK QUEUE — 2026-07-30 overnight run (~9h window; arm-only, ~4-5h expected)
 # ==========================================================================================
-# 1) Arm: G1-Arm-Left-Integrated-v0, FRESH weights, 8000 iters. First-ever training of
-#    the 2026-07-29 static-torque-ceiling fix (integrated action targets + env-local
-#    ee/goal obs + target_fb, 46-D — see policy_status.md's 2026-07-29 "ROOT CAUSE
-#    FOUND" entry and check_arm_static_torque_ceiling.py). Fresh run, so
-#    --max_iterations is absolute (the ADDITIVE-on-resume trap corrected last night
-#    doesn't apply). Benchmark to beat: best_combined 28.20%/32.85% at 2000 iters /
-#    30.15%/28.10% at ~10000. Early tell in tensorboard: Train/mean_episode_length
-#    finally dropping well below ~290 (the 200/20 reference converges to ~60).
-#    Est. ~2h50m (best_combined did 8001 iters in that last night).
-# 2) Eval the arm run TWICE: once at model_2000.pt (direct apples-to-apples vs
-#    best_combined's own 2000-iter result) and once at the final checkpoint.
-#    eval_arm.py writes to <checkpoint_dir>/arm_eval/ — both checkpoints share a run
-#    dir, so the mid-run eval is renamed to arm_eval_iter2000/ before the final one
-#    runs, or the second would overwrite the first.
-# 3) Walking: G1-Locomotion-Velocity-ArmDisturbance-StandingPackage-v0, FRESH weights
-#    (deliberate — changed reward composition + the stale-critic lessons in
-#    policy_status.md), 7000 iters. The 2026-07-29 in-distribution eval of
-#    walking_latest (turn/strafe buckets fixed to the trained envelope) showed 0.00%
-#    falls in EVERY bucket incl. turn_left — the old 31.79% turn_left number was an
-#    out-of-distribution artifact — so the standing package is the right next target,
-#    not turning. TIMING NOTE: at last night's walking pace (~5000 iters in ~5.5h),
-#    7000 ≈ 7.5-8h — this step will likely still be running (or its eval pending) at
-#    the 9h mark. Safe to stop in the morning (stop_overnight.sh): checkpoints save
-#    every 100 iters, and the eval can be run manually on whatever the latest is.
-# Each training step is followed by its own eval so results are ready to read in the
-# morning, not just raw checkpoints.
+# Arm: G1-Arm-Left-IntegratedNoTerm-v0, FRESH weights, 12000 iters. Fixes the hold-
+# quality problem found in the first Integrated run (logs/rsl_rl/arms/integrated/
+# 2026-07-29_20-27-48, model_7999.pt): reaching itself was already solved there (100%
+# reach rate, ~1-3mm precision), but terminate_on_success made completing the
+# 15-consecutive-step hold reward-NEGATIVE (ends the per-step goal_reached_bonus
+# stream, respawns a harder goal), so the policy learned to dither at the 2cm boundary
+# instead of settling deep and still — legacy success rate read only 6.5-9.4% despite
+# the real capability being there. This run disables terminate_on_success entirely
+# (see G1ArmLeftIntegratedNoTermEnvCfg's docstring in g1_arm_env.py) — episodes always
+# run the full length, so the bonus keeps paying for every step spent in-zone and
+# there's nothing left to gain from leaving. Same 46-D obs/integrated-target
+# pipeline/gain/reward as the first Integrated run otherwise — an incentive-only
+# change, not a capability change. See arms_policy_finalisation.md step 1 (option (a))
+# and policy_status.md's 2026-07-30 arm entries for the full reasoning.
+#
+# Fresh run (no --resume), so --max_iterations is absolute. Est. ~4-4.5h at last
+# night's Integrated pace (8001 iters in ~2h50m).
+#
+# NOTE: Train/mean_episode_length is NOT a useful progress signal for this run (it's
+# always ~max, since nothing terminates early) — watch Episode_Reward/goal_reached_
+# bonus (ceiling ~50/step) and Metrics/frac_envs_reached in tensorboard instead.
+#
+# Eval afterward MUST use --integrated_no_term (not --integrated) — it selects the
+# matching NoTerm PLAY env (terminate_on_success=False there too) so the eval's
+# tail-settle-rate metric always sees a full trailing window per episode, and reports
+# the new Settled-<2cm/<3cm + Tail-settle columns as the real judge of this run
+# (legacy "success rate" will read a structural, expected 0% here — see
+# arms_policy_finalisation.md, do not read that as a regression).
 
-run_step "Train: arm Integrated (fresh) -> 8000 iters" \
-    python scripts/rsl_rl/train.py --task G1-Arm-Left-Integrated-v0 \
-        --max_iterations 8000 --headless --seed "$SEED"
+run_step "Train: arm IntegratedNoTerm (fresh) -> 12000 iters" \
+    python scripts/rsl_rl/train.py --task G1-Arm-Left-IntegratedNoTerm-v0 \
+        --max_iterations 12000 --headless --seed "$SEED"
 
-ARM_RUN_DIR=$(latest_run_dir "arms/integrated")
-ARM_MID_CKPT=""
-[ -n "$ARM_RUN_DIR" ] && [ -f "$ARM_RUN_DIR/model_2000.pt" ] && ARM_MID_CKPT="$ARM_RUN_DIR/model_2000.pt"
-if [ -n "$ARM_MID_CKPT" ]; then
-    run_step "Eval: arm Integrated @ 2000 iters (vs best_combined's 28.20%/32.85%)" \
-        python validation/eval_arm.py --checkpoint "$ARM_MID_CKPT" --integrated --headless
-    if [ -d "$ARM_RUN_DIR/arm_eval" ]; then
-        mv "$ARM_RUN_DIR/arm_eval" "$ARM_RUN_DIR/arm_eval_iter2000"
-        echo "[INFO] mid-run eval stashed at ${ARM_RUN_DIR}arm_eval_iter2000/"
-    fi
-else
-    echo "[SKIP] arm mid-run eval — no model_2000.pt in ${ARM_RUN_DIR:-<no run dir>}."
-fi
-
+ARM_RUN_DIR=$(latest_run_dir "arms/integrated_no_term")
 ARM_CKPT=$(latest_checkpoint "$ARM_RUN_DIR")
 if [ -n "$ARM_CKPT" ]; then
-    run_step "Eval: arm Integrated @ final ($(basename "$ARM_CKPT"))" \
-        python validation/eval_arm.py --checkpoint "$ARM_CKPT" --integrated --headless
+    run_step "Eval: arm IntegratedNoTerm @ final ($(basename "$ARM_CKPT"))" \
+        python validation/eval_arm.py --checkpoint "$ARM_CKPT" --integrated_no_term --headless
 else
-    echo "[SKIP] arm final eval — no checkpoint found in ${ARM_RUN_DIR:-<no run dir>}."
-fi
-
-run_step "Train: walking StandingPackage (fresh) -> 7000 iters" \
-    python scripts/rsl_rl/train.py --task G1-Locomotion-Velocity-ArmDisturbance-StandingPackage-v0 \
-        --max_iterations 7000 --headless --seed "$SEED"
-
-WALK_RUN_DIR=$(latest_run_dir "walking/arm_disturbance")
-WALK_CKPT=$(latest_checkpoint "$WALK_RUN_DIR")
-if [ -n "$WALK_CKPT" ]; then
-    run_step "Eval: walking StandingPackage @ final ($(basename "$WALK_CKPT"))" \
-        python validation/eval_walking.py --checkpoint "$WALK_CKPT" \
-            --arm_disturbance --skip_displacement --headless
-else
-    echo "[SKIP] walking eval — no checkpoint found in ${WALK_RUN_DIR:-<no run dir>}."
+    echo "[SKIP] arm eval — no checkpoint found in ${ARM_RUN_DIR:-<no run dir>}."
 fi
 
 echo ""

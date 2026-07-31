@@ -461,6 +461,83 @@ actually needs. For deployment NOW this is already the best arm artifact this re
 produced (the 200/20 reference's true single-shot rate was ~30%). Deployment reminder:
 `g1_rl_control` must integrate deltas (`target += clamped_delta`), not `current+delta`.
 
+**2026-07-30 — retrain queued to fix the dithering incentive: `G1-Arm-Left-
+IntegratedNoTerm-v0`.** Implements option (a) above: `terminate_on_success=False`
+(new env cfg `G1ArmLeftIntegratedNoTermEnvCfg` in `g1_arm_env.py`, same 46-D
+obs/gain/reward as the Integrated task otherwise — an incentive-only change).
+Queued via `overnight_train.sh` the night of 2026-07-30: fresh weights, 12000 iters,
+followed automatically by `validation/eval_arm.py --integrated_no_term` on the final
+checkpoint (`logs/rsl_rl/arms/integrated_no_term/<run>/model_11999.pt` once done —
+**not run as of this writing**, check that directory before trusting this as
+current). Judge the result by the eval's Settled-<2cm/<3cm and Tail-settle-rate
+columns — the legacy success-rate column reads a **structural, expected 0%** for
+this checkpoint (its `terminate_on_success=False` means the CSV's `success` column,
+`bool(terminated[env_id])`, is never True by construction — see
+`arms_policy_finalisation.md` step 1's own note on this). `--integrated_no_term`
+also selects a matching NoTerm eval env (same reason: keeps every episode running
+the full length, so the Tail-settle metric's trailing window is never cut short by
+an early termination).
+
+**2026-07-31 — RESULT: the retrain worked — holding is now genuinely solved, not
+just reaching.** Trained (`logs/rsl_rl/arms/integrated_no_term/2026-07-30_19-57-17`,
+12000 iters, `model_11999.pt`) and evaluated. Real numbers, both buckets: Settled
+<2cm/<3cm **100.00%/100.00%**, mean dist **0.10cm**, median **0.05cm**, p90
+**0.23-0.24cm**, `frac_envs_reached` (per-step time in zone) **~97%**,
+`goal_reached_bonus` **48.5/step** (of a 50 ceiling) — a policy that gets in deep and
+stays, exactly what removing the terminate-on-success incentive was supposed to
+produce. Legacy success rate correctly reads a structural 0% as predicted (see
+above).
+
+**Bug found and fixed the same day**: Tail-settle initially reported 0% (`excl=512`,
+i.e. every episode excluded) — traced to `validation/eval_arm.py`'s
+`_tail_settle_stats` anchoring its trailing window to the nominal final snapshot
+column (`dist_to_goal_cm_t20.0s` for a 20s episode), which is **empty in 100% of
+rows for a structural reason**: the episode truncates one control step short of the
+exact step-count boundary `metrics_wrappers.py`'s `_update_dist_snapshot` needs to
+fire that slot's "due" check — a property of that existing (unmodified) wrapper, not
+specific to this checkpoint. Anchoring to a column that's never populated excluded
+every episode regardless of real hold quality — confirmed wrong immediately from the
+same eval's own Settled/mean-dist/frac_envs_reached numbers, all showing
+near-perfect holding. **Fixed**: drop any snapshot column empty for every row before
+selecting the window (now correctly uses t15.0s-t19.0s for a 20s episode/5s window).
+**Recomputed tail-settle for this run directly from its existing `arm_detailed.csv`
+files (no re-run needed): 100.00% both buckets, 0 excluded** —
+`logs/rsl_rl/arms/integrated_no_term/2026-07-30_19-57-17/arm_eval/summary.md`
+corrected in place. Any other checkpoint evaluated with the pre-2026-07-31
+`eval_arm.py` and a 20s-episode PLAY cfg has the same stale Tail-settle number —
+re-run (cheap, no sim needed if the CSVs still exist) before trusting an old
+Tail-settle reading.
+
+**Promotion recommendation**: `logs/rsl_rl/arms/integrated_no_term/
+2026-07-30_19-57-17/model_11999.pt` is ready to replace
+`chosen_checkpoints/arm_left_latest.pt` (currently the pre-fix `model_7999.pt`,
+copied there 2026-07-30) — reaching AND holding are both now solved at the real
+40/10 hardware gain. Not auto-promoted here; see `arms_policy_finalisation.md` for
+what's still open (demo verification, `g1_rl_control` deployment wiring) before
+calling this fully finished.
+
+**2026-07-30 — `g1_full_demo.py` didn't support the Integrated observation/action
+layout at all; fixed.** Found after the user copied `model_7999.pt` into
+`chosen_checkpoints/arm_left_latest.pt` and hit a runtime error the moment an arm
+command actually ran — root cause: the demo hand-rolls its own arm control loop
+(not a reuse of `G1ArmEnv`) using the legacy `current + delta`/raw-world-frame path
+unconditionally, which is a hard 39-vs-46 observation-shape mismatch against an
+Integrated checkpoint (crashes) and, even where dimensions happened to line up,
+would silently apply the wrong control law (reinstating the torque ceiling) and the
+wrong observation frame. Fixed via a new `--integrated` flag: switches the demo to
+a persistent per-arm target buffer (mirroring `g1_arm_env.py`'s `joint_targets`,
+re-anchored whenever homing completes) integrated the same way training does, plus
+a torso-anchored local frame for ee_pos/goal (the moving-base analog of training's
+fixed-env-origin subtraction — see `_root_anchor_pos`'s docstring in
+`g1_full_demo.py`) and the `target_fb` observation block. Covers both the native-arm
+path and the Y/U mirror-testing path (mdp/symmetry.py's 46-D sign convention, added
+2026-07-29, already handled the mirrored `target_fb` block correctly). The flag is
+cross-checked against the checkpoint's actual observation width and refuses to run
+on a mismatch either way (safe failure, not silent corruption). **Implemented, NOT
+yet live-tested against Isaac Sim** — verify interactively before trusting it:
+`python testing/visual_testing/full_demo/g1_full_demo.py --arm_checkpoint
+chosen_checkpoints/arm_left_latest.pt --arm left --integrated --target 0.3 0.2 1.0`.
+
 **2026-07-30 — StandingPackage trained 7000 iters fresh
 (`logs/rsl_rl/walking/arm_disturbance/2026-07-29_23-28-41`, model_6999): standing goal
 achieved, with two honest costs.** `stand_still`: step count 8.23→**1.96**, |lateral

@@ -661,6 +661,46 @@ class G1ArmLeftIntegratedEnvCfg_PLAY(G1ArmLeftIntegratedEnvCfg):
 
 
 @configclass
+class G1ArmLeftIntegratedNoTermEnvCfg(G1ArmLeftIntegratedEnvCfg):
+    """2026-07-30: disables early termination on success — the fix for the hold-quality
+    problem found in the first Integrated run (`logs/rsl_rl/arms/integrated/
+    2026-07-29_20-27-48`). That run solved reaching itself (100% reach rate, ~1-3mm
+    precision) but its legacy success rate read only 6.5-9.4% — traced to
+    `terminate_on_success` making the 15-consecutive-step hold reward-NEGATIVE
+    (completing it ends the per-step `goal_reached_bonus` stream and respawns a
+    harder, distant goal), so the reward-optimal behavior was to dither right at the
+    2cm boundary rather than settle deep and still. See `arms_policy_finalisation.md`
+    step 1 (option (a)) and `policy_status.md`'s 2026-07-30 arm entries for the full
+    reasoning. Episodes now always run to the full episode_length_s timeout — the
+    goal_reached_bonus keeps paying every step spent in-zone, so the reward-maximal
+    behavior becomes getting in and staying, with nothing left to gain from leaving.
+    Same reward/gain/observation layout as G1ArmLeftIntegratedEnvCfg otherwise (46-D
+    obs, integrated action targets, env-local ee/goal) — this is a training-incentive
+    change only, not a capability change.
+
+    NOTE: `Train/mean_episode_length` stops being a useful progress signal under this
+    cfg (it's always ~max, since nothing terminates early) — watch
+    `Episode_Reward/goal_reached_bonus` (ceiling ~50/step) and
+    `Metrics/frac_envs_reached` instead."""
+
+    terminate_on_success: bool = False
+
+
+@configclass
+class G1ArmLeftIntegratedNoTermEnvCfg_PLAY(G1ArmLeftIntegratedNoTermEnvCfg):
+    """Eval variant — terminate_on_success stays False (matching training) so every
+    episode runs the full episode_length_s and the eval's tail-settle-rate metric
+    (validation/eval_arm.py, computed from per-second distance snapshots over a
+    trailing window) always has a full window to check, rather than being cut short
+    by an early success termination the way it would under the standard PLAY cfg."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.num_envs = 32
+        self.episode_length_s = 20.0
+
+
+@configclass
 class G1ArmLeftAblationLowVelNoiseEnvCfg(G1ArmLeftEnvCfg):
     """2026-07-25 ablation: joint_vel_noise reduced from 1.5 rad/s to 0.1 rad/s, in
     isolation (no other change — same gain, same reward, symmetry intact).
