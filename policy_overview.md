@@ -1,22 +1,31 @@
 # Policy overview — reward, curriculum, what's been tried
 
 Quick-reference companion to `policy_status.md` (full evidence/history lives there).
-"Chosen" = last night's runs: arm `G1-Arm-Left-Integrated-v0`
-(`logs/rsl_rl/arms/integrated/2026-07-29_20-27-48/model_7999.pt`) and walking
+"Chosen" (updated 2026-08-01, promoted checkpoints as of that date) = arm
+`G1-Arm-Left-IntegratedNoTerm-v0`
+(`logs/rsl_rl/arms/integrated_no_term/2026-07-30_19-57-17/model_11999.pt`, now
+`chosen_checkpoints/arm_left_latest.pt`) and walking
 `G1-Locomotion-Velocity-ArmDisturbance-StandingPackage-v0`
-(`logs/rsl_rl/walking/arm_disturbance/2026-07-29_23-28-41/model_6999.pt`).
+(`logs/rsl_rl/walking/arm_disturbance/2026-07-29_23-28-41/model_6999.pt`, now
+`chosen_checkpoints/walking_latest.pt`).
 
 ## Arm
 
 ### 1. Chosen reward — what it optimizes for
 
 Closing distance to the goal (linear term) plus a flat +50/step bonus for being
-within the 2cm threshold — the bonus dominates once close, so the policy is mostly
-optimizing "get in the zone and stay counted as in it." Smaller shaping terms:
-penalize proximity to joint limits and to the torso (self-collision defense),
-deviation from the default pose (a tiebreaker among redundant arm configurations),
-jerky/large actions, and — once within 5cm of the goal specifically — joint
-velocity (encourages braking into the hold rather than flying through it).
+within the 2cm threshold. **`terminate_on_success=False`** (the 2026-07-30 fix, on
+top of the same reward the original `Integrated` recipe used) — episodes always run
+the full length instead of ending the instant the arm holds for 15 consecutive
+steps, so the bonus keeps paying for every additional step spent in-zone. This
+closed a real incentive gap in the original version: with early termination on,
+holding was reward-*negative* (it cut off the bonus stream and respawned a harder,
+distant goal), so the policy learned to dither right at the 2cm boundary instead of
+settling deep and still. Smaller shaping terms unchanged: penalize proximity to
+joint limits and to the torso (self-collision defense), deviation from the default
+pose (a tiebreaker among redundant arm configurations), jerky/large actions, and —
+once within 5cm of the goal specifically — joint velocity (encourages braking into
+the hold).
 
 ### 2. Training curriculum
 
@@ -43,6 +52,7 @@ episode, fixed throughout.
 | Observing the action-filter's own internal state (`action_fb`) | Closed a real POMDP gap (a memoryless policy couldn't sense its own filtered-action momentum) — kept as a permanent default. |
 | More iterations alone, twice (2k→8k/10k, two different recipes) | Ruled out iteration count as the lever both times — the plateau was structural, not a training-time problem. |
 | No-RL static-hold probe + integrated action-target fix | Root cause found and fixed: the action pipeline capped static holding torque well below what gravity requires; fixing it solved reaching (100% reach rate, mm-scale precision). |
+| Disabling `terminate_on_success` (`IntegratedNoTerm`) | Fixed a real incentive bug the fix above exposed — reaching worked immediately but the policy dithered at the 2cm boundary instead of holding, because early termination made completing a hold reward-negative; removing it solved holding too (100% settled, ~97% time-in-zone). |
 
 ## Walking
 

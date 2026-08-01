@@ -13,6 +13,10 @@ This repository contains:
 - integration demos combining locomotion and arm control on one robot,
 - curated deployable checkpoints under `chosen_checkpoints/`.
 
+**DEVELOPMENT FROZEN (2026-08-01)**: sim-side training/tuning is paused while the
+currently-chosen checkpoints are attempted on the physical robot — see
+`policy_status.md`'s own top-of-file note before starting new work here.
+
 **Start here if you're new to this repo (human or a fresh Claude chat): read the
 "Overview / up to speed" section near the bottom of this file, then `policy_status.md`
 for full current status and findings (or `policy_overview.md` for a brief
@@ -53,14 +57,13 @@ environment.
 This repo ignores large training logs (`logs/`) and intermediate checkpoints, but keeps
 a small curated set of deployable models in `chosen_checkpoints/` — see that directory's
 own `README.md` for exactly which checkpoint is current and its provenance. As of
-2026-07-30: `walking_latest.pt` is the promoted walking+standing checkpoint (the
+2026-08-01: `walking_latest.pt` is the promoted walking+standing checkpoint (the
 "standing package" recipe — much stiller when standing, at the cost of more
 straight-line heading drift and untrained in-place turning; see
-`chosen_checkpoints/README.md`). `arm_left_latest.pt` is still stale — the actual
-current-best arm checkpoint (`G1-Arm-Left-Integrated-v0`, which solved precise
-reaching via a 2026-07-29 fix) hasn't been promoted there yet: it needs one more
-reward-design retrain first (see `arms_policy_finalisation.md`) and isn't yet
-compatible with the demo script below.
+`chosen_checkpoints/README.md`). `arm_left_latest.pt` is `G1-Arm-Left-IntegratedNoTerm-v0`
+— reaching and holding are both solved (100% Settled/Tail-settle, see
+`chosen_checkpoints/README.md`); one open item remains (`g1_rl_control` deployment
+wiring, see `arms_policy_finalisation.md`) before it's fully finished.
 
 ## Quick Start
 
@@ -94,11 +97,13 @@ python testing/visual_testing/full_demo/g1_full_demo.py \
 ```
 
 See `testing/visual_testing/full_demo/README.md` for controls, keybindings, and the
-`--reset_arm_on_walk` flag. `chosen_checkpoints/walking_latest.pt` is the 2026-07-30
+`--reset_arm_on_walk` flag — or `arms_full_demo.py`/`walking_full_demo.py` (same
+directory) to test one half in isolation, e.g. arm control with the lower body
+physically fixed. `chosen_checkpoints/walking_latest.pt` is the 2026-07-30
 "standing package" checkpoint; `chosen_checkpoints/arm_left_latest.pt` is the
-`G1-Arm-Left-Integrated-v0` checkpoint (see `chosen_checkpoints/README.md` for
+`G1-Arm-Left-IntegratedNoTerm-v0` checkpoint (see `chosen_checkpoints/README.md` for
 both). **`--integrated` is required whenever the arm checkpoint is from the
-Integrated task family** (this one, or its `IntegratedNoTerm` successor) — it switches the
+Integrated task family** (this one, its predecessor, or any future variant) — it switches the
 demo to that task's integrated action-target pipeline and env-local observation
 frame; passing it for any other (pre-2026-07-29) checkpoint, or omitting it for an
 Integrated one, is a hard error (the demo cross-checks the flag against the
@@ -164,15 +169,19 @@ at `~/Elm/Backups/g1_locomotion/23_dof/` if ever needed — not deleted, just su
   episode), and sustained in-place turning is now essentially untrained/ignored.
   Several earlier drift-fix rounds also made heading drift worse, not better — see
   `policy_status.md` for the full history and what's still open.
-- **Arms**: the long-standing ~25-30% plateau is **resolved** — root cause found
-  2026-07-29 (the action pipeline capped static holding torque well below what
-  gravity needs at the real 40/10 hardware gain) and fixed via an integrated
-  action-target parameterization (`G1-Arm-Left-Integrated-v0`). Reaching itself is
-  now genuinely solved: 100% reach rate, ~1-3mm typical precision. One more
-  reward-design retrain is needed before promotion (the current checkpoint dithers
-  right at the 2cm boundary instead of settling deep, due to a termination/bonus
-  incentive issue, not a capability gap) — see `arms_policy_finalisation.md` for the
-  exact pick-up plan, or `policy_status.md` for the full evidence trail.
+- **Arms**: the long-standing ~25-30% plateau is **resolved, and promoted**. Root
+  cause found 2026-07-29 (the action pipeline capped static holding torque well
+  below what gravity needs at the real 40/10 hardware gain) and fixed via an
+  integrated action-target parameterization — reaching itself became genuinely
+  solved (100% reach rate, ~1-3mm typical precision), but that first checkpoint
+  dithered at the 2cm boundary instead of settling deep (a termination/bonus
+  incentive issue, not a capability gap). Fixed 2026-07-30/31 via
+  `G1-Arm-Left-IntegratedNoTerm-v0` (`terminate_on_success=False`), now promoted to
+  `chosen_checkpoints/arm_left_latest.pt`: 100%/100% Settled-<2cm/<3cm, 100%
+  Tail-settle (stays under threshold for a full trailing 5s), ~97% of every step
+  spent in the goal zone. One item remains before this is fully finished:
+  `g1_rl_control` deployment wiring — see `arms_policy_finalisation.md`, or
+  `policy_status.md` for the full evidence trail.
 - **IK pivot, reassessed**: `unitreerobotics/xr_teleoperate`'s `G1_29_ArmIK` was
   under consideration as a fallback while pure-RL reaching looked stuck (see history
   below) — with reaching now solved, IK is no longer needed as the primary path for

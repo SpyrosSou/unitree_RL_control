@@ -4,6 +4,15 @@ Living summary of what's actually validated vs. still open, for the checkpoints 
 `chosen_checkpoints/`. Update this when a checkpoint gets promoted or a real gap is
 found — don't let it go stale the way `known_issues.md` did on the 23dof branch.
 
+**DEVELOPMENT FROZEN (2026-08-01)**: sim-side training/tuning is paused while the
+currently-chosen checkpoints (`walking_latest.pt` = StandingPackage `model_6999.pt`;
+`arm_left_latest.pt` = IntegratedNoTerm `model_11999.pt`) are attempted on the
+physical robot. Both are eval-confirmed in sim but **not yet demo-verified in Isaac
+Sim, let alone on real hardware** — this deployment attempt is the actual first
+real-world test. Do not start new sim-side training/tuning work on this branch
+without checking in first; findings from the physical attempt (what breaks, what
+doesn't match sim) should be folded back into this doc before resuming.
+
 ## Walking + standing (`chosen_checkpoints/walking_latest.pt`)
 
 **PROMOTED 2026-07-30 (current):** `logs/rsl_rl/walking/arm_disturbance/
@@ -16,9 +25,11 @@ arm-integration priority — stand_still step count 8.23→1.96, |lateral drift|
 eval (see the 2026-07-30 eval-bucket-fix entry below) reads 0% falls everywhere.
 **Known costs, not yet addressed:** `forward_slow` heading drift roughly doubled
 (62→112 deg; medium/fast/backward improved), and in-place turning is now essentially
-untrained/ignored. Superseded checkpoint below (`model_20996`) kept as
-`chosen_checkpoints/walking_latest_prev.pt` for rollback/comparison — better
-straight-line walking and turning, worse standing.
+untrained/ignored. Superseded checkpoint below (`model_20996`) — better straight-line
+walking and turning, worse standing — is **not** kept alongside the promoted one in
+`chosen_checkpoints/` (2026-08-01: exactly one `.pt` per policy there, no `*_prev.pt`
+copies); its source is backed up at `~/Elm/Backups/g1_locomotion/29dof/legs_runs/
+2026-07-28_11-41-33_loose_height_nostep/` if ever needed again.
 
 <details>
 <summary>Superseded 2026-07-28 promotion history (model_20996, kept for context)</summary>
@@ -249,16 +260,22 @@ arm-IK integration below.
 
 ## Arm reaching
 
-**Status as of 2026-07-30: root cause found and fixed — reaching itself is solved.**
+**Status as of 2026-08-01: root cause found and fixed — reaching AND holding are both
+solved. `G1-Arm-Left-IntegratedNoTerm-v0` (`model_11999.pt`) is PROMOTED to
+`chosen_checkpoints/arm_left_latest.pt`.**
 The 25-29%-plateau history below (everything up to and including the
 "CORRECTED 2026-07-28" note) turned out to trace to one thing: the action pipeline's
 `current + delta` parameterization capped static holding torque well below what
 gravity requires at the real 40/10 hardware gain (see "2026-07-29 — ROOT CAUSE FOUND"
 further down). Fixed via `G1-Arm-Left-Integrated-v0`: 100% reach rate, ~1-3mm typical
-precision at the real gain. **Not yet promoted to `chosen_checkpoints/`** — one more
-retrain is needed to fix a termination/bonus incentive issue (see the 2026-07-30
-outcome entry and `arms_policy_finalisation.md` for the exact pick-up plan) before
-this is a finished artifact. The history below (gain sweeps, entropy ablations, locked
+precision at the real gain — but that checkpoint dithered instead of holding (an
+incentive bug, `terminate_on_success` made completing a hold reward-negative); fixed
+by `G1-Arm-Left-IntegratedNoTerm-v0` (`terminate_on_success=False`), which is the
+promoted checkpoint: 100%/100% Settled-<2cm/<3cm, 100% Tail-settle, ~97% time-in-zone
+(see the 2026-07-31 "RESULT" entry below for the full numbers). Remaining open item
+before calling the arm policy fully finished: `g1_rl_control` deployment wiring +
+live demo verification — see `arms_policy_finalisation.md`. The history below (gain
+sweeps, entropy ablations, locked
 wrist, etc.) is kept for the record — all of it was, in hindsight, working around a
 single control-interface detail, not the actual bottleneck.
 
@@ -508,13 +525,12 @@ corrected in place. Any other checkpoint evaluated with the pre-2026-07-31
 re-run (cheap, no sim needed if the CSVs still exist) before trusting an old
 Tail-settle reading.
 
-**Promotion recommendation**: `logs/rsl_rl/arms/integrated_no_term/
-2026-07-30_19-57-17/model_11999.pt` is ready to replace
-`chosen_checkpoints/arm_left_latest.pt` (currently the pre-fix `model_7999.pt`,
-copied there 2026-07-30) — reaching AND holding are both now solved at the real
-40/10 hardware gain. Not auto-promoted here; see `arms_policy_finalisation.md` for
-what's still open (demo verification, `g1_rl_control` deployment wiring) before
-calling this fully finished.
+**PROMOTED (confirmed 2026-08-01)**: `logs/rsl_rl/arms/integrated_no_term/
+2026-07-30_19-57-17/model_11999.pt` is now `chosen_checkpoints/arm_left_latest.pt`
+(checksum-verified), superseding the interim pre-NoTerm-fix `model_7999.pt` copied
+there 2026-07-30 — reaching AND holding are both now solved at the real 40/10
+hardware gain. See `arms_policy_finalisation.md` for what's still open (live demo
+verification, `g1_rl_control` deployment wiring) before calling this fully finished.
 
 **2026-07-30 — `g1_full_demo.py` didn't support the Integrated observation/action
 layout at all; fixed.** Found after the user copied `model_7999.pt` into
