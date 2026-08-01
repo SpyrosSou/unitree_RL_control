@@ -60,11 +60,11 @@ environment.
 This repo ignores large training logs (`logs/`) and intermediate checkpoints, but keeps
 a small curated set of deployable models in `chosen_checkpoints/` — see that directory's
 own `README.md` for exactly which checkpoint is current and its provenance. As of
-2026-07-27: `walking_latest.pt` is the deployable walking+standing checkpoint;
-`arm_left_latest.pt` is stale and `best_combined` (RL) was never promoted — on this
-branch the arm entry will become an IK-backed component instead, per
-`ik_arm_integration_plan.md`; `chosen_checkpoints/README.md` will be updated as that
-work lands.
+2026-08-01: `walking_latest.pt` is the deployable walking+standing checkpoint;
+`arm_left_residual_latest.pt` is the current arm checkpoint — an IK baseline + RL
+residual (NOT a standalone policy, see `chosen_checkpoints/README.md` for the required
+action-pipeline pairing before using it anywhere). The old pure-RL `arm_left_latest.pt`
+is superseded, kept only for historical reference.
 
 ## Quick Start
 
@@ -152,26 +152,36 @@ project's own validation/testing methodology was kept, only the underlying asset
 changed). Older 23-DOF-era work lives on the `23_dof` git branch and an external backup
 at `~/Elm/Backups/g1_locomotion/23_dof/` if ever needed — not deleted, just superseded.
 
-**Current status (2026-07-27, at the start of this branch):**
+**Current status (2026-08-01):**
 - **Walking/standing**: working, `chosen_checkpoints/walking_latest.pt` — 0% fall rate,
   real verified translation, but a known ~24-27° heading drift over a straight 20s walk.
   Three rounds of drift-fix attempts all made heading drift *worse*, not better —
   treated as a real pattern, not bad luck, and currently on hold. A live hypothesis
   (`base_height`'s reward weight forcing near-locked knees, reducing balance-recovery
-  margin) is flagged but not yet acted on. **Unaffected by the arm pivot below.**
+  margin) is flagged but not yet acted on. **Unaffected by the arm work below —
+  walking integration is still deferred, see below.**
 - **Arms (pre-pivot, `main`-branch history)**: no RL checkpoint was ever fully
   trustworthy. The training-time success metric (up to 99.98% for one reference
   checkpoint) did NOT reflect true single-shot reliability (~30%, confirmed via a
   dedicated long-hold/single-attempt test) — a real, hard-won methodology finding, not
   just a tuning gap. `best_combined`
   (`logs/rsl_rl/arms/best_combined/2026-07-26_13-09-32/model_1999.pt`) was the best RL
-  candidate found and is this branch's baseline to beat.
-- **Current direction (this branch)**: replace RL-only arm reaching with
-  `unitreerobotics/xr_teleoperate`'s `G1_29_ArmIK` (Pinocchio+CasADi, official Unitree
-  code, matches this exact robot) for precise grasp targets, with a later-phase RL
-  residual on top for compliance/robustness — see `ik_arm_integration_plan.md` for the
-  full phased plan, landmines, and file map. `main` stays exactly as-is as the pure-RL
-  fallback if this doesn't pan out.
+  candidate found and was this branch's baseline to beat — since superseded, see below.
+- **Arms (current, this branch): IK baseline + RL residual, promoted.** Numerical IK
+  (`unitreerobotics/xr_teleoperate`'s `G1_29_ArmIK`, vendored in
+  `source/.../controllers/arm_ik.py`) provides the precise per-episode joint-space
+  target; a trained RL residual policy (`chosen_checkpoints/arm_left_residual_latest.pt`)
+  closes the remaining ~10-20cm PD-tracking/gravity gap on top of it. Validated on a
+  genuinely fixed base (walking integration still deferred — see
+  `ik_arm_integration_plan.md`'s 2026-07-28 finding on walking-induced solver
+  instability): 100% of episodes settle within 2cm and stay there for the full trailing
+  5s window, mean final distance ~1.2cm, vs. ~9-13cm for the IK baseline alone. One
+  known, deliberately-not-blocking open item: a joint-limit-avoidance reward tweak
+  had a mixed effect (fixed some visibly awkward extreme joint configurations, made
+  others slightly more prone to hugging their limits) — see
+  `chosen_checkpoints/README.md` and `ik_arm_integration_plan.md`'s 2026-08-01 entries
+  for the full numbers. See `ik_arm_integration_plan.md` for the full phased plan,
+  landmines, and file map. `main` stays exactly as-is as the pure-RL fallback.
 
 **Working conventions worth knowing before touching anything:**
 - Verify before concluding — this project has repeatedly found that plausible-sounding

@@ -234,6 +234,69 @@ under reaction torque — real PD-not-infinitely-rigid physics, not a bug, see
 landmine #5 in the plan doc) shows up here too, unsurprising since the underlying
 mechanism is unrelated to this task.
 
+**2026-07-31: two more root causes found and fixed (both cross-checked against
+independent findings on `main`), then a fresh long training run — PROMOTED
+2026-08-01.** Full numbers/reasoning in `ik_arm_integration_plan.md`'s 2026-07-31 and
+2026-08-01 entries; summary here:
+
+1. `success_rate` collapsing with more training (95.8%→12.9%, 2500→5000 iters, noted
+   above) was the same `terminate_on_success` reward-termination artifact `main`
+   independently found and proved for its own (non-residual) arm task: completing the
+   15-consecutive-step hold ends the episode and forfeits the remaining per-step
+   `goal_reached_bonus` stream, so dithering at the 2cm boundary out-earns actually
+   succeeding, and more training just optimizes that harder. Neither the velocity gate
+   nor the streak bonus (both already in place, see above) removes this — the streak
+   bonus actually sharpens the exploit (a repeatable streak/break/rebuild cycle).
+   **Fixed**: `terminate_on_success=False` on both residual cfgs; the streak
+   multiplier capped at `goal_hold_steps` (episodes now run to timeout).
+2. The rate-limit fix noted above (never trained until this point) re-anchored the
+   commanded target to the *measured* position every step, which re-introduces a real
+   static-torque ceiling `main`'s own probe
+   (`check_arm_static_torque_ceiling.py`) confirmed breaks arm holding
+   (kp·0.06rad=2.4Nm vs. the 4.5-5.7Nm goal-box postures need). **Fixed**:
+   `_apply_action` now slew-limits a *persistent* commanded target
+   (`self._cmd_targets`, re-seeded at every reset) instead — same 0.06 rad/step bound
+   on setpoint speed, no cap on the static gravity-holding bias it can accumulate.
+
+Trained fresh (both fixes together) to iteration 5999
+(`logs/rsl_rl/arms/residual_left/2026-07-31_07-52-15/model_5999.pt`): Settled <2cm
+100%, Tail-settle (5s) 100%, mean min-dist 0.55cm, mean final-dist 0.99cm — a dramatic,
+well-explained improvement over every prior checkpoint (now arguably beating the
+standalone kinematic solver's own ~0.8-2.9cm accuracy ceiling, plausible since the
+residual is closed-loop/corrects from measured error every step, unlike a single
+open-loop IK solve). `validation/eval_arm_residual.py` updated to report Settled
+<2cm/<3cm and Tail-settle (ported from `main`'s `eval_arm.py`), since the legacy
+`success` CSV column reads 0% by construction under `terminate_on_success=False`.
+
+**2026-08-01: tiered joint-limit-proximity penalty — mixed result, not re-opened.**
+Visual inspection of the 5999 checkpoint found some joint configurations resolving the
+arm's redundancy (7 DOF for a 3-DOF position-only goal) via awkward-looking extreme
+angles — explained by the existing `joint_limit_term` being nearly inert in practice
+(-0.03 to -0.04 vs. a +154 `goal_reached_bonus`, ~4000x smaller). Replaced the single
+5%-margin/scale=1.0 flag with three concentric, cumulative bands (20%/10%/5% margin,
+escalating scale 0.1/0.3/1.0 — the 5%-band scale kept at the prior default so the
+tightest/most-critical band's behavior doesn't regress). Resumed training to iteration
+11999 (`logs/rsl_rl/arms/residual_left/2026-07-31_14-00-08/model_11999.pt`): Settled
+<2cm and Tail-settle both stayed 100%, and wrist_pitch's achieved range fixed cleanly
+(was exceeding its own soft limit at 99-111% pre-fix, now 86-90%) — but the aggregate
+tightest-band (5%) per-step dwell-time metric actually *rose* (~3.5%→~17% averaged
+across joints), and precision dipped slightly (mean min-dist 0.55→0.67cm, mean
+final-dist 0.99→1.21cm). Net: real but partial improvement, not a clean win — **user
+decision 2026-08-01: promote as-is, defer further joint-limit tuning** rather than
+spend more time chasing a second moving target on an already-working checkpoint.
+
+**PROMOTED 2026-08-01**: `model_11999.pt` → `chosen_checkpoints/arm_left_residual_latest.pt`.
+This is the current arm checkpoint. It is a residual policy, not a standalone one — see
+`chosen_checkpoints/README.md`'s entry for the required action-pipeline pairing
+(IK baseline solve, gravity feedforward, slew-limited persistent target, 46-D
+observation) before using it anywhere. `arm_left_latest.pt` (pure-RL, pre-pivot) is
+superseded, kept for historical reference only. Visualize with
+`testing/visual_testing/arms/g1_arm_residual_reach_test.py` — NOT `g1_full_demo.py`,
+which drives a live walking policy (no fixed-base option) and has no residual-backend
+support at all (wrong obs dim, wrong action semantics); using it would put this
+checkpoint in the walking-induced-instability regime the plan already found and
+deferred.
+
 ## Arm reaching (historical — pure-RL era, superseded by IK + residual RL above)
 
 **Status: not working, root cause still open, but two small real improvements found +

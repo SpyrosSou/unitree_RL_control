@@ -727,6 +727,108 @@ pre-slew-limiter action interface — do not re-eval them under today's env code
 compare against their archived numbers. Needs a fresh training run (reward structure
 AND action interface both changed).
 
+**2026-08-01: `train.py`'s `--max_iterations` was additive on resume, not absolute —
+fixed.** Root cause: `rsl_rl`'s `OnPolicyRunner.learn()` computes
+`tot_iter = current_learning_iteration + num_learning_iterations` — i.e.
+`num_learning_iterations` is always additive to wherever the runner's counter
+currently sits, regardless of what the CLI flag is named. `train.py` passed
+`agent_cfg.max_iterations` straight through as `num_learning_iterations`, so a resume
+from iteration 1500 with `--max_iterations 4500` ran to iteration 6000, not 4500 as
+the flag name implied (confirmed directly — this is exactly what happened resuming
+the run that became `2026-07-31_07-52-15`). Fixed: on a resume (and not combined with
+`--resume_reset_iteration`, which already has its own absolute-numbering mechanism),
+`train.py` now computes `remaining = max_iterations - runner.current_learning_iteration`
+and passes that instead, printing exactly how many iterations it's about to run, and
+raising a clear error if the target is already ≤ the resumed checkpoint's iteration.
+`--max_iterations` is now the absolute target total in every case, resume or fresh.
+
+**2026-08-01: root-cause fixes trained and validated — first PROMOTION of an arm
+checkpoint since the branch's pivot to IK + residual RL.**
+
+Fresh run (both root-cause fixes above — `terminate_on_success=False`, the
+persistent-target slew-limiter) trained to iteration 5999
+(`logs/rsl_rl/arms/residual_left/2026-07-31_07-52-15/model_5999.pt`,
+`validation/eval_arm_residual.py`, fixed base, trimmed box, 1024 episodes/bucket):
+
+| Bucket | Settled <2cm | Tail-settle (5s) | Mean min-dist | Mean final-dist |
+|---|---|---|---|---|
+| `ik_baseline` (residual forced 0) | 0.00% | 0.00% | 9.28cm | 13.24cm |
+| `residual_no_wobble` | 100.00% | 100.00% (excl=0) | 0.55cm | 0.99cm |
+| `residual_with_wobble` | 100.00% | 100.00% (excl=0) | 0.55cm | 0.98cm |
+
+Sanity-checked, not just trusted at face value: `success_rate (legacy)` reads 0.00%
+for every bucket including the residual ones, confirming `terminate_on_success=False`
+really was active during eval (not silently ignored) rather than the settings being
+stale; `mean_dist_cm` is defined identically to every prior eval (mean of each
+episode's *minimum* distance, not a full-trajectory average), so this is a fair
+apples-to-apples comparison against the pre-fix `model_2000.pt` (1.15cm mean
+min-dist, 1.86cm mean final-dist, 96% legacy success before it collapsed with more
+training). The result now arguably beats the standalone kinematic solver's own
+accuracy ceiling (Phase 2's ~0.79-2.89cm mean) — plausible since the residual is
+closed-loop (corrects from measured error every control step) where the kinematic
+number was a single open-loop IK solve.
+
+One caveat found in the same eval: the joint-range-utilization table showed several
+joints (elbow, wrist_pitch) sitting at 94-111% of their reported "hw range" — this is
+`soft_joint_pos_limits`, a margin *inside* the true PhysX hard stops, so brief PD
+overshoot past it is expected dynamics, not a limit violation (and was already
+present, 102%, in the pre-fix `model_2000.pt` report — not something these two fixes
+introduced). Still, it prompted a closer look — see next entry.
+
+**2026-08-01: tiered joint-limit-proximity penalty (user-requested follow-up) — real
+but partial effect, not re-opened further.** Visual inspection of the 5999 checkpoint
+(`testing/visual_testing/arms/g1_arm_residual_reach_test.py`) confirmed the joint-range
+numbers weren't just a benign soft-limit artifact — some reaches visibly resolved the
+arm's redundancy (7 DOF for a 3-DOF position-only goal) via awkward extreme
+configurations. Explained by the existing `joint_limit_term` being almost entirely
+inert in practice: its actual eval contribution was -0.03 to -0.04, against a +154
+`goal_reached_bonus` (~4000x larger) — nothing was meaningfully discouraging extreme
+configurations as long as the end-effector landed on target. `null_space_penalty_scale`
+(0.05, pulls toward the default pose generally, not limit-specific) was in the same
+boat.
+
+Implemented in `G1ArmResidualEnv._get_rewards` (fully isolated to this task, not
+touching the base `G1ArmEnv`): replaced the single 5%-margin/scale=1.0 flag with
+three concentric, cumulative margin bands — 20%/10%/5% of each joint's span, scales
+0.1/0.3/1.0 (escalating; the 5%-band scale kept at the prior default so the tightest,
+most safety-relevant band's behavior wouldn't regress from what was already
+validated). New cfg fields: `joint_limit_margin_fraction_{20,10,05}`,
+`joint_limit_penalty_scale_{20,10,05}`. `Metrics/mean_joints_at_limit` kept its old
+meaning (5%-band only) for continuity with prior eval history.
+
+Resumed (not fresh — a value/structure change isolated to one reward term, not the
+termination/action-interface fixes) across two further sessions to iteration 11999
+(`logs/rsl_rl/arms/residual_left/2026-07-31_14-00-08/model_11999.pt`):
+
+| Bucket | Settled <2cm | Tail-settle (5s) | Mean min-dist | Mean final-dist | `mean_joints_at_limit` (5% band) |
+|---|---|---|---|---|---|
+| `model_5999` (pre-tiered-penalty) | 100.00% | 100.00% | 0.55cm | 0.99cm | ~0.03 |
+| `model_11999` (tiered penalty) | 100.00% | 100.00% | 0.67cm | 1.21cm | ~0.17 |
+
+Mixed, not a clean win: `Episode_Reward/joint_limit` went from -0.03/-0.035 to
+-0.50/-0.49 (the tiered penalty is genuinely firing now, unlike before), and
+wrist_pitch's achieved range fixed cleanly (was exceeding its own soft limit at
+99-111% pre-fix, now 86-90%, i.e. within it). But the tightest-band (5%) *dwell-time*
+metric rose rather than fell (~3.5%→~17% averaged across the 7 joints) — plausibly the
+policy shifted which joint absorbs the redundancy-resolution cost (e.g.
+`residual_with_wobble`'s shoulder_yaw achieved range grew from 91.9% to 96.3% of its
+span) rather than reducing extreme-configuration usage overall — and precision dipped
+slightly (min-dist 0.55→0.67cm, final-dist 0.99→1.21cm), a real if small trade-off.
+Settled/Tail-settle stayed unaffected (both 100%), so nothing regressed on the
+headline task.
+
+**Decision (2026-08-01, user): promote `model_11999.pt` as-is; defer further
+joint-limit tuning rather than chase a second moving target on an already-working
+checkpoint** ("sort of improved but not 100%, this will do for now"). Copied to
+`chosen_checkpoints/arm_left_residual_latest.pt` — see that directory's `README.md`
+for the required action-pipeline pairing (this is a residual policy, not a standalone
+one: IK baseline solve, gravity feedforward, persistent slew-limited target, 46-D
+observation) and `policy_status.md`'s matching entry for the summary. If joint-limit
+smoothness is revisited later: candidates not yet tried are widening the 20%/10%
+bands further, bumping `null_space_penalty_scale` instead of/alongside the tiered
+penalty, or a genuinely continuous (not 3-step) barrier function — worth an isolated
+ablation against `model_11999.pt` as the new baseline, not `model_5999.pt`.
+
 ## Working conventions on this branch (non-negotiable, carried from `main`)
 
 - **Never run Isaac Sim / GPU / training commands yourself. Give the user the exact
