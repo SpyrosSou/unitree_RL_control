@@ -228,6 +228,16 @@ def main():
             default_pos, zero_vel,
             joint_ids=inner_env.arm_joint_indices_tensor, env_ids=env_ids_0,
         )
+        # 2026-08-01: re-seed the slew-limiter's persistent commanded-target state
+        # (G1ArmResidualEnv._cmd_targets) to match the pose just teleported to above —
+        # without this, _apply_action's rate limit clamps against wherever the
+        # PREVIOUS target's residual left _cmd_targets, not this freshly-reset
+        # position, so the arm would visibly crawl from the stale old target toward
+        # the new one instead of starting clean. _reset_idx (the natural per-episode
+        # reset path) already does this same re-seed; this script bypasses _reset_idx
+        # by writing joint state directly, so it needs its own copy of that line.
+        arm = inner_env._arm_groups[0]
+        inner_env._cmd_targets[0:1] = inner_env.robot.data.default_joint_pos[0:1, arm["joint_tensor"]]
 
         origin = inner_env.scene.env_origins[0]
         t = targets_local[idx]

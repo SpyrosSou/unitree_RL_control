@@ -64,6 +64,16 @@ parser.add_argument(
     "it was trained with or runner.load() fails on a shape mismatch. Default: None "
     "(use G1ArmResidualPPORunnerCfg's own default, [512, 256, 128]).",
 )
+parser.add_argument(
+    "--tail_window_s", type=float, default=5.0,
+    help="Window (seconds) for the tail-settle-rate metric (ported from main's "
+    "eval_arm.py 2026-07-30/31): fraction of episodes whose distance-to-goal stayed "
+    "under goal_threshold for the ENTIRE last N seconds of the episode, computed from "
+    "the existing per-second dist_to_goal_cm_t*s snapshot columns. The direct 'hold "
+    "capability' measure for checkpoints trained with terminate_on_success=False "
+    "(where the legacy success/hold-counter metric reads a structural 0%%). Clipped "
+    "to the episode length if longer.",
+)
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 
@@ -76,6 +86,7 @@ simulation_app = app_launcher.app
 import csv
 import math
 import os
+import re
 
 import g1_locomotion.tasks  # noqa: F401 — registers gym envs
 import torch
@@ -105,7 +116,66 @@ from rsl_rl.runners import OnPolicyRunner
 from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
 
 
-def _summarize(csv_path: str, goal_threshold_cm: float) -> dict:
+# Matches ArmMetricsCsvWrapper's per-second snapshot columns, e.g. "dist_to_goal_cm_t5.0s".
+_TAIL_SNAPSHOT_RE = re.compile(r"^dist_to_goal_cm_t([0-9.]+)s$")
+
+
+def _tail_settle_stats(rows: list[dict], goal_threshold_cm: float, tail_window_s: float) -> dict:
+    """Ported from main's eval_arm.py (2026-07-30, incl. the 2026-07-31 dead-column
+    fix): 'did distance-to-goal stay under threshold for the ENTIRE last tail_window_s
+    of the episode' -- computed purely from the existing per-second dist_to_goal_cm_t*s
+    snapshot columns (metrics_wrappers.py's _DIST_SNAPSHOT_INTERVAL_S=1.0s cadence).
+    With terminate_on_success=False the legacy success metric reads a structural 0%
+    (the CSV's 'success' column is bool(terminated), and terminated only ever fires
+    when terminate_on_success is on), and final_dist_to_goal_cm only checks the single
+    LAST instant -- a policy still oscillating right up to episode end would pass that
+    but shouldn't count as 'holding'. This checks a whole trailing window instead.
+
+    Episodes lacking a full window of snapshots are excluded from the denominator and
+    counted in tail_settle_excluded -- reported separately rather than silently
+    treated as pass or fail either way."""
+    if not rows:
+        return {"tail_settle_rate": 0.0, "tail_settle_window_s": 0.0, "tail_settle_excluded": 0}
+    candidate_times = sorted(
+        float(m.group(1)) for c in rows[0].keys() if (m := _TAIL_SNAPSHOT_RE.match(c))
+    )
+    if not candidate_times:
+        return {"tail_settle_rate": 0.0, "tail_settle_window_s": 0.0, "tail_settle_excluded": len(rows)}
+    # Drop any snapshot column that's EMPTY FOR EVERY ROW before picking the trailing
+    # window -- the nominal final slot (t == episode_length_s) is empty in 100% of
+    # rows (episodes truncate one control step short of the exact step-count boundary
+    # the wrapper's "due" check needs), and anchoring the window to that structurally-
+    # dead column would exclude EVERY episode (main's 2026-07-31 finding, confirmed on
+    # a real run there). Only entirely-dead columns are dropped -- rows individually
+    # missing a live column are still excluded per-row below.
+    usable_times = [
+        t for t in candidate_times
+        if any(r[f"dist_to_goal_cm_t{round(t, 1)}s"] != "" for r in rows)
+    ]
+    if not usable_times:
+        return {"tail_settle_rate": 0.0, "tail_settle_window_s": 0.0, "tail_settle_excluded": len(rows)}
+    max_t = usable_times[-1]
+    window_used = min(tail_window_s, max_t)
+    tail_cols = [f"dist_to_goal_cm_t{round(t, 1)}s" for t in usable_times if t > max_t - window_used + 1e-6]
+
+    settled = 0
+    excluded = 0
+    for r in rows:
+        vals = [r[c] for c in tail_cols]
+        if any(v == "" for v in vals):
+            excluded += 1
+            continue
+        if all(float(v) < goal_threshold_cm for v in vals):
+            settled += 1
+    denom = len(rows) - excluded
+    return {
+        "tail_settle_rate": (settled / denom) if denom > 0 else 0.0,
+        "tail_settle_window_s": window_used,
+        "tail_settle_excluded": excluded,
+    }
+
+
+def _summarize(csv_path: str, goal_threshold_cm: float, tail_window_s: float) -> dict:
     if not os.path.isfile(csv_path):
         return {"episodes": 0}
     with open(csv_path) as f:
@@ -114,16 +184,32 @@ def _summarize(csv_path: str, goal_threshold_cm: float) -> dict:
         return {"episodes": 0}
     n = len(rows)
     dists = sorted(float(r["min_dist_to_goal_cm"]) for r in rows)
+    final_dists = [float(r["final_dist_to_goal_cm"]) for r in rows]
+    tail_stats = _tail_settle_stats(rows, goal_threshold_cm, tail_window_s)
 
     def pct(p: float) -> float:
         return dists[min(int(n * p), n - 1)]
 
     return {
         "episodes": n,
-        # "success" (env's own definition, unchanged): reached AND held under
-        # goal_threshold for goal_hold_steps CONSECUTIVE steps -- the number relevant
-        # for a task that needs to stay put once it arrives.
+        # LEGACY "success" (reached AND held for goal_hold_steps CONSECUTIVE steps,
+        # via terminate_on_success). 2026-07-31: with the residual cfgs now training
+        # (and playing) with terminate_on_success=False, the CSV's success column
+        # (bool(terminated)) reads 0% BY CONSTRUCTION -- kept only for comparison
+        # against pre-NoTerm checkpoints' historical numbers. Judge NoTerm
+        # checkpoints by settled_* and tail_settle_rate below.
         "success_rate": sum(int(r["success"]) for r in rows) / n,
+        # ADDED 2026-07-31 (ported from main's eval_arm.py): fraction of episodes
+        # ENDING within 2cm/3cm of the goal -- the use-case-representative headline
+        # for a grasp task ("get there and be there at the end"), independent of the
+        # hold-counter/termination path entirely.
+        "settled_lt_2cm": sum(1 for d in final_dists if d < goal_threshold_cm) / n,
+        "settled_lt_3cm": sum(1 for d in final_dists if d < 3.0) / n,
+        # ADDED 2026-07-31 (ported from main): stayed under goal_threshold for the
+        # ENTIRE trailing window -- the real "hold capability" answer; catches a
+        # policy still oscillating right up to the last instant, which settled_*
+        # alone wouldn't. See _tail_settle_stats.
+        **tail_stats,
         # 2026-07-28 (user request): a SEPARATE reach-only rate -- did min_dist_to_goal
         # ever drop under goal_threshold at all, regardless of whether it then held
         # there for the required consecutive-step count. Derived directly from the
@@ -240,7 +326,7 @@ def _run_bucket(base_env: G1ArmResidualEnv, name: str, eval_root: str) -> tuple[
     # cascade down and tear down base_env, breaking the next bucket.
     env._csv.close()
     goal_threshold_cm = base_env.cfg.goal_threshold * 100.0
-    return _summarize(env.csv_path, goal_threshold_cm), joint_ranges, reward_breakdown
+    return _summarize(env.csv_path, goal_threshold_cm, args_cli.tail_window_s), joint_ranges, reward_breakdown
 
 
 def main():
@@ -285,14 +371,18 @@ def main():
         "own fixed-base result (~16.65cm mean achieved error) as a sanity check that this "
         "eval is measuring the same thing before trusting the residual buckets' improvement.",
         "",
-        "`success_rate` = reached AND held for goal_hold_steps consecutive steps (the "
-        "hold-in-place task this eval currently tests). `reach_rate_no_hold` = ever got "
-        "under goal_threshold at all, regardless of holding -- the more representative "
-        "number for continuous/path-following control, where holding at any one point "
-        "isn't the goal.",
+        "`success_rate (legacy)` = reached AND held for goal_hold_steps consecutive "
+        "steps via terminate_on_success -- **reads 0.00% BY CONSTRUCTION for "
+        "checkpoints trained/evaluated with terminate_on_success=False** (the CSV's "
+        "success column is bool(terminated), which never fires without termination); "
+        "kept only for comparison against pre-NoTerm historical numbers. Judge NoTerm "
+        "checkpoints by **Settled <2cm/<3cm** (episode ENDED that close) and "
+        "**Tail-settle** (stayed under goal_threshold for the entire trailing window; "
+        "`excl=N` = episodes without a full window, excluded from the rate). "
+        "`reach_rate_no_hold` = ever got under goal_threshold at all.",
         "",
-        "| Bucket | Episodes | Success rate (reach+hold) | Reach rate (no hold) | Mean reward | Mean dist (cm) | Median dist (cm) | p90 dist (cm) | Mean final dist (cm) |",
-        "|---|---|---|---|---|---|---|---|---|",
+        f"| Bucket | Episodes | Success rate (legacy) | Reach rate (no hold) | Settled <2cm | Settled <3cm | Tail-settle ({args_cli.tail_window_s:.0f}s) | Mean reward | Mean dist (cm) | Median dist (cm) | p90 dist (cm) | Mean final dist (cm) |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
 
     joint_range_lines = [
@@ -315,12 +405,19 @@ def main():
         stats, joint_ranges, reward_breakdown = _run_bucket(base_env, name, eval_root)
         if stats["episodes"] == 0:
             print(f"[Eval] Bucket '{name}': no completed episodes — increase --steps_per_bucket.")
-            summary_lines.append(f"| {name} | 0 | — | — | — | — | — | — | — |")
+            summary_lines.append(f"| {name} | 0 | — | — | — | — | — | — | — | — | — | — |")
             continue
+        tail_cell = (
+            f"{stats['tail_settle_rate']:.2%} ({stats['tail_settle_window_s']:.0f}s, "
+            f"excl={stats['tail_settle_excluded']})"
+        )
         print(
             f"[Eval] Bucket '{name}': episodes={stats['episodes']} "
-            f"success_rate={stats['success_rate']:.2%} "
+            f"success_rate_legacy={stats['success_rate']:.2%} "
             f"reach_rate_no_hold={stats['reach_rate_no_hold']:.2%} "
+            f"settled_lt_2cm={stats['settled_lt_2cm']:.2%} "
+            f"settled_lt_3cm={stats['settled_lt_3cm']:.2%} "
+            f"tail_settle={tail_cell} "
             f"mean_reward={stats['mean_reward']:.3f} "
             f"mean_dist_cm={stats['mean_dist_cm']:.2f} "
             f"p50_dist_cm={stats['p50_dist_cm']:.2f} "
@@ -329,6 +426,7 @@ def main():
         )
         summary_lines.append(
             f"| {name} | {stats['episodes']} | {stats['success_rate']:.2%} | {stats['reach_rate_no_hold']:.2%} "
+            f"| {stats['settled_lt_2cm']:.2%} | {stats['settled_lt_3cm']:.2%} | {tail_cell} "
             f"| {stats['mean_reward']:.3f} | {stats['mean_dist_cm']:.2f} | {stats['p50_dist_cm']:.2f} "
             f"| {stats['p90_dist_cm']:.2f} | {stats['mean_final_dist_cm']:.2f} |"
         )

@@ -688,6 +688,45 @@ oscillation from building up, independent of training duration.
 Needs a fresh training run to evaluate (the previous 2000-iteration run pre-dates
 this fix and isn't representative of it).
 
+**2026-07-31: full review against `main`'s post-fork findings — two root causes
+identified, three fixes implemented, superseding the two open items above.**
+`main`'s independent arm work (see `arms_policy_finalisation.md` there, 2026-07-30)
+proved two things that map directly onto this branch's residual results:
+
+1. **The success_rate collapse with more training (95.8% @2500 → 12.9% @5000 on
+   `22-17-21`) is the `terminate_on_success` incentive artifact, not a tuning
+   problem.** Completing the 15-consecutive-step hold terminates the episode and
+   forfeits the remaining per-step `goal_reached_bonus` stream — dithering at the
+   2cm boundary out-earns succeeding by ~an order of magnitude, and more training
+   just optimizes that objective harder (main's proof: 2k→8k improved every real
+   metric while legacy success FELL 10.8%→6.5%). Neither the velocity gate nor the
+   streak bonus removes the cliff (the streak bonus sharpens the exploit: a
+   repeatable 14-streak/break/rebuild cycle). **Fix: `terminate_on_success=False`
+   on both residual cfgs**; streak multiplier now capped at `goal_hold_steps`
+   (3.25x) since holds can run to timeout under NoTerm.
+2. **The 2026-07-29 rate-limit fix (never trained) re-introduced the static-torque
+   ceiling main probe-confirmed breaks holding** (`targets = current + clamp(...)`
+   caps sustained PD torque at kp·0.06 = 2.4 Nm vs 4.5–5.7 Nm needed;
+   `check_arm_static_torque_ceiling.py` on main). It would also have capped the
+   residual's correction authority at 2.4 Nm above tau_ff — model_2000's own eval
+   closed the 8.6cm ik_baseline gap to 1.15cm precisely by commanding well beyond
+   the baseline. **Fix: `_apply_action` now slew-limits a persistent commanded
+   target (`self._cmd_targets`, re-seeded to the arm's actual pose at reset) —
+   same 0.06 rad/step bound on setpoint speed, no cap on accumulated static bias**
+   (main's integrated-target principle).
+3. **`eval_arm_residual.py` updated for NoTerm**: under `terminate_on_success=False`
+   the CSV's legacy `success` column reads 0% by construction, so the eval now also
+   reports **Settled <2cm/<3cm** (final_dist) and **Tail-settle** (entire trailing
+   `--tail_window_s`, default 5s, from the per-second snapshot columns — including
+   main's 2026-07-31 fix dropping the structurally-empty final snapshot slot).
+   Judge NoTerm checkpoints by those; acceptance bar mirroring main's: Settled
+   <2cm ≥ 95%, Tail-settle(5s) ≥ ~90%.
+
+Caveat: old checkpoints (e.g. `22-17-21/model_2000.pt`) were trained on the
+pre-slew-limiter action interface — do not re-eval them under today's env code and
+compare against their archived numbers. Needs a fresh training run (reward structure
+AND action interface both changed).
+
 ## Working conventions on this branch (non-negotiable, carried from `main`)
 
 - **Never run Isaac Sim / GPU / training commands yourself. Give the user the exact

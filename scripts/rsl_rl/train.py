@@ -49,9 +49,10 @@ parser.add_argument(
     default=False,
     help=(
         "When used with --resume, warm-start the model/optimizer weights as usual but reset "
-        "the learning-iteration counter to 0 afterward, so --max_iterations is an absolute "
-        "range (not additive) and checkpoint filenames (model_<iter>.pt) look like a normal "
-        "fresh run instead of continuing the source checkpoint's absolute iteration count. "
+        "the learning-iteration counter to 0 afterward, so checkpoint filenames (model_<iter>.pt) "
+        "look like a normal fresh run instead of continuing the source checkpoint's absolute "
+        "iteration count (--max_iterations is an absolute target either way — see below — this "
+        "flag only affects the renumbering/curriculum-offset behavior described here). "
         "Curriculum carry-forward (arm_motion_disturbance phase offset, lin_vel_cmd_levels) "
         "still reads the source checkpoint's true iteration directly from its 'iter' field, "
         "so that state is unaffected by this reset — only the runner's own counter is reset. "
@@ -395,8 +396,36 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
     dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
 
+    # 2026-08-01 FIX: rsl_rl's OnPolicyRunner.learn() computes
+    # tot_iter = current_learning_iteration + num_learning_iterations (see
+    # on_policy_runner.py) -- i.e. num_learning_iterations is ALWAYS additive to
+    # wherever the runner's counter currently sits, regardless of --max_iterations'
+    # own naming. Passing agent_cfg.max_iterations straight through as
+    # num_learning_iterations therefore made --max_iterations additive on a resume
+    # (confirmed: --resume from iteration 1500 with --max_iterations 4500 ran to
+    # iteration 6000, not 4500) -- surprising given the flag's own name and the
+    # --resume_reset_iteration flag's docstring, which already assumed the opposite.
+    # Fix: on a resume (runner.current_learning_iteration > 0, i.e. NOT reset by
+    # --resume_reset_iteration above), treat --max_iterations as the ABSOLUTE target
+    # iteration and pass the runner only the remaining distance to it. A fresh run
+    # (current_learning_iteration == 0) is unaffected -- absolute and additive are
+    # the same thing from iteration 0.
+    num_learning_iterations = agent_cfg.max_iterations - runner.current_learning_iteration
+    if runner.current_learning_iteration > 0:
+        print(
+            f"[INFO] --max_iterations={agent_cfg.max_iterations} is an ABSOLUTE target "
+            f"(resumed from iteration {runner.current_learning_iteration}) -- running "
+            f"{max(num_learning_iterations, 0)} more iteration(s)."
+        )
+    if num_learning_iterations <= 0:
+        raise ValueError(
+            f"--max_iterations={agent_cfg.max_iterations} is already <= the resumed checkpoint's "
+            f"iteration ({runner.current_learning_iteration}) -- nothing to train. Raise "
+            "--max_iterations, or pass --resume_reset_iteration if you intended a fresh count."
+        )
+
     # run training
-    runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)
+    runner.learn(num_learning_iterations=num_learning_iterations, init_at_random_ep_len=True)
 
     print(f"Training time: {round(time.time() - start_time, 2)} seconds")
 

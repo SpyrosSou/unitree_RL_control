@@ -261,7 +261,70 @@ class G1ArmResidualLeftEnvCfg(G1ArmLeftEnvCfg):
     # real, escalating opportunity cost, not just the one missed step's flat bonus.
     # First estimate (not yet tuned): at hold_counter=14 (just before goal_hold_steps=15
     # would fire success/termination), this gives a ~3.1x multiplier.
+    #
+    # 2026-07-31: with terminate_on_success=False (below), episodes always run to
+    # timeout, so an uncapped streak multiplier would grow without bound over a long
+    # hold (300-step hold -> 46x -> ~2300/step by episode end) and distort the value
+    # function. _get_rewards now caps the streak used for scaling at goal_hold_steps
+    # (max multiplier 1 + 15*0.15 = 3.25x) -- keeps the escalating incentive while a
+    # hold is being established, flat once it's genuinely held.
     hold_streak_bonus_scale: float = 0.15
+
+    # 2026-07-31: THE fix for the success_rate collapse with more training (95.8% at
+    # 2500 iters -> 12.9% at 5000 on run 2026-07-28_22-17-21). With termination on
+    # success, completing the 15-consecutive-step hold ends the episode and forfeits
+    # the remaining per-step goal_reached_bonus stream (~50-160/step x the ~200+
+    # remaining steps) -- so the reward-optimal policy dithers at the 2cm boundary,
+    # flickering in and out, and never completes the hold; more training = better
+    # optimization of that objective = lower success rate. Independently found and
+    # proven on main (arms_policy_finalisation.md, 2026-07-30: the Integrated run's
+    # 2k->8k training improved every real metric while legacy success FELL 10.8%->
+    # 6.5%; their NoTerm retrain is the same fix). Neither the velocity gate nor the
+    # streak bonus removes this cliff -- the streak bonus actually sharpens the
+    # exploit (a repeatable 14-step-streak/break/rebuild cycle out-earns terminating).
+    # With False, staying in-zone strictly dominates leaving and there is nothing
+    # left to gain from dithering. NOTE: Train/mean_episode_length stops being a
+    # progress signal (always ~max); watch Episode_Reward/goal_reached_bonus and
+    # Metrics/frac_envs_reached instead. Eval note: the metrics wrapper's legacy
+    # `success` CSV column reads bool(terminated) and is 0% BY CONSTRUCTION under
+    # this cfg -- judge checkpoints by the settled/tail-settle metrics
+    # eval_arm_residual.py now reports (ported from main's eval_arm.py).
+    terminate_on_success: bool = False
+
+    # 2026-08-01: tiered joint-limit-proximity penalty, replacing the base task's
+    # single 5%-margin/scale=1.0 "at limit" flag (the base's own
+    # `_joint_limit_margin_fraction` is hardcoded 5% in G1ArmEnv.__init__, not a cfg
+    # field, and this task's _get_rewards already fully overrides the base's
+    # joint_limit_term computation — see that method's own docstring for why).
+    # Motivated by a real, visually-confirmed observation (2026-08-01, checkpoint
+    # 2026-07-31_07-52-15/model_5999.pt): the existing term contributed essentially
+    # nothing in eval (-0.03 to -0.04 vs. a +154 goal_reached_bonus — 4000x smaller),
+    # so nothing was actually discouraging the residual from resolving the arm's
+    # redundancy (7 DOF for a 3-DOF position-only goal) via extreme, awkward-looking
+    # joint configurations that still land on the same end-effector point. `at_limit`
+    # (the outermost 5% band) stayed a low ~3.5% dwell-time average, but several
+    # joints' ACHIEVED range in eval touched 94-111% of their soft hw range — the
+    # existing single hard cutoff gave no anticipatory pressure before that band.
+    # Three concentric margin bands (20%/10%/5% of each joint's span, ordered
+    # widest-to-narrowest) with ESCALATING, CUMULATIVE scales approximate a soft
+    # barrier that gets steeper the closer a joint sits to its real limit: a joint
+    # within the outer 20% pays only the mildest penalty; one within the innermost
+    # 5% (a subset of both outer bands) pays all three added together. The 5%-band
+    # scale is kept at the base task's own default (1.0) specifically so behavior at
+    # the tightest, most safety-relevant band doesn't regress from what's already
+    # validated; the 10%/20% bands are new, lighter, first-pass estimates (not yet
+    # tuned against real data — same "flag it, don't pretend it's final" treatment
+    # every other first-estimate reward weight in this file gets). Deliberately NOT
+    # touching null_space_penalty_scale (0.05, inherited unchanged) or anything in
+    # the termination/streak/action-interface fixes above -- this is an isolated,
+    # single-mechanism addition so its effect (if any) on Settled/Tail-settle can be
+    # attributed cleanly, per this branch's own established practice.
+    joint_limit_margin_fraction_20: float = 0.20
+    joint_limit_margin_fraction_10: float = 0.10
+    joint_limit_margin_fraction_05: float = 0.05
+    joint_limit_penalty_scale_20: float = 0.1
+    joint_limit_penalty_scale_10: float = 0.3
+    joint_limit_penalty_scale_05: float = 1.0  # matches the base task's existing joint_limit_penalty_scale default
 
 
 @configclass
@@ -278,6 +341,13 @@ class G1ArmResidualRightEnvCfg(G1ArmRightEnvCfg):
     settle_velocity_penalty_scale: float = 0.05  # see G1ArmResidualLeftEnvCfg's own comment
     goal_reached_max_vel: float = 1.5  # see G1ArmResidualLeftEnvCfg's own comment
     hold_streak_bonus_scale: float = 0.15  # see G1ArmResidualLeftEnvCfg's own comment
+    terminate_on_success: bool = False  # see G1ArmResidualLeftEnvCfg's own comment
+    joint_limit_margin_fraction_20: float = 0.20  # see G1ArmResidualLeftEnvCfg's own comment
+    joint_limit_margin_fraction_10: float = 0.10  # see G1ArmResidualLeftEnvCfg's own comment
+    joint_limit_margin_fraction_05: float = 0.05  # see G1ArmResidualLeftEnvCfg's own comment
+    joint_limit_penalty_scale_20: float = 0.1  # see G1ArmResidualLeftEnvCfg's own comment
+    joint_limit_penalty_scale_10: float = 0.3  # see G1ArmResidualLeftEnvCfg's own comment
+    joint_limit_penalty_scale_05: float = 1.0  # see G1ArmResidualLeftEnvCfg's own comment
 
 
 @configclass
@@ -343,6 +413,20 @@ class G1ArmResidualEnv(G1ArmEnv):
         self.ik_baseline_q = self.robot.data.default_joint_pos[:, arm["joint_tensor"]].clone()
         self.ik_baseline_tauff = torch.zeros_like(self.ik_baseline_q)
 
+        # 2026-07-31: persistent commanded-target state for _apply_action's slew-rate
+        # limiter (re-initialized to the arm's actual post-reset pose in _reset_idx).
+        # Rate-limiting the COMMANDED-TARGET TRAJECTORY (target_t = target_{t-1} +
+        # clamped delta) bounds how fast the PD setpoint can move -- the legitimate
+        # smoothness/deployment concern behind the 2026-07-29 rate-limit fix --
+        # WITHOUT the static-torque ceiling that fix accidentally introduced by
+        # re-anchoring to the MEASURED position every step (|target - current| <=
+        # 0.06 rad caps sustained PD torque at kp*0.06 = 2.4 Nm; main's
+        # check_arm_static_torque_ceiling.py probe confirmed goal-box postures need
+        # 4.5-5.7 Nm, and model_2000's own eval shows the residual closing an 8.6cm
+        # baseline gap only by commanding well beyond it). Same integrated-target
+        # principle as main's integrate_action_targets fix.
+        self._cmd_targets = self.robot.data.default_joint_pos[:, arm["joint_tensor"]].clone()
+
     # ------------------------------------------------------------------
     # IK baseline (solved once per episode, at reset)
     # ------------------------------------------------------------------
@@ -391,6 +475,11 @@ class G1ArmResidualEnv(G1ArmEnv):
             if not isinstance(env_ids, torch.Tensor) else env_ids
         )
         self._solve_ik_baseline_for_envs(env_ids_tensor)
+        # Re-seed the slew-limiter's persistent commanded target at the arm's actual
+        # (randomized) post-reset pose, so the first commanded step is continuous from
+        # wherever the episode starts -- see __init__'s _cmd_targets comment.
+        arm = self._arm_groups[0]
+        self._cmd_targets[env_ids_tensor] = self.robot.data.joint_pos[env_ids_tensor][:, arm["joint_tensor"]]
 
     # ------------------------------------------------------------------
     # Action: q_ik + bounded residual (not current_pose + delta)
@@ -400,20 +489,28 @@ class G1ArmResidualEnv(G1ArmEnv):
         """2026-07-29: was missing max_action_delta_per_step entirely -- the residual
         could jump the commanded target by its FULL range (+-residual_action_scale,
         i.e. up to a 0.3 rad swing) in a single control step, only softened by
-        action_filter_alpha's EMA (a low-pass, not a hard bound). Every other script
-        in this project (G1ArmEnv._apply_action, g1_full_demo.py, both eval scripts)
-        hard-clamps the per-step commanded delta to max_action_delta_per_step (0.06
-        rad, inherited from G1ArmEnvCfg but never applied here) for exactly this
-        reason. Confirmed via clean per-checkpoint eval data (2026-07-29): every
-        FAILED episode (both this run and the pre-fix 22-17-21 run) runs the full
+        action_filter_alpha's EMA (a low-pass, not a hard bound). Confirmed via clean
+        per-checkpoint eval data (2026-07-29): every FAILED episode runs the full
         episode timeout with dist_to_goal rhythmically oscillating between <0.3cm and
-        2-3.5cm on a multi-second cycle that never damps out -- a control-loop limit
-        cycle, not an exploration/training-progress problem (more iterations can't fix
-        a policy that's structurally allowed to command undampened target jumps).
-        Rate-limiting the target relative to the arm's CURRENT actual position (same
-        pattern as G1ArmEnv._apply_action) directly bounds the velocity the PD
-        controller is ever asked to chase, which should prevent this cycle from
-        building up in the first place.
+        2-3.5cm on a multi-second cycle that never damps out. A rate limit bounds the
+        velocity the PD controller is ever asked to chase.
+
+        2026-07-31 (before this version was ever trained): the first rate-limit
+        implementation clamped the target relative to the arm's CURRENT MEASURED
+        position (G1ArmEnv._apply_action's legacy pattern) -- which re-introduces the
+        static-torque ceiling main probe-confirmed breaks arm holding
+        (check_arm_static_torque_ceiling.py: |target - current| <= 0.06 rad caps
+        sustained PD torque at kp*0.06 = 2.4 Nm vs the 4.5-5.7 Nm goal-box postures
+        need; the target would trail the sagging arm downward with no equilibrium
+        until residual gravity <= 2.4 Nm + tau_ff). It would also have capped the
+        residual's whole correction authority at 2.4 Nm above tau_ff -- model_2000's
+        eval shows the residual closing an 8.6cm baseline gap to 1.15cm precisely by
+        commanding well beyond the baseline (elbow at 102% of hw range), which that
+        clamp forbids. This version slew-limits the COMMANDED-TARGET TRAJECTORY
+        instead (self._cmd_targets, persistent state re-seeded at reset): same 0.06
+        rad/step bound on how fast the setpoint moves (the actual smoothness concern),
+        zero cap on the static bias it can accumulate -- the same integrated-target
+        principle main's integrate_action_targets fix deploys with.
         """
         self._apply_root_wobble()
 
@@ -421,16 +518,15 @@ class G1ArmResidualEnv(G1ArmEnv):
         alpha = min(max(alpha, 0.0), 1.0)
         self.filtered_actions = alpha * self.actions + (1.0 - alpha) * self.filtered_actions
 
-        arm = self._arm_groups[0]
-        current = self.robot.data.joint_pos[:, arm["joint_tensor"]]
         residual = self.filtered_actions * self.cfg.residual_action_scale
         desired_targets = self.ik_baseline_q + residual
-        delta = (desired_targets - current)
+        delta = desired_targets - self._cmd_targets
         max_delta = float(self.cfg.max_action_delta_per_step)
         if max_delta > 0.0:
             delta = delta.clamp(min=-max_delta, max=max_delta)
-        targets = current + delta
+        targets = self._cmd_targets + delta
         targets = targets.clamp(self._arm_hw_limits[:, 0], self._arm_hw_limits[:, 1])
+        self._cmd_targets = targets
         self.robot.set_joint_position_target(targets, joint_ids=self.arm_joint_indices_tensor)
         if self.cfg.apply_ik_tauff:
             self.robot.set_joint_effort_target(self.ik_baseline_tauff, joint_ids=self.arm_joint_indices_tensor)
@@ -461,19 +557,22 @@ class G1ArmResidualEnv(G1ArmEnv):
         return obs
 
     # ------------------------------------------------------------------
-    # Rewards: full copy of G1ArmEnv._get_rewards with TWO changes -- see below
+    # Rewards: full copy of G1ArmEnv._get_rewards with THREE changes -- see below
     # ------------------------------------------------------------------
 
     def _get_rewards(self) -> torch.Tensor:
-        """Copy of ``G1ArmEnv._get_rewards`` with exactly two behavioral changes:
+        """Copy of ``G1ArmEnv._get_rewards`` with three behavioral changes:
         (1) ``goal_reached_bonus`` requires low joint velocity too, not just
-        proximity, and (2) that bonus is scaled by how long the current consecutive
+        proximity, (2) that bonus is scaled by how long the current consecutive
         hold streak is, so a sustained hold is worth strictly more than the same
-        number of qualifying steps scattered with gaps. Full method duplicated (not a
-        small patch) because both changes need state computed earlier/differently
-        than the base version does, and Python has no clean way to patch a few lines
-        out of a parent method — if ``G1ArmEnv._get_rewards`` changes later, this
-        needs to be re-synced by hand.
+        number of qualifying steps scattered with gaps, and (3, added 2026-08-01)
+        ``joint_limit_term`` uses a tiered/cumulative 20%-10%-5% margin penalty
+        instead of the base task's single 5%-margin flag — see
+        ``G1ArmResidualLeftEnvCfg``'s own comment for the motivation. Full method
+        duplicated (not a small patch) because these changes need state computed
+        earlier/differently than the base version does, and Python has no clean way
+        to patch a few lines out of a parent method — if ``G1ArmEnv._get_rewards``
+        changes later, this needs to be re-synced by hand.
 
         2026-07-28: found via direct TensorBoard inspection (not guessed) that a
         20x bump to ``settle_velocity_penalty_scale`` (see that field's own comment)
@@ -571,18 +670,41 @@ class G1ArmResidualEnv(G1ArmEnv):
         prospective_hold_counter = torch.where(
             all_reached, self._hold_counter + 1, torch.zeros_like(self._hold_counter)
         )
-        goal_bonus_term = goal_bonus_term * (1.0 + prospective_hold_counter.float() * self.cfg.hold_streak_bonus_scale)
+        # 2026-07-31: cap the streak used for SCALING at goal_hold_steps -- with
+        # terminate_on_success=False episodes run to timeout, and an uncapped
+        # multiplier would grow ~46x over a full-episode hold (see the cfg field's
+        # 2026-07-31 note). The committed self._hold_counter itself stays uncapped
+        # (success definition unchanged).
+        streak_for_scaling = prospective_hold_counter.clamp(max=self.cfg.goal_hold_steps)
+        goal_bonus_term = goal_bonus_term * (1.0 + streak_for_scaling.float() * self.cfg.hold_streak_bonus_scale)
 
         action_smoothness_term = -torch.norm(self.previous_actions, dim=-1) * self.cfg.action_smoothness_scale
 
+        # 2026-08-01: tiered joint-limit-proximity penalty (three concentric margin
+        # bands, cumulative) -- see G1ArmResidualLeftEnvCfg's own comment for the full
+        # motivation/design. Replaces the base task's single-margin/single-scale
+        # at_limit_mask computation entirely (this method already fully overrides
+        # G1ArmEnv._get_rewards, so nothing upstream depends on the old computation).
         joint_pos = self.robot.data.joint_pos[:, self.arm_joint_indices_tensor]
         limits = self._arm_hw_limits
         span = limits[:, 1] - limits[:, 0]
-        margin_lo = self._joint_limit_margin_fraction[:, 0] * span
-        margin_hi = self._joint_limit_margin_fraction[:, 1] * span
-        at_limit_mask = (joint_pos < limits[:, 0] + margin_lo) | (joint_pos > limits[:, 1] - margin_hi)
-        at_limit = at_limit_mask.float().sum(-1)
-        joint_limit_term = -at_limit * self.cfg.joint_limit_penalty_scale
+
+        def _at_margin(frac: float) -> torch.Tensor:
+            margin = frac * span
+            return (joint_pos < limits[:, 0] + margin) | (joint_pos > limits[:, 1] - margin)
+
+        at_limit_20 = _at_margin(self.cfg.joint_limit_margin_fraction_20)
+        at_limit_10 = _at_margin(self.cfg.joint_limit_margin_fraction_10)
+        at_limit_05 = _at_margin(self.cfg.joint_limit_margin_fraction_05)
+        joint_limit_term = -(
+            at_limit_20.float().sum(-1) * self.cfg.joint_limit_penalty_scale_20
+            + at_limit_10.float().sum(-1) * self.cfg.joint_limit_penalty_scale_10
+            + at_limit_05.float().sum(-1) * self.cfg.joint_limit_penalty_scale_05
+        )
+        # Metrics/mean_joints_at_limit keeps its old meaning (tightest 5% band only —
+        # matches the base task's diagnostic convention) even though the reward now
+        # also considers the two looser bands.
+        at_limit = at_limit_05.float().sum(-1)
 
         total = (
             position_dist_term + position_exp_term + goal_bonus_term + torso_proximity_term
