@@ -110,3 +110,6 @@ tests/
 # TacSL sensor
 **/tactile_record/*
 **/gelsight_r15_data/*
+
+# Git commands for dual account management
+git_commands.md
